@@ -512,6 +512,11 @@ TEST_F(DaemonTest, HipMemcpyRoundTripInt) {
   EXPECT_EQ(r.exit_code, 0) << r.output;
 }
 
+TEST_F(DaemonTest, HipVmmShareableAliasesRoundTrip) {
+  auto r = run_hip_test(hip_memcpy_bin(), "HipMemcpyTest.VmmShareableAliasesRoundTrip");
+  EXPECT_EQ(r.exit_code, 0) << r.output;
+}
+
 TEST_F(DaemonTest, HipMemcpyRoundTripPageableAbovePinThreshold) {
   auto r = run_hip_test(hip_memcpy_bin(), "HipMemcpyTest.RoundTripPageableAbovePinThreshold");
   EXPECT_EQ(r.exit_code, 0) << r.output;
@@ -542,6 +547,20 @@ TEST_F(DaemonTest, TwoIndependentClients) {
 
   EXPECT_EQ(r1.exit_code, 0) << "Client 1 (vector_add):\n" << r1.output;
   EXPECT_EQ(r2.exit_code, 0) << "Client 2 (memcpy):\n" << r2.output;
+}
+
+TEST_F(DaemonTest, TwoIndependentVmmClients) {
+  ProcessResult first, second;
+  std::thread first_client([&] {
+    first = run_hip_test(hip_memcpy_bin(), "HipMemcpyTest.VmmShareableAliasesRoundTrip");
+  });
+  std::thread second_client([&] {
+    second = run_hip_test(hip_memcpy_bin(), "HipMemcpyTest.VmmShareableAliasesRoundTrip");
+  });
+  first_client.join();
+  second_client.join();
+  EXPECT_EQ(first.exit_code, 0) << first.output;
+  EXPECT_EQ(second.exit_code, 0) << second.output;
 }
 
 // --- Daemon-mode plugin coverage ---
@@ -644,6 +663,18 @@ TEST_F(DaemonTest, InterposerDup2OverPrimaryInvalidatesRemote) {
 
 TEST_F(DaemonTest, InterposerProcMapsNamesRemoteKfdMarker) {
   auto r = run_hip_test(interposer_dup_bin(), "InterposerDupTest.ProcMapsNamesRemoteKfdMarker");
+  EXPECT_EQ(r.exit_code, 0) << r.output;
+}
+
+TEST_F(DaemonTest, RemotePrimeImportRetainsExportedBacking) {
+  auto r = run_hip_test(interposer_dup_bin(),
+                        "InterposerDupTest.RemotePrimeImportRetainsExportedBacking");
+  EXPECT_EQ(r.exit_code, 0) << r.output;
+}
+
+TEST_F(DaemonTest, RemoteGemVaPartialClearKeepsRemainingRange) {
+  auto r = run_hip_test(interposer_dup_bin(),
+                        "InterposerDupTest.RemoteGemVaPartialClearKeepsRemainingRange");
   EXPECT_EQ(r.exit_code, 0) << r.output;
 }
 

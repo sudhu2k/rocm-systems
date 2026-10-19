@@ -229,6 +229,21 @@ ComputeUnitCore::~ComputeUnitCore() {
       gws_device_->notify_parked_wave_gone(*wave);
 }
 
+void ComputeUnitCore::report_unresolved_apertures(uint32_t identity, ProcessIdentityKind kind) {
+  bool guest_banks_programmed = false;
+  {
+    std::lock_guard lock(vmid_aperture_mutex_);
+    guest_banks_programmed = std::any_of(vmid_apertures_.begin(), vmid_apertures_.end(),
+                                         [](const auto &bank) { return bank.has_value(); });
+  }
+  if (!guest_banks_programmed ||
+      unresolved_aperture_reported_.exchange(true, std::memory_order_relaxed))
+    return;
+  util::Logger::warn(
+      std::format("{}: no unambiguous guest shader aperture for {} {} (retaining CU defaults)",
+                  full_path(), kind == ProcessIdentityKind::Vmid ? "VMID" : "PASID", identity));
+}
+
 template <GpuIsa Isa>
 static std::unique_ptr<ComputeUnitCore> create_functional_cu(std::string name,
                                                              const ComputeUnitCore::Config &config,
@@ -1069,7 +1084,7 @@ VmAccessOutcome ComputeUnitCore::route_memory_inst(Instruction *inst, Wavefront 
   std::array<uint64_t, 64> pre_routing_address_storage;
   std::span<const uint64_t> pre_routing_addresses;
   if (inst->data()->tag() == GLOBAL_MEM && inst->mnemonic().starts_with("flat_") &&
-      shared_aperture_base_ != 0) {
+      wf.shared_aperture_base() != 0) {
     auto &d = *inst->data_as<VectorMemState>();
     // The wavefront is the authority on its own width. VectorMemState::wf_size
     // is set by whoever built the state, and the DS paths leave it at its
@@ -1080,9 +1095,9 @@ VmAccessOutcome ComputeUnitCore::route_memory_inst(Instruction *inst, Wavefront 
       const uint64_t lane_bit = uint64_t{1} << lane;
       if ((d.lane_mask & ~scratch_lanes & lane_bit) != 0) {
         const uint64_t address = d.per_lane_addr[lane];
-        if (address >= shared_aperture_base_ && address <= shared_aperture_limit_) {
+        if (address >= wf.shared_aperture_base() && address <= wf.shared_aperture_limit()) {
           if (arch() == ROCJITSU_CODE_ARCH_CDNA5 &&
-              ((address - shared_aperture_base_) & (uint64_t{1} << 31)) != 0)
+              ((address - wf.shared_aperture_base()) & (uint64_t{1} << 31)) != 0)
             flat_dds_lane_mask |= lane_bit;
           else
             flat_local_lane_mask |= lane_bit;
@@ -1108,7 +1123,7 @@ VmAccessOutcome ComputeUnitCore::route_memory_inst(Instruction *inst, Wavefront 
       }
       for (uint32_t lane = 0; lane < wf_size; ++lane) {
         if (flat_shared_lane_mask & (uint64_t{1} << lane)) {
-          uint64_t offset = d.per_lane_addr[lane] - shared_aperture_base_;
+          uint64_t offset = d.per_lane_addr[lane] - wf.shared_aperture_base();
           // RDNA4 FLAT uses unsigned 17-bit LDS address math. Keep the
           // workgroup LDS base outside that wrapping calculation.
           if (arch() == ROCJITSU_CODE_ARCH_RDNA4) {
@@ -1356,9 +1371,10 @@ void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf) {
   // Source checks precede this pure FLAT domain calculation. Resolve admission,
   // overwrite ordering and result readiness before execution.
   const bool flat = inst.mnemonic().starts_with("flat_");
-  const auto planned_flat = flat ? MemoryWaitScoreboard::flat_lanes(inst, wf, shared_aperture_base_,
-                                                                    shared_aperture_limit_)
-                                 : MemoryWaitScoreboard::FlatLanes{};
+  const auto planned_flat =
+      flat ? MemoryWaitScoreboard::flat_lanes(inst, wf, wf.shared_aperture_base(),
+                                              wf.shared_aperture_limit())
+           : MemoryWaitScoreboard::FlatLanes{};
   const uint64_t flat_shared_lanes = planned_flat.shared;
   const uint64_t flat_requests = planned_flat.requests;
   const auto flat_counter_lanes = [&](WaitCounterKind counter) {
@@ -1973,6 +1989,11 @@ ComputeUnitCore::issue_instruction_impl(Wavefront *active, MaybeAsyncWindow<Enab
       handle_terminal_vm_fault(*active, VmAccessOutcome::Faulted);
       return IssueOutcome::NotIssued;
     }
+    if (!using_retained_vm_access && !active->same_execution_root(*vm_access)) {
+      drain_async_window();
+      handle_terminal_vm_fault(*active, VmAccessOutcome::Revoked);
+      return IssueOutcome::NotIssued;
+    }
   }
   const bool vm_address_space = vm_access != nullptr;
   const uint64_t fetch_pc = vm_address_space ? active->vm_instruction_pc() : active->pc;
@@ -2089,6 +2110,12 @@ ComputeUnitCore::issue_instruction_impl(Wavefront *active, MaybeAsyncWindow<Enab
     active->pc += inst_size;
     return IssueOutcome::NotIssued;
   }
+  // A decoded instruction may publish memory through a cache, a translated
+  // access, or an async pipeline. NOP and ENDPGM create no new memory effect;
+  // all other instructions conservatively block completion rebinding.
+  if (active->needs_execution_effect_mark() && inst->mnemonic() != "s_nop" &&
+      inst->mnemonic() != "s_endpgm")
+    active->note_potential_execution_effect();
   auto *wait_state =
       config_.memory_wait_checks_enabled() ? active->memory_wait_scoreboard() : nullptr;
   if (wait_state) {

@@ -47,6 +47,7 @@ SimulationEngine                           (simdojo - owns topology)
 └── Topology
     └── VirtualMachine                     (CompositeComponent - topology root)
         ├── SimulatedKfd driver_            (owned member, not a child component)
+        ├── FabricEndpoint ("fabric")        (VM-owned local peer transport)
         └── gpu[0..G] ("gpu0"..)           (CompositeComponent, one per GPU)
             ├── SoC ("soc")                 (owned, but its children were adopted
             │                                by the gpuN wrapper above, so it is
@@ -68,6 +69,14 @@ The `VirtualMachine` is a `simdojo::CompositeComponent` set as the topology root
 and it owns the simulated KFD alongside its SoCs. The simulation infrastructure
 (engine, topology, partitioning) is managed by `SimulationEngine`; the SoC
 represents the hardware being modeled.
+
+For unambiguous local ScaleUp or Infinity Fabric routes, the VM owns a
+`FabricEndpoint` child that carries admitted peer effects through Simdojo
+endpoints. Both link classes currently use unit-latency functional transport;
+this does not model hardware-specific Infinity Fabric timing. Executing those
+routes does not grant native XGMI discovery: explicit manifests still suppress
+KFD hive and XGMI metadata while the stock driver uses UC PCIe peer BAR
+mappings.
 
 ## Address spaces, translation, and backing
 
@@ -586,6 +595,25 @@ bound covers its 8-byte memory element although SDATA holds 16 bytes.
 
 - `s_dcache_inv` / `s_dcache_inv_vol` — invalidate the L1 scalar cache
 - `s_gl1_inv` — invalidate the L1 vector cache
+
+### Cache tag storage and measured cost
+
+`CacheTag` is 96 bytes with translated-local backing and publication metadata,
+compared with 40 bytes before that policy was added. A 64-set, four-way L1
+therefore stores 24 KiB of tags instead of 10 KiB, including when it does not
+use the extra fields. The inline metadata avoids a side-table lookup and
+allocation on fills, hits, and eviction.
+
+On 2026-11-09, a Release `-O3` build with amdclang++ 23 ran the existing
+`L2CacheBenchmark.ScalarL1Hit` and `L2CacheBenchmark.VectorL1Hit` tests on one
+pinned CPU of a Ryzen Threadripper PRO 9985WX. Five alternating runs after a
+warmup gave median times of 6.518 and 8.726 ns/access on the pre-PR base
+`b4b55168e84`, versus 18.285 and 22.680 ns/access on the parent branch.
+These end-to-end hit tests include the PR's new admission and coherence paths;
+their difference cannot be attributed to tag size alone. They establish a
+cache-heavy regression to profile before claiming that the shared layout has
+no throughput cost. Reproduce the check with the two GTest filters above in
+matching Release builds, running each binary serially on the same CPU.
 
 ### Transaction observation boundaries
 
