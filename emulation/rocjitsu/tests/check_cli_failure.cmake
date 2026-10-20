@@ -8,8 +8,19 @@ if(NOT DEFINED TEST_REGEX)
     message(FATAL_ERROR "TEST_REGEX is required")
 endif()
 
+set(_command "${TEST_EXECUTABLE}" ${TEST_ARGS})
+if(DEFINED TEST_ENVIRONMENT)
+    set(_command
+        "${CMAKE_COMMAND}"
+        -E
+        env
+        ${TEST_ENVIRONMENT}
+        ${_command}
+    )
+endif()
+
 execute_process(
-    COMMAND "${TEST_EXECUTABLE}" ${TEST_ARGS}
+    COMMAND ${_command}
     RESULT_VARIABLE _result
     OUTPUT_VARIABLE _stdout
     ERROR_VARIABLE _stderr

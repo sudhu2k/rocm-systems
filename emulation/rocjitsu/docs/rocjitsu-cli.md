@@ -47,7 +47,7 @@ receiving real GPU descriptors over a Unix socket.
 ## Command-Line Options
 
 ```
-Usage: rocjitsu [--config <config.json>|--profile <name>] [--cpu-thread-budget <n>] [--daemon|--attach] -- <app> [args...]
+Usage: rocjitsu [--config <config.json>|--profile <name>] [--cpu-thread-budget <n>] [--wait-checking <mode>] [--daemon|--attach] -- <app> [args...]
        rocjitsu paths [--json]
        rocjitsu --config <config.json> --vfio-socket <path>
 ```
@@ -57,15 +57,15 @@ Usage: rocjitsu [--config <config.json>|--profile <name>] [--cpu-thread-budget <
 | `--config <path>` | Path to simulation config JSON. Cannot be combined with `--profile`. |
 | `--profile <name>` | Bundled profile config to run. Defaults to `mi350x` when neither `--config` nor `--profile` is supplied. |
 | `--cpu-thread-budget <n>`, `--cpu-thread-budget=<n>` | Replace `cpu_thread_budget` for this launch only; the source JSON is left unchanged. Zero selects automatic sizing. Not available with `--attach`. |
+| `--wait-checking <mode>`, `--wait-checking=<mode>` | Override wait checking for this launch only. `on` enables ordinary checks, `off` disables them, and `all` also enables gfx1250 XCNT checks. The source JSON is left unchanged. Not available with `--attach`. |
 | `--thread-budget-table` | Print engine and dispatch allocations without running a VM. |
-| `--json` | Emit machine-readable JSON for commands that support it, such as `paths`. |
 | `--daemon` | Run in daemon mode: fork a daemon process hosting the simulation engine, then launch the application with the interposer. Without `-- <app>`, runs the daemon server only. |
 | `--attach` | Attach to a running daemon. The socket path is resolved as `$ROCJITSU_RUNTIME_DIR/daemon.sock`, then `$XDG_RUNTIME_DIR/rocjitsu/daemon.sock`, falling back to `/tmp/rocjitsu-<uid>/daemon.sock`. |
 | `--vfio-socket <path>` | Serve the configured GPU as a PCI function over VFIO-user. The VMM must share guest RAM through mmap-able file descriptors. |
 | `--check-vfio-user` | Exit successfully only when this binary was built with VFIO-user support. |
 | `--help`, `-h` | Print usage and exit |
 | `--version`, `-v` | Print version, Git revision, commit date, and commit title, then exit |
-| `paths` | Print config/runtime search paths. Use `--json` for a structured form. |
+| `paths [--json]` | Print config/runtime search paths. `--json` must follow `paths`, as in `rocjitsu paths --json`. |
 | `--` | Separator between rocjitsu options and the target application command line |
 
 ### Usage Examples

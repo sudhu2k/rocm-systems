@@ -389,7 +389,9 @@ add_test(
 )
 set_tests_properties(
     RocjitsuPaths
-    PROPERTIES PASS_REGULAR_EXPRESSION "runtime_dir: .*/paths-runtime"
+    PROPERTIES
+        PASS_REGULAR_EXPRESSION "runtime_dir: .*/paths-runtime"
+        FAIL_REGULAR_EXPRESSION "invocation_"
 )
 add_test(
     NAME RocjitsuPathsJson
@@ -399,7 +401,9 @@ add_test(
 )
 set_tests_properties(
     RocjitsuPathsJson
-    PROPERTIES PASS_REGULAR_EXPRESSION "\"runtime_dir\": \".*/paths-runtime\""
+    PROPERTIES
+        PASS_REGULAR_EXPRESSION "\"runtime_dir\": \".*/paths-runtime\""
+        FAIL_REGULAR_EXPRESSION "invocation_"
 )
 add_test(
     NAME RocjitsuPathsRejectsUnknown
@@ -427,6 +431,47 @@ add_test(
         --cpu-thread-budget=1 --thread-budget-table
 )
 add_test(
+    NAME RocjitsuCpuThreadBudgetConfigEquals
+    COMMAND
+        $<TARGET_FILE:rocjitsu_bin> --config=${_rj_cdna3_config}
+        --cpu-thread-budget=1 --thread-budget-table
+)
+set_tests_properties(
+    RocjitsuCpuThreadBudget
+    RocjitsuCpuThreadBudgetAssigned
+    RocjitsuCpuThreadBudgetConfigEquals
+    PROPERTIES PASS_REGULAR_EXPRESSION "Configured \\| 1 \\| 1 \\| 0 \\| 1"
+)
+
+add_test(
+    NAME RocjitsuCpuThreadBudgetRejectsNonNumeric
+    COMMAND
+        $<TARGET_FILE:rocjitsu_bin> --config ${_rj_cdna3_config}
+        --cpu-thread-budget four --thread-budget-table
+)
+set_tests_properties(
+    RocjitsuCpuThreadBudgetRejectsNonNumeric
+    PROPERTIES
+        PASS_REGULAR_EXPRESSION
+            "--cpu-thread-budget requires an unsigned integer"
+)
+
+add_test(
+    NAME RocjitsuCpuThreadBudgetRejectsAttach
+    COMMAND
+        $<TARGET_FILE:rocjitsu_bin> --config ${_rj_cdna3_config} --attach
+        --cpu-thread-budget 1 -- true
+)
+set_tests_properties(
+    RocjitsuCpuThreadBudgetRejectsAttach
+    PROPERTIES
+        PASS_REGULAR_EXPRESSION
+            "--cpu-thread-budget cannot be combined with --attach"
+)
+
+# Keep profile coverage after the complete CPU-budget group so each CLI feature's
+# success and rejection cases stay together.
+add_test(
     NAME RocjitsuProfileDefaultThreadBudget
     COMMAND
         $<TARGET_FILE:rocjitsu_bin> --cpu-thread-budget 32 --thread-budget-table
@@ -434,19 +479,14 @@ add_test(
 add_test(
     NAME RocjitsuProfileMi300xThreadBudget
     COMMAND
-        $<TARGET_FILE:rocjitsu_bin> --profile mi300x --cpu-thread-budget 24
+        $<TARGET_FILE:rocjitsu_bin> --profile=mi300x --cpu-thread-budget 32
         --thread-budget-table
 )
 add_test(
     NAME RocjitsuProfileCaseInsensitiveThreadBudget
     COMMAND
-        $<TARGET_FILE:rocjitsu_bin> --profile MI450X --cpu-thread-budget 48
+        $<TARGET_FILE:rocjitsu_bin> --profile=MI450X --cpu-thread-budget 48
         --thread-budget-table
-)
-set_tests_properties(
-    RocjitsuCpuThreadBudget
-    RocjitsuCpuThreadBudgetAssigned
-    PROPERTIES PASS_REGULAR_EXPRESSION "Configured \\| 1 \\| 1 \\| 0 \\| 1"
 )
 set_tests_properties(
     RocjitsuProfileMi300xThreadBudget
@@ -478,6 +518,65 @@ add_test(
         ${_rj_cli_failure_script}
 )
 
+add_test(
+    NAME RocjitsuProfileRejectsAttach
+    COMMAND
+        ${CMAKE_COMMAND} "-DTEST_EXECUTABLE=$<TARGET_FILE:rocjitsu_bin>"
+        "-DTEST_ARGS=--profile;mi300x;--attach;--;true"
+        "-DTEST_REGEX=--profile cannot be combined with --attach" -P
+        ${_rj_cli_failure_script}
+)
+
+add_test(
+    NAME RocjitsuProfileRejectsMissingValue
+    COMMAND
+        ${CMAKE_COMMAND} "-DTEST_EXECUTABLE=$<TARGET_FILE:rocjitsu_bin>"
+        "-DTEST_ARGS=--profile;--thread-budget-table"
+        "-DTEST_REGEX=--profile requires a value" -P ${_rj_cli_failure_script}
+)
+
+add_test(
+    NAME RocjitsuProfileRejectsEmptyValue
+    COMMAND
+        ${CMAKE_COMMAND} "-DTEST_EXECUTABLE=$<TARGET_FILE:rocjitsu_bin>"
+        "-DTEST_ARGS=--profile=;--thread-budget-table"
+        "-DTEST_REGEX=--profile requires a value" -P ${_rj_cli_failure_script}
+)
+
+add_test(
+    NAME RocjitsuConfigRejectsMissingValue
+    COMMAND
+        ${CMAKE_COMMAND} "-DTEST_EXECUTABLE=$<TARGET_FILE:rocjitsu_bin>"
+        "-DTEST_ARGS=--config;--thread-budget-table"
+        "-DTEST_REGEX=--config requires a value" -P ${_rj_cli_failure_script}
+)
+
+add_test(
+    NAME RocjitsuConfigRejectsEmptyValue
+    COMMAND
+        ${CMAKE_COMMAND} "-DTEST_EXECUTABLE=$<TARGET_FILE:rocjitsu_bin>"
+        "-DTEST_ARGS=--config=;--thread-budget-table"
+        "-DTEST_REGEX=--config requires a value" -P ${_rj_cli_failure_script}
+)
+
+add_test(
+    NAME RocjitsuAttachWithoutConfigSkipsDefaultProfile
+    COMMAND
+        ${CMAKE_COMMAND} "-DTEST_EXECUTABLE=$<TARGET_FILE:rocjitsu_bin>"
+        "-DTEST_ENVIRONMENT=ROCJITSU_RUNTIME_DIR=${CMAKE_CURRENT_BINARY_DIR}/attach-no-profile-runtime"
+        "-DTEST_ARGS=--attach;--;true" "-DTEST_REGEX=no daemon socket" -P
+        ${_rj_cli_failure_script}
+)
+
+add_test(
+    NAME RocjitsuProfileBuildTreeConfigLookup
+    COMMAND
+        ${CMAKE_COMMAND} "-DTEST_EXECUTABLE=$<TARGET_FILE:rocjitsu_bin>"
+        "-DTEST_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/build-tree-profile-layout"
+        "-DTEST_CONFIG_SOURCE=${CMAKE_SOURCE_DIR}/configs/gfx950_mi355x.json" -P
+        ${CMAKE_CURRENT_SOURCE_DIR}/profile_build_tree_config_test.cmake
+)
+
 if(NOT IS_ABSOLUTE "${CMAKE_INSTALL_DATADIR}")
     add_test(
         NAME RocjitsuProfileRelocatedInstall
@@ -489,32 +588,6 @@ if(NOT IS_ABSOLUTE "${CMAKE_INSTALL_DATADIR}")
             ${CMAKE_CURRENT_SOURCE_DIR}/profile_relocated_install_test.cmake
     )
 endif()
-
-add_test(
-    NAME RocjitsuCpuThreadBudgetRejectsNonNumeric
-    COMMAND
-        $<TARGET_FILE:rocjitsu_bin> --config ${_rj_cdna3_config}
-        --cpu-thread-budget four --thread-budget-table
-)
-set_tests_properties(
-    RocjitsuCpuThreadBudgetRejectsNonNumeric
-    PROPERTIES
-        PASS_REGULAR_EXPRESSION
-            "--cpu-thread-budget requires an unsigned integer"
-)
-
-add_test(
-    NAME RocjitsuCpuThreadBudgetRejectsAttach
-    COMMAND
-        $<TARGET_FILE:rocjitsu_bin> --config ${_rj_cdna3_config} --attach
-        --cpu-thread-budget 1 -- true
-)
-set_tests_properties(
-    RocjitsuCpuThreadBudgetRejectsAttach
-    PROPERTIES
-        PASS_REGULAR_EXPRESSION
-            "--cpu-thread-budget cannot be combined with --attach"
-)
 
 add_executable(rj_decode_fuzz_test fuzz/decode/decode_fuzz_test.cpp)
 target_link_libraries(
@@ -1403,6 +1476,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 # --- CLI launcher preload tests ---
+
+add_executable(rocjitsu_cli_json_test rocjitsu_cli_json_test.cpp)
+target_link_libraries(
+    rocjitsu_cli_json_test
+    PRIVATE rocjitsu_cli_json GTest::gtest_main
+)
+rj_configure_target(rocjitsu_cli_json_test TEST)
+rj_add_gtest_tests(rocjitsu_cli_json_test)
 
 add_executable(launch_preload_test launch_preload_test.cpp)
 target_link_libraries(

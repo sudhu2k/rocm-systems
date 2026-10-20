@@ -18,6 +18,10 @@ target_compile_definitions(rocjitsu_cli_launch_preload PRIVATE _GNU_SOURCE)
 target_link_libraries(rocjitsu_cli_launch_preload PUBLIC ${CMAKE_DL_LIBS})
 rj_configure_target(rocjitsu_cli_launch_preload TOOL)
 
+add_library(rocjitsu_cli_json STATIC json_output.cpp)
+target_include_directories(rocjitsu_cli_json PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+rj_configure_target(rocjitsu_cli_json TOOL)
+
 add_executable(rocjitsu_bin main.cpp)
 
 target_include_directories(
@@ -30,6 +34,15 @@ target_compile_definitions(
         RJ_SOURCE_CONFIG_DIR="${PROJECT_SOURCE_DIR}/configs"
         RJ_INSTALL_CONFIG_DIR="${CMAKE_INSTALL_FULL_DATADIR}/rocjitsu/configs"
         RJ_INSTALL_CONFIG_RELDIR="${CMAKE_INSTALL_DATADIR}/rocjitsu/configs"
+)
+
+add_custom_command(
+    TARGET rocjitsu_bin
+    POST_BUILD
+    COMMAND
+        ${CMAKE_COMMAND} -E copy_directory "${PROJECT_SOURCE_DIR}/configs"
+        "$<TARGET_FILE_DIR:rocjitsu_bin>/../../configs"
+    COMMENT "Staging rocjitsu configs for build-tree profile lookup"
 )
 
 target_link_libraries(
@@ -55,6 +68,7 @@ target_link_libraries(
         flatbuffers
         Threads::Threads
         rocjitsu_cli_launch_preload
+        rocjitsu_cli_json
         rocjitsu_version
 )
 
