@@ -8,7 +8,8 @@ Until the cutover, each view is one analysis config panel:
 - the same panels, tables, headers and table settings, in order;
 - the same rows in order, leaving out only rows that show no equation (and tables left
   empty by them);
-- each panel's -b alias is the config template's;
+- each panel's -b alias, and the -b aliases the arch reads (its family's views), are
+  the config template's;
 - every row's legacy position is its row in the panel file, and every metric the arch
   shows has one legacy_id, that position.
 
@@ -18,6 +19,7 @@ arch without a roofline benchmark).
 """
 
 import json
+import re
 from typing import Any, Dict, List
 
 import common
@@ -28,6 +30,7 @@ from rocprof_compute_soc.metric_library import loader
 from utils.analysis_views import (
     METRIC_TABLE,
     NO_VALUE,
+    get_arch_panel_id_to_alias,
     iter_view_rows,
     legacy_position,
     load_views,
@@ -36,7 +39,7 @@ from utils.analysis_views import (
     row_metric_ids,
     views_to_panel_configs,
 )
-from utils.utils_common import get_arch_panel_id_to_alias, load_panel_configs
+from utils.utils_common import load_panel_configs, load_yaml
 
 # Table settings that must match the panel's; rows are compared by name.
 TABLE_KEYS = ("id", "title", "header", "cli_style", "source", "columnwise")
@@ -65,6 +68,7 @@ def structure_errors(
             for error in _panel_errors(panel, actual[panel_id])
         )
     errors.extend(_alias_errors(views, arch))
+    errors.extend(_family_alias_errors(arch))
     errors.extend(_legacy_id_errors(views, metrics, positions))
     return errors
 
@@ -131,12 +135,38 @@ def _shows_equation(row: Dict[str, Any]) -> bool:
 
 
 def _alias_errors(views: List[Dict[str, Any]], arch: str) -> List[str]:
-    template_aliases = get_arch_panel_id_to_alias(arch)
+    template_aliases = _template_aliases(arch)
     return [
         f"panel {panel_number}: -b alias {alias!r}, config template has "
         f"{template_aliases.get(panel_number)!r}"
         for panel_number, alias in panel_aliases(views).items()
         if template_aliases.get(panel_number) != alias
+    ]
+
+
+def _template_aliases(arch: str) -> Dict[str, str]:
+    """Return panel number -> -b alias from the config template whose name prefix
+    matches arch, "" for none; {} when no template matches."""
+    for path in sorted(config.analysis_configs_dir.glob("*_config_template.yaml")):
+        match = re.match(r"(gfx\d+)_config_template\.yaml$", path.name)
+        if match and arch.startswith(match.group(1)):
+            panels = (load_yaml(path) or {}).get("panels") or []
+            return {
+                str(panel["panel_id"]): (panel.get("panel_alias") or "")
+                for panel in panels
+            }
+    return {}
+
+
+def _family_alias_errors(arch: str) -> List[str]:
+    """Check the aliases -b reads for arch (its family's) against its template."""
+    template_aliases = _template_aliases(arch)
+    view_aliases = get_arch_panel_id_to_alias(arch)
+    return [
+        f"panel {panel_number}: -b alias {view_aliases.get(panel_number)!r}, config "
+        f"template has {template_aliases.get(panel_number)!r}"
+        for panel_number in sorted(set(template_aliases) | set(view_aliases), key=int)
+        if template_aliases.get(panel_number) != view_aliases.get(panel_number)
     ]
 
 
