@@ -68,6 +68,8 @@ Full documentation for ROCm Compute Profiler is available at [https://rocm.docs.
   * Operator call trees now show each operator's arguments.
   * `--trace-ml-api triton` does not capture the Triton kernels that `torch.compile` generates. Use `--trace-ml-api torch` for those kernels.
 
+* Analyze shows each metric's formula, unit, peak and description from the metric library, so some panels change, for example `Gbps` is shown as `GB/s` and bandwidths shown in `Bytes/s` are now in `GB/s`. Rows that never showed a value are gone, so later gfx908 Speed-of-Light IDs such as `2.1.11` are renumbered, and the gfx1250 roofline `WMMA FLOPs (FP64)` row shows its theoretical peak.
+
 ### Removed
 
 * Removed the experimental `--gui` and `--tui` analyze modes and the `--random-port` option. Use the default CLI analyze mode for terminal output, or `--output-format db` to explore results in ROCm Optiq.
