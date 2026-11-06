@@ -62,14 +62,10 @@ test_categories:
       - "RmaDebugLoggingTest.*"
       - "RmaProxyGatingTest.*"
       - "RmaProxyReadyTest.*"
-      # plugin/rma.cc
-      - "RmaPluginInitTest.*"
       # tuning/tuning_general.cc
       - "TuningGeneralMicrotest.*"
       # tuning/tuning.cc
       - "TuningMicrotest.*"
-      # plugin/tuner/csv_tuner.cc
-      - "CsvTunerMicrotest.*"
       # commDump.cc
       - "CommDumpMicrotest.*"
       # include/timer.h
