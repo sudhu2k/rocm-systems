@@ -35,7 +35,8 @@ using namespace topo_scene;
 
 ncclResult_t ncclTopoGetXmlFromCpu(struct ncclXmlNode* cpuNode, struct ncclXml* xml);  // src/graph/xml.cc
 
-// The NETDEVS policy lives in this TU's statics; the other graph TUs set it through here.
+// The NETDEVS policy lives in this TU's statics; this file's tests set it through here (topo-netdevs-seam.cc
+// defines the same setter for search-test.cc).
 void TopoSetNetDevsPolicy(enum netDevsPolicy policy, int num) {
   int unused;
   ncclTopoGetNetDevsPolicy(nullptr, &unused);  // consume the call_once first
