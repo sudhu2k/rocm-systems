@@ -863,7 +863,7 @@ TEST(WrapMicrotest, SetP2pNetChunkSize_AlreadyCachedReturnsStoredValueUnchanged)
 // IS a real oracle either way.
 //
 // The divergence tripwire is a RUNTIME check, not a static_assert: this is a
-// shared binary (p2p/rma/group/devcomm/enqueue all link it), and a
+// shared binary (p2p/rma/group/enqueue all link it), and a
 // compile-time assert here would break every one of those builds over a
 // constant none of them read. One failing test names the problem without
 // taking the rest of the suite down with it.
