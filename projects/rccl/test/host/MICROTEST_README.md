@@ -607,6 +607,14 @@ export colliding non-`static` symbols; otherwise a unit needs its own binary:
     (`NET_IB_OPS_FAULT_CC_PATH`, from `net_ib_cast/net-ib-ops-fault-test.cc`; suite
     `NetIbOpsFault*`). The p2p and ops-fault tests run on fake verbs devices
     (`IbVerbsScene.h`).
+  - `net_ib_cast/p2p_resiliency.cc`, `p2p_resiliency_recovery.cc` and
+    `p2p_resiliency_recovery_ainic.cc` (`NET_IB_CAST_P2P_RESILIENCY*_CC_PATH`, from
+    `net_ib_cast/net-ib-cast-p2p-resiliency*-test.cc`); suites `P2pResiliency*Microtest.*`,
+    over the fake verbs context in `net_ib_cast/P2pResiliencyScene.h`, with the
+    `net_ib_cast_*` fakes standing in for `connect.cc`, `p2p.cc` and `common.cc`.
+    `net-ib-cast-p2p-resiliency{,-recovery}-test.cc` each also compile the other unit
+    through `p2p_resiliency*_wrapper.cc`, and both link the real
+    `p2p_resiliency_recovery_ainic.cc`.
   - `net_socket.cc` and `net_socket/common.cc`
     (`NET_SOCKET_CC_PATH`, `NET_SOCKET_COMMON_CC_PATH`, from
     `net-socket-test.cc`); suites `NetSocket*Microtest.*`. Three disabled tests
@@ -650,13 +658,6 @@ export colliding non-`static` symbols; otherwise a unit needs its own binary:
   send/recv comm pair with failover contexts on two `IbVerbsScene` devices).
   Device discovery runs against `IbVerbsWorld.h`, the fake HCAs and verbs
   libraries that `FakeIbWorld` in `net_ib_cast/net-ib-cast-test-common.h` also builds on.
-
-- **`rccl-UnitTestsMicroP2pResiliency`**: `src/transport/net_ib_cast/p2p_resiliency.cc`,
-  `p2p_resiliency_recovery.cc` and `p2p_resiliency_recovery_ainic.cc`, one test TU each
-  (`P2P_RESILIENCY*_CC_PATH`, suites `P2pResiliency*Microtest.*`), over the fake verbs
-  context in `P2pResiliencyScene.h`. Its own binary: the `net_ib_cast_*` fakes it links
-  stand in for `connect.cc`, `p2p.cc` and `common.cc`. See
-  `test_categories_micro_p2p_resiliency.yaml`.
 
 - **`rccl-UnitTestsMicroMisc<Unit>`** — `src/misc/`, one binary per test file, registered in
   `misc/host_tests.cmake`. This entry covers the IB verbs and direct-verbs loaders
@@ -1399,8 +1400,8 @@ can be configured **directly** to build every host binary — `rccl-HostUnitTest
 `rccl-UnitTestsMicroTransport<Unit>` (one per `src/transport/` test file),
 `rccl-UnitTestsMicroEnqueue<Unit>` (one per other `src/enqueue/` test file),
 `rccl-UnitTestsMicroTuning<Unit>` (one per `src/tuning/` test file),
-`rccl-UnitTestsMicroSymKernels`, `rccl-UnitTestsMicroRma<Unit>` and
-`rccl-UnitTestsMicroP2pResiliency` — **without configuring/building all of
+`rccl-UnitTestsMicroSymKernels` and `rccl-UnitTestsMicroRma<Unit>`
+— **without configuring/building all of
 librccl**. It compiles just the tests + fakes + the hipified unit-under-test
 sources.
 
@@ -1479,7 +1480,6 @@ cmake --build build -j"$(nproc)"
 ./build/rccl-UnitTestsMicroDdaFabricInit      # src/algorithms/dda/fabric/fabric_init.cu; one binary per src/algorithms/dda/ test file
 ./build/rccl-UnitTestsMicroTransportP2p       # src/transport/p2p.cc; one binary per src/transport/ test file
 ./build/rccl-UnitTestsMicroMiscIbvwrap        # src/misc/ibvwrap.cc; one binary per src/misc/ test file
-./build/rccl-UnitTestsMicroP2pResiliency      # src/transport/net_ib_cast/p2p_resiliency*.cc tests
 ./build/rccl-HostUnitTests
 ./build/rccl-UnitTestsMicroMiscRoctxNvmlStub  # misc/roctx.cc + misc/nvmlwrap_stub.cc tests
 ./build/rccl-UnitTestsMicroMiscRoctxNvmlStub-roctx  # same, ROCTX_ENABLE arm
