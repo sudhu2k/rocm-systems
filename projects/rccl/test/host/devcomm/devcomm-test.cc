@@ -27,7 +27,7 @@
 #include "dev_runtime.h"
 #include "nccl.h"
 
-// devcomm_fakes.cc cannot define ncclDevCommCopyLsaData: rccl-UnitTestsMicro
+// devcomm_fakes.cc cannot define ncclDevCommCopyLsaData: rccl-UnitTestsMicroDevRuntime
 // links devcomm_fakes.cc alongside dev_runtime.cc's real definition. These
 // tests still need to observe and suppress the copy, so route this TU's call
 // sites through the hook instead, the same shim p2p-test.cc uses for p2p.cc's

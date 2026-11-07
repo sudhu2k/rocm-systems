@@ -31,7 +31,7 @@ extern std::function<bool(int)> g_symkKernelIdIsTma;
 extern std::function<ncclResult_t(struct ncclComm*)> g_symkFinalize;
 
 // ncclSymkLLKernelMask/ncclSymkDynamicSmemKernelMask/ncclSymkGetKernelIndex/ncclSymkKernelIdToString/
-// ncclSymkMakeDevWork seams live in sym_kernels_index_fakes.h, not here (rccl-UnitTestsMicro links the
+// ncclSymkMakeDevWork seams live in sym_kernels_index_fakes.h, not here (rccl-UnitTestsMicroSymKernelsIndex compiles the
 // real sym_kernels_host.cc, which defines those symbols for real -- a duplicate-symbol error if faked here too).
 
 void ResetSymKernelsFakes();

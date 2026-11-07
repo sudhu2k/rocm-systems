@@ -769,8 +769,8 @@ class AsyncLaunchTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    // Not just this class's own SetUp: other TUs sharing this binary/thread (e.g. rccl_wrap.cc's
-    // rcclDdaEnabled reading ncclGroupDepth) can run next, especially under --gtest_shuffle.
+    // Not just this class's own SetUp: any test on this thread can run next, especially under
+    // --gtest_shuffle.
     ResetGroupThreadLocals();
     s_active = nullptr;
   }
@@ -1207,7 +1207,7 @@ TEST_F(ArgsGlobalCheckTest, HookFailsOnSecondEntry_StopsDequeuingAndPropagatesTh
   // `failing` is deliberately left unfreed here: production's fail: path dequeues without
   // freeing it (mirrored here), and no test-side check can tell that apart from "already freed
   // by a future production change" -- guessing wrong there double-frees. Leaks one entry under
-  // ASan, same as ~18 other pre-existing allocations in this binary; not a new gate.
+  // ASan; not a new gate.
 }
 
 // groupJobUnlinkComms: undoes the comm->groupJob links the non-blocking path published, so a
@@ -1449,8 +1449,8 @@ TEST_F(MgmtTaskJobFuncTest, FailingTaskStopsDequeuingAndStillRunsItsOwnDestructo
 }
 
 // ncclCommGroupRegisterSymmetric: only the ceInitTaskQueue branch. rmaCeInitTaskQueue is not
-// covered because this binary links the real src/rma/rma_ce.cc, whose ncclRmaCeInit needs the
-// dev_runtime fixture; the other four queues need that fixture or new seams. Deferred.
+// covered because ncclRmaCeInit is a plain ::abort() stub here (collective_stubs.cc); the other
+// four queues need the dev_runtime fixture or new seams. Deferred.
 class GroupRegisterSymmetricCeInitTest : public ::testing::Test {
  protected:
   std::unique_ptr<ncclComm> comm_;
