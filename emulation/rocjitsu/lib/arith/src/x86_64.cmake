@@ -33,6 +33,7 @@ check_cxx_compiler_flag(
 )
 
 set(rj_arith_x86_64_v3_sources
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/mixed_bf16_x86_64_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/conversion/x86_64/byte_conversion_x86_64_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/conversion/x86_64/conversion16_x86_64_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/conversion/x86_64/conversion32_x86_64_v3.cpp
@@ -65,6 +66,7 @@ set(rj_arith_x86_64_v3_sources
     ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/half_fma_exact_x86_64_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/half_minmax_x86_64_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/ldexp_x86_64_v3.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/mixed_mad_x86_64_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/minmax_x86_64_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/mixed_fma_x86_64_v3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/packed_fma_x86_64_v3.cpp
@@ -109,6 +111,8 @@ set(rj_arith_x86_64_v3_sources
 )
 
 set(rj_arith_x86_64_v4_sources
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/mixed_bf16_x86_64_v4.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dot/x86_64/cdna_dot_x86_64_v4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/conversion/x86_64/byte_conversion_x86_64_v4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/conversion/x86_64/conversion16_x86_64_v4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/conversion/x86_64/conversion32_x86_64_v4.cpp
@@ -134,6 +138,7 @@ set(rj_arith_x86_64_v4_sources
     ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/fma_exact_x86_64_v4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/half_fma_exact_x86_64_v4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/ldexp_x86_64_v4.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/mixed_mad_x86_64_v4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fp/x86_64/mixed_fma_exact_x86_64_v4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/graphics/x86_64/cube_x86_64_v4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/graphics/x86_64/interp32_x86_64_v4.cpp
