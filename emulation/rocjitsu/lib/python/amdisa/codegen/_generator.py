@@ -15609,10 +15609,26 @@ class CodeGenerator:
                     cpp_includes.append(
                         ('rocjitsu/isa/arch/amdgpu/shared/rj_arith_lane_exec.h', False)
                     )
-                from amdisa.codegen.execute.rj_arith_float import FLOAT_NAMES
+                from amdisa.codegen.execute.rj_arith_float import (
+                    FLOAT_NAMES,
+                    FP8_NARROW_NAMES,
+                    FP8_WIDEN_NAMES,
+                )
 
-                if self.isa_spec.arch_name in ('rdna3', 'rdna4') and any(
-                    i.name in FLOAT_NAMES for i in all_insts
+                if (
+                    self.isa_spec.arch_name in ('rdna3', 'rdna4')
+                    and any((i.name in FLOAT_NAMES for i in all_insts))
+                    or (
+                        self.isa_spec.arch_name in ('cdna3', 'cdna4', 'cdna5')
+                        and any((i.name in FP8_NARROW_NAMES for i in all_insts))
+                    )
+                ) or (
+                    self.isa_spec.arch_name in ('rdna3', 'rdna4')
+                    and any((i.name in FLOAT_NAMES for i in all_insts))
+                    or (
+                        self.isa_spec.arch_name in ('cdna3', 'cdna4', 'cdna5')
+                        and any((i.name in FP8_WIDEN_NAMES for i in all_insts))
+                    )
                 ):
                     cpp_includes.append(
                         ('rocjitsu/isa/arch/amdgpu/shared/rj_arith_float_exec.h', False)
