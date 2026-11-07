@@ -148,6 +148,14 @@ ncclResult_t ncclDevrWorldToLsaRank(struct ncclComm*, int worldRank, int* lsaRan
 ncclResult_t ncclDevrGetLsaTeamPtrMC(struct ncclComm*, struct ncclDevrWindow*, size_t, struct ncclTeam, void**) {
   FailLoudUnfaked("dev_runtime_fakes", "ncclDevrGetLsaTeamPtrMC");
 }
+// group.cc's devcomm-create task path; no suite reaches it.
+ncclResult_t ncclDevrCommCreateInternal(struct ncclComm*, struct ncclDevCommRequirements*, struct ncclDevComm*, bool,
+                                        uint32_t) {
+  FailLoudUnfaked("dev_runtime_fakes", "ncclDevrCommCreateInternal");
+}
+void freeDevCommRequirements(struct ncclDevCommRequirements*) {
+  FailLoudUnfaked("dev_runtime_fakes", "freeDevCommRequirements");
+}
 
 void ResetDevRuntimeFakes() {
   g_devrFindWindow = DefaultDevrFindWindow;
