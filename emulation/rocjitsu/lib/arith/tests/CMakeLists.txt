@@ -99,6 +99,7 @@ foreach(
         v_div_scale
         v_fma_dx9_zero
         v_fma
+        v_mad_f16
         v_fma_mix
         v_fmaak
         v_fmac

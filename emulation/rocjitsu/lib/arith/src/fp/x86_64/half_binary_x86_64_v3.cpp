@@ -17,12 +17,62 @@
 
 namespace rocjitsu::arith {
 
+namespace {
+
+// Collapse four 64-bit comparison masks into four 32-bit masks.
+__m128i mask32(__m256d mask) {
+  auto words = _mm256_shuffle_epi32(_mm256_castpd_si256(mask), _MM_SHUFFLE(2, 0, 2, 0));
+  return _mm_unpacklo_epi64(_mm256_castsi256_si128(words), _mm256_extracti128_si256(words, 1));
+}
+
+// Add four widened half operands exactly, then round toward the guest direction in FP32.
+// Correcting at most one FP32 ULP lets the subsequent half conversion use that same direction.
+__m128 add_directed4(__m128 x, __m128 y, unsigned rounding) {
+  auto exact = _mm256_add_pd(_mm256_cvtps_pd(x), _mm256_cvtps_pd(y));
+  auto nearest = _mm256_cvtpd_ps(exact);
+  auto rounded = _mm256_cvtps_pd(nearest);
+  auto above = mask32(_mm256_cmp_pd(rounded, exact, _CMP_GT_OQ));
+  auto below = mask32(_mm256_cmp_pd(rounded, exact, _CMP_LT_OQ));
+  auto bits = _mm_castps_si128(nearest);
+  auto sign = _mm_srai_epi32(bits, 31);
+  auto up = rounding == 1   ? below
+            : rounding == 3 ? _mm_and_si128(below, sign)
+                            : _mm_setzero_si128();
+  auto down = rounding == 2   ? above
+              : rounding == 3 ? _mm_andnot_si128(sign, above)
+                              : _mm_setzero_si128();
+  auto step = _mm_or_si128(sign, _mm_set1_epi32(1));
+  bits = _mm_add_epi32(bits, _mm_and_si128(up, step));
+  bits = _mm_sub_epi32(bits, _mm_and_si128(down, step));
+  if (rounding == 2) {
+    auto zero =
+        _mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7fffffff)), _mm_setzero_si128());
+    auto opposite = _mm_and_si128(_mm_xor_si128(_mm_castps_si128(x), _mm_castps_si128(y)),
+                                  _mm_set1_epi32(int(0x80000000U)));
+    bits = _mm_or_si128(bits, _mm_and_si128(zero, opposite));
+  }
+  return _mm_castsi128_ps(bits);
+}
+
+// Add eight half-derived operands with guest rounding; host controls remain unchanged.
+__m256 add(__m256 x, __m256 y, unsigned rounding) {
+  if (!rounding) {
+    return _mm256_add_ps(x, y);
+  }
+  auto low = add_directed4(_mm256_castps256_ps128(x), _mm256_castps256_ps128(y), rounding);
+  auto high = add_directed4(_mm256_extractf128_ps(x, 1), _mm256_extractf128_ps(y, 1), rounding);
+  return _mm256_insertf128_ps(_mm256_castps128_ps256(low), high, 1);
+}
+
+} // namespace
+
 // Evaluate FP16 binary arithmetic. Preserve destination lanes outside exec_mask.
 // Requires the named CPU features and validated instruction controls.
 template <Binary Op, bool Packed>
 void half_binary_x86_64_v3(uint64_t flags, uint32_t exec_mask, uint32_t instruction_flags,
                            uint32_t *d, const uint32_t *a, const uint32_t *b, bool compatibility,
                            bool preserve_input_snan) {
+  const unsigned rounding = unsigned((flags & RJ_ARITH_FP_ROUND_MASK) >> 24);
   constexpr bool arithmetic = rocjitsu::arith::is_arithmetic(Op);
   constexpr bool legacy = Op == Binary::MinLegacy || Op == Binary::MaxLegacy;
   constexpr bool preserve_nan_inputs = legacy || Op == Binary::Minimum || Op == Binary::Maximum;
@@ -55,15 +105,15 @@ void half_binary_x86_64_v3(uint64_t flags, uint32_t exec_mask, uint32_t instruct
       }
       __m256 value;
       if constexpr (Op == Binary::Add) {
-        value = _mm256_add_ps(x, y);
+        value = add(x, y, rounding);
       }
       if constexpr (Op == Binary::Sub) {
         y = _mm256_xor_ps(y, _mm256_set1_ps(-0.0f));
-        value = _mm256_add_ps(x, y);
+        value = add(x, y, rounding);
       }
       if constexpr (Op == Binary::Subrev) {
         x = _mm256_xor_ps(x, _mm256_set1_ps(-0.0f));
-        value = _mm256_add_ps(x, y);
+        value = add(x, y, rounding);
       }
       if constexpr (Op == Binary::Mul) {
         value = _mm256_mul_ps(x, y);
@@ -92,7 +142,7 @@ void half_binary_x86_64_v3(uint64_t flags, uint32_t exec_mask, uint32_t instruct
       if (m & RJ_ARITH_ALU_OMOD_MASK) {
         if (arithmetic && compatibility && !Packed) {
           // Narrow and widen in registers; ordinary Loose needs neither conversion.
-          auto narrowed = half_narrow(value, flags & RJ_ARITH_FP16_OVFL);
+          auto narrowed = half_narrow(value, flags & RJ_ARITH_FP16_OVFL, rounding);
           value = _mm256_cvtph_ps(_mm_packus_epi32(_mm256_castsi256_si128(narrowed),
                                                    _mm256_extracti128_si256(narrowed, 1)));
         }
@@ -114,9 +164,11 @@ void half_binary_x86_64_v3(uint64_t flags, uint32_t exec_mask, uint32_t instruct
         }
         value = clamped;
       }
-      auto encoded = half_narrow<legacy>(value, flags & RJ_ARITH_FP16_OVFL);
+      auto encoded =
+          half_narrow<legacy>(value, flags & RJ_ARITH_FP16_OVFL, arithmetic ? rounding : 0);
       if constexpr (Packed && arithmetic) {
-        if (preserve_input_snan && !(m & RJ_ARITH_ALU_CLAMP)) {
+        if (preserve_input_snan &&
+            (!(m & RJ_ARITH_ALU_CLAMP) || (flags & RJ_ARITH_FP_DX10_CLAMP_OFF))) {
           // Restore selected raw sNaNs after F16C has quieted them.
           auto raw_half = [](__m256i words, int shift, bool negate) {
             auto bits = _mm256_and_si256(_mm256_srl_epi32(words, _mm_cvtsi32_si128(shift)),

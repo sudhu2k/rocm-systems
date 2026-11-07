@@ -15609,10 +15609,47 @@ class CodeGenerator:
                     cpp_includes.append(
                         ('rocjitsu/isa/arch/amdgpu/shared/rj_arith_lane_exec.h', False)
                     )
-                from amdisa.codegen.execute.rj_arith_float import FLOAT_NAMES
+                from amdisa.codegen.execute.rj_arith_float import (
+                    FLOAT_NAMES,
+                    BINARY_ARITHMETIC_F16,
+                    FMA_F16,
+                )
 
-                if self.isa_spec.arch_name in ('rdna3', 'rdna4') and any(
-                    i.name in FLOAT_NAMES for i in all_insts
+                if any(
+                    i.name
+                    in (
+                        FLOAT_NAMES
+                        if self.isa_spec.arch_name in ('rdna3', 'rdna4')
+                        else (
+                            (
+                                (
+                                    (
+                                        (
+                                            (
+                                                (
+                                                    BINARY_ARITHMETIC_F16
+                                                    | {'V_FREXP_EXP_I16_F16'}
+                                                )
+                                                | FMA_F16
+                                            )
+                                            | {'V_MAD_F16', 'V_MAD_LEGACY_F16'}
+                                        )
+                                        | {
+                                            'V_MAD_F16',
+                                            'V_MAD_LEGACY_F16',
+                                            'V_MADMK_F16',
+                                            'V_MADAK_F16',
+                                        }
+                                    )
+                                    | {'V_PK_FMAC_F16'}
+                                )
+                                | {'V_PK_ADD_F16', 'V_PK_MUL_F16', 'V_PK_FMA_F16'}
+                            )
+                            if self.isa_spec.arch_name in ('cdna3', 'cdna4', 'cdna5')
+                            else ()
+                        )
+                    )
+                    for i in all_insts
                 ):
                     cpp_includes.append(
                         ('rocjitsu/isa/arch/amdgpu/shared/rj_arith_float_exec.h', False)

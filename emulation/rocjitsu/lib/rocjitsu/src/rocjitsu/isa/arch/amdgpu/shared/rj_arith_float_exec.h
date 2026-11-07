@@ -5,6 +5,7 @@
 
 #include "rj_arith/rj_arith.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/alu_exceptions.h"
+#include "rocjitsu/isa/arch/amdgpu/shared/dpp_sdwa_ops.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/rj_arith_vector_exec.h"
 #include "rocjitsu/isa/operand.h"
 #include "rocjitsu/vm/amdgpu/register_access.h"
@@ -554,12 +555,12 @@ inline void execute_dot2_f16(Wavefront &wave, FloatTernaryWave32Function wave32,
 }
 
 // Fixed-rounding cores can still use guest rounding for FRACT or output scaling.
-// Routed VOP1 halves and explicit VOP3 selectors both
-// preserve the destination's other half, including when source and destination alias.
+// Preserve the unselected half, unless zero_extend_low requests zero-extension
+// of low-half results for older CDNA instructions. Source/destination aliasing is supported.
 inline void execute_float_unary16(Wavefront &wave, FloatUnary32Function wave32,
                                   FloatUnary64Function wave64, uint64_t flags, uint64_t modifiers,
                                   const Operand &destination, const Operand &source, bool rdna3,
-                                  bool guest_rounding = false) {
+                                  bool guest_rounding = false, bool zero_extend_low = false) {
   const uint64_t exec_mask = wave.exec() & wave.vgpr_write_mask();
   if (!wave.exec())
     return;
@@ -578,11 +579,89 @@ inline void execute_float_unary16(Wavefront &wave, FloatUnary32Function wave32,
                    ? wave32(flags, uint32_t(write_mask), modifiers, d, &a.data, state)
                    : wave64(flags, write_mask, modifiers, d, &a.data, state);
       },
-      /*allow_direct=*/false, modifiers & RJ_ARITH_ALU_HIGH_D ? 0xC : 0x3);
+      /*allow_direct=*/false,
+      modifiers & RJ_ARITH_ALU_HIGH_D ? 0xC
+      : zero_extend_low               ? 0xF
+                                      : 0x3);
   if (success) {
     wave.set_trapsts(wave.trapsts() | causes);
     wave.raise_alu_causes(causes);
   }
+}
+
+// Extract exponents from staged SDWA sources and apply integer destination placement.
+// Arithmetic runs for the whole wave before any aliased destination is published.
+template <typename Inst>
+inline void execute_half_exponent_sdwa(Inst &inst, Wavefront &wave, FloatUnary32Function wave32,
+                                       FloatUnary64Function wave64, uint64_t flags,
+                                       const Operand &destination, const Operand &source) {
+  const uint64_t exec_mask = wave.exec() & wave.vgpr_write_mask();
+  if (!wave.exec()) {
+    return;
+  }
+  flags = float16_f64_flags(wave, flags, true) & ~RJ_ARITH_FP_ROUND_MASK;
+  RegisterAccess registers(wave);
+  VectorInput32 a(registers, wave, source, wave.exec(), 0x3);
+  if (wave.instruction_execution_failed()) {
+    return;
+  }
+  uint32_t result[64]{};
+  uint32_t *d = result;
+  uint32_t causes = 0;
+  const int status = wave.wf_size() == 32
+                         ? wave32(flags, uint32_t(exec_mask), 0, &d, &a.data, &causes)
+                         : wave64(flags, exec_mask, 0, &d, &a.data, &causes);
+  if (status != RJ_ARITH_SUCCESS) {
+    wave.report_instruction_execution_error(InstructionExecutionError::UnsupportedOperandValue);
+    return;
+  }
+  for (uint32_t lane = 0; lane < wave.wf_size(); ++lane) {
+    if (exec_mask & (1ULL << lane)) {
+      sdwa::write_lane<sdwa::ResultFormat::NONE>(inst, wave, destination, lane, result[lane]);
+    }
+  }
+}
+
+// Apply SDWA floating modifiers to semantic half results before destination placement.
+// Capture every input before publishing aliased outputs or architectural status.
+template <typename Inst>
+inline void execute_float_binary16_sdwa(Inst &inst, Wavefront &wave, FloatBinary32Function wave32,
+                                        FloatBinary64Function wave64, uint64_t flags,
+                                        const Operand &destination, const Operand &lhs,
+                                        const Operand &rhs) {
+  if (!wave.exec()) {
+    return;
+  }
+  const uint64_t exec_mask = wave.exec() & wave.vgpr_write_mask();
+  flags = float16_flags(wave, flags, true);
+  const uint64_t modifiers =
+      uint64_t(sdwa::output_modifier<sdwa::ResultFormat::F16>(inst, wave)) * RJ_ARITH_ALU_OMOD_2 |
+      (inst.sdwa_clamp_ ? RJ_ARITH_ALU_CLAMP : 0);
+  RegisterAccess registers(wave);
+  VectorInput32 a(registers, wave, lhs, wave.exec(), 0x3);
+  VectorInput32 b(registers, wave, rhs, wave.exec(), 0x3);
+  if (wave.instruction_execution_failed()) {
+    return;
+  }
+  uint32_t result[64]{};
+  uint32_t *d = result;
+  uint32_t causes = 0;
+  const int status =
+      wave.wf_size() == 32
+          ? wave32(flags, uint32_t(exec_mask), modifiers, &d, &a.data, &b.data, &causes)
+          : wave64(flags, exec_mask, modifiers, &d, &a.data, &b.data, &causes);
+  if (status != RJ_ARITH_SUCCESS) {
+    wave.report_instruction_execution_error(InstructionExecutionError::UnsupportedOperandValue);
+    return;
+  }
+  for (uint32_t lane = 0; lane < wave.wf_size(); ++lane) {
+    if (exec_mask & (1ULL << lane)) {
+      // Arithmetic already applied scaling and clamp; only byte placement remains.
+      sdwa::write_lane<sdwa::ResultFormat::NONE>(inst, wave, destination, lane, result[lane]);
+    }
+  }
+  wave.set_trapsts(wave.trapsts() | causes);
+  wave.raise_alu_causes(causes);
 }
 
 // Ordinary FP16 reads and writes selected halves. VOP2 operand wrappers already
@@ -591,7 +670,7 @@ inline void execute_float_unary16(Wavefront &wave, FloatUnary32Function wave32,
 inline void execute_float_binary16(Wavefront &wave, FloatBinary32Function wave32,
                                    FloatBinary64Function wave64, uint64_t flags, uint64_t modifiers,
                                    const Operand &destination, const Operand &lhs,
-                                   const Operand &rhs, bool rdna3) {
+                                   const Operand &rhs, bool rdna3, bool zero_extend_low = false) {
   const uint64_t exec_mask = wave.exec() & wave.vgpr_write_mask();
   if (!wave.exec())
     return;
@@ -599,6 +678,8 @@ inline void execute_float_binary16(Wavefront &wave, FloatBinary32Function wave32
   RegisterAccess registers(wave);
   VectorInput32 a(registers, wave, lhs, wave.exec(), modifiers & RJ_ARITH_ALU_HIGH_A ? 0xC : 0x3);
   VectorInput32 b(registers, wave, rhs, wave.exec(), modifiers & RJ_ARITH_ALU_HIGH_B ? 0xC : 0x3);
+  // CDNA VOP3 low-half results clear the upper half; the staged output is zero-initialized.
+  const uint8_t bytes = modifiers & RJ_ARITH_ALU_HIGH_D ? 0xC : zero_extend_low ? 0xF : 0x3;
   uint32_t causes = 0;
   const bool success = write_vector32_result(
       wave, registers, destination, exec_mask,
@@ -608,7 +689,7 @@ inline void execute_float_binary16(Wavefront &wave, FloatBinary32Function wave32
                    ? wave32(flags, uint32_t(write_mask), modifiers, d, &a.data, &b.data, state)
                    : wave64(flags, write_mask, modifiers, d, &a.data, &b.data, state);
       },
-      /*allow_direct=*/false, modifiers & RJ_ARITH_ALU_HIGH_D ? 0xC : 0x3);
+      /*allow_direct=*/false, bytes);
   if (success) {
     wave.set_trapsts(wave.trapsts() | causes);
     wave.raise_alu_causes(causes);
@@ -681,7 +762,7 @@ inline void execute_float_ternary16(Wavefront &wave, FloatTernaryWave32Function 
                                     FloatTernaryWave64Function wave64, uint64_t flags,
                                     uint64_t modifiers, const Operand &destination,
                                     const Operand &lhs, const Operand &rhs, const Operand &third,
-                                    bool rdna3) {
+                                    bool rdna3, bool zero_extend_low = false) {
   const uint64_t exec_mask = wave.exec() & wave.vgpr_write_mask();
   if (!wave.exec())
     return;
@@ -690,6 +771,9 @@ inline void execute_float_ternary16(Wavefront &wave, FloatTernaryWave32Function 
   VectorInput32 a(registers, wave, lhs, wave.exec(), modifiers & RJ_ARITH_ALU_HIGH_A ? 0xC : 0x3);
   VectorInput32 b(registers, wave, rhs, wave.exec(), modifiers & RJ_ARITH_ALU_HIGH_B ? 0xC : 0x3);
   VectorInput32 c(registers, wave, third, wave.exec(), modifiers & RJ_ARITH_ALU_HIGH_C ? 0xC : 0x3);
+  // Legacy CDNA low-half writes clear the other half. Publish zeroes from the staged bank;
+  // ordinary FMA/MAD operands restrict this write to their selected destination half.
+  const uint8_t bytes = modifiers & RJ_ARITH_ALU_HIGH_D ? 0xC : zero_extend_low ? 0xF : 0x3;
   uint32_t causes = 0;
   const bool success = write_vector32_result(
       wave, registers, destination, exec_mask,
@@ -700,7 +784,7 @@ inline void execute_float_ternary16(Wavefront &wave, FloatTernaryWave32Function 
                             state)
                    : wave64(flags, write_mask, modifiers, d, &a.data, &b.data, &c.data, state);
       },
-      /*allow_direct=*/false, modifiers & RJ_ARITH_ALU_HIGH_D ? 0xC : 0x3);
+      /*allow_direct=*/false, bytes);
   if (success) {
     wave.set_trapsts(wave.trapsts() | causes);
     wave.raise_alu_causes(causes);
@@ -773,6 +857,44 @@ inline void execute_packed_fma16(Wavefront &wave, Wave32Function wave32, Wave64F
         }
       });
   if (success) {
+    wave.set_trapsts(wave.trapsts() | causes);
+    wave.raise_alu_causes(causes);
+  }
+}
+
+// Evaluate CDNA packed FMAC before SDWA destination placement and final clamp.
+// Sources have already been selected/staged by the generated instruction wrapper.
+template <typename Inst, typename Wave32Function, typename Wave64Function>
+inline void execute_packed_fmac_sdwa(Inst &inst, Wavefront &wave, Wave32Function wave32,
+                                     Wave64Function wave64, uint64_t flags, uint64_t modifiers,
+                                     const Operand &destination, const Operand &lhs,
+                                     const Operand &rhs) {
+  const uint64_t exec_mask = wave.exec() & wave.vgpr_write_mask();
+  if (!wave.exec())
+    return;
+  flags = float16_flags(wave, flags, true);
+  RegisterAccess registers(wave);
+  VectorInput32 a(registers, wave, lhs, wave.exec());
+  VectorInput32 b(registers, wave, rhs, wave.exec());
+  VectorInput32 c(registers, wave, destination, wave.exec());
+  if (wave.instruction_execution_failed())
+    return;
+  uint32_t result[64];
+  std::copy_n(c.data, wave.wf_size(), result);
+  uint32_t *d = result;
+  uint32_t causes = 0;
+  int status = wave.wf_size() == 32
+                   ? wave32(flags, uint32_t(exec_mask), modifiers, &d, &a.data, &b.data, &causes)
+                   : wave64(flags, exec_mask, modifiers, &d, &a.data, &b.data, &causes);
+  if (status != RJ_ARITH_SUCCESS) {
+    wave.report_instruction_execution_error(InstructionExecutionError::UnsupportedOperandValue);
+    return;
+  }
+  for (uint32_t lane = 0; lane < wave.wf_size(); ++lane) {
+    if (exec_mask & (1ULL << lane))
+      sdwa::write_lane<sdwa::ResultFormat::PK_F16>(inst, wave, destination, lane, result[lane]);
+  }
+  if (!wave.instruction_execution_failed()) {
     wave.set_trapsts(wave.trapsts() | causes);
     wave.raise_alu_causes(causes);
   }

@@ -376,6 +376,25 @@ int half_binary(uint64_t flags, uint32_t exec_mask, uint64_t instruction_flags, 
   if (exec_mask == 0) {
     return RJ_ARITH_SUCCESS;
   }
+  const bool preserve_input_snan =
+      Packed && Rdna3 && compatibility && !(flags & RJ_ARITH_FP_IEEE_MODE);
+#if defined(RJ_ARITH_HAVE_X86_64_V4)
+  if constexpr (arithmetic) {
+    if (rocjitsu::arith::cpu_level_at_least(flags, RJ_ARITH_CPU_X86_64_V4)) {
+      rocjitsu::arith::half_binary_x86_64_v4<Op, Packed>(flags, exec_mask,
+                                                         uint32_t(instruction_flags), d[0], a[0],
+                                                         b[0], compatibility, preserve_input_snan);
+      return RJ_ARITH_SUCCESS;
+    }
+  }
+#endif
+#if defined(RJ_ARITH_HAVE_X86_64_V3)
+  if (rocjitsu::arith::cpu_level_at_least(flags, RJ_ARITH_CPU_X86_64_V3)) {
+    rocjitsu::arith::half_binary_x86_64_v3<Op, Packed>(
+        flags, exec_mask, instruction_flags, d[0], a[0], b[0], compatibility, preserve_input_snan);
+    return RJ_ARITH_SUCCESS;
+  }
+#endif
   if constexpr (!Packed && arithmetic) {
     if (flags & RJ_ARITH_FP_ROUND_MASK) {
       return arithmetic_modes<Op, Rdna3>(flags, exec_mask, uint32_t(instruction_flags), d, a, b,
@@ -389,15 +408,6 @@ int half_binary(uint64_t flags, uint32_t exec_mask, uint64_t instruction_flags, 
                                                 b);
     }
   }
-  const bool preserve_input_snan =
-      Packed && Rdna3 && compatibility && !(flags & RJ_ARITH_FP_IEEE_MODE);
-#if defined(RJ_ARITH_HAVE_X86_64_V3)
-  if (rocjitsu::arith::cpu_level_at_least(flags, RJ_ARITH_CPU_X86_64_V3)) {
-    rocjitsu::arith::half_binary_x86_64_v3<Op, Packed>(
-        flags, exec_mask, instruction_flags, d[0], a[0], b[0], compatibility, preserve_input_snan);
-    return RJ_ARITH_SUCCESS;
-  }
-#endif
   if constexpr (Packed) {
     if (!(flags & (RJ_ARITH_FP_FLUSH_INPUT_DENORMALS | RJ_ARITH_FP_FLUSH_OUTPUT_DENORMALS))) {
       return half_binary_scalar<Op, Packed, false, Rdna3>(flags, exec_mask, instruction_flags, d, a,

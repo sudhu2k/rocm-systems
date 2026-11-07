@@ -120,6 +120,20 @@ int half_exponent(uint64_t flags, uint32_t exec_mask, uint64_t instruction_flags
   }
   if constexpr (Ldexp) {
     if (rocjitsu::arith::is_exact(flags) || (flags & RJ_ARITH_FP_ROUND_MASK)) {
+#if defined(RJ_ARITH_HAVE_X86_64_V4)
+      if (rocjitsu::arith::cpu_level_at_least(flags, RJ_ARITH_CPU_X86_64_V4)) {
+        rocjitsu::arith::half_ldexp_exact_x86_64_v4(flags, exec_mask, uint32_t(instruction_flags),
+                                                    d[0], a[0], b[0]);
+        return RJ_ARITH_SUCCESS;
+      }
+#endif
+#if defined(RJ_ARITH_HAVE_X86_64_V3)
+      if (rocjitsu::arith::cpu_level_at_least(flags, RJ_ARITH_CPU_X86_64_V3)) {
+        rocjitsu::arith::half_ldexp_exact_x86_64_v3(flags, exec_mask, uint32_t(instruction_flags),
+                                                    d[0], a[0], b[0]);
+        return RJ_ARITH_SUCCESS;
+      }
+#endif
       return ldexp_rounded(flags, exec_mask, uint32_t(instruction_flags), d, a, b);
     }
     if constexpr (!GuestDenormals) {
@@ -129,6 +143,15 @@ int half_exponent(uint64_t flags, uint32_t exec_mask, uint64_t instruction_flags
       }
     }
   }
+#if defined(RJ_ARITH_HAVE_X86_64_V4)
+  if constexpr (!Ldexp) {
+    if (rocjitsu::arith::cpu_level_at_least(flags, RJ_ARITH_CPU_X86_64_V4)) {
+      rocjitsu::arith::half_frexp_exp_x86_64_v4(flags, exec_mask, uint32_t(instruction_flags), d[0],
+                                                a[0]);
+      return RJ_ARITH_SUCCESS;
+    }
+  }
+#endif
 #if defined(RJ_ARITH_HAVE_X86_64_V3)
   if (rocjitsu::arith::cpu_level_at_least(flags, RJ_ARITH_CPU_X86_64_V3)) {
     if constexpr (GuestDenormals) {
