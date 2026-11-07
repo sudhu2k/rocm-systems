@@ -297,43 +297,6 @@ function(rccl_define_micro_source_lists)
     ../common/ProcessIsolatedTestRunner.cpp
     PARENT_SCOPE)
 
-  # rccl-UnitTestsMicroBootstrap -- src/bootstrap.cc. Own binary: bootstrap_micro_fakes.cc replaces misc/socket.cc
-  # wholesale, and other binaries link bootstrap_stubs.cc for this unit's symbols.
-  set(TEST_MICRO_BOOTSTRAP_SOURCE_FILES
-    bootstrap-test.cc
-    fakes/bootstrap_micro_fakes.cc
-    fakes/env_fakes.cc
-    fakes/hip_fakes.cc
-    fakes/nccl_fakes.cc
-    fakes/os_fakes.cc
-    ${RCCL_HOST_HIPIFY_DIR}/src/misc/utils.cc
-    ../common/main_altrsmi.cpp
-    PARENT_SCOPE)
-
-  # rccl-UnitTestsMicroCollectives -- src/collectives.cc. Own binary: fakes/collectives_fakes.cc, which
-  # most targets link, defines this file's string helpers.
-  set(TEST_MICRO_COLLECTIVES_SOURCE_FILES
-    collectives-test.cc
-    fakes/bootstrap_stubs.cc
-    fakes/ce_fakes.cc
-    fakes/collconfig_fakes.cc
-    fakes/comm_fakes.cc
-    fakes/dda_fakes.cc
-    fakes/dev_runtime_fakes.cc
-    fakes/enqueue_fakes.cc
-    fakes/group_fakes.cc
-    fakes/hip_fakes.cc
-    fakes/nccl_fakes.cc
-    fakes/nccl_stubs.cc
-    fakes/mgmt_task_enq_fakes.cc
-    fakes/rccl_wrap_fakes.cc
-    fakes/recorder_fakes.cc
-    fakes/strongstream_stubs.cc
-    fakes/sym_kernels_fakes.cc
-    ${RCCL_HOST_HIPIFY_DIR}/src/misc/archinfo.cc
-    ../common/main_altrsmi.cpp
-    PARENT_SCOPE)
-
   # rccl-UnitTestsMicroInit(+-uncached,-faultinj) -- src/init.cc.
   set(TEST_MICRO_INIT_SOURCE_FILES
     init-test.cc
@@ -350,7 +313,6 @@ function(rccl_define_micro_source_lists)
     # Shared per-production-TU fakes (see MICROTEST_README.md for the map).
     fakes/amdsmi_fakes.cc
     fakes/api_trace_fakes.cc
-    fakes/dev_runtime_fakes.cc
     fakes/enqueue_fakes.cc               # src/enqueue/enqueue.cc (rcclEffectiveP2pBatchEnable)
     fakes/env_fakes.cc
     fakes/env_plugin_fakes.cc
@@ -378,59 +340,6 @@ function(rccl_define_micro_source_lists)
     ../common/ProcessIsolatedTestRunner.cpp
     PARENT_SCOPE)
 
-  # rccl-UnitTestsMicroHostDispatch -- host_test_dispatch.cc, the rccl-UnitTestsHostAll front end.
-  # Own binary like every other unit under test; it also makes the dispatcher run its own tests.
-  set(TEST_MICRO_HOST_DISPATCH_SOURCE_FILES
-    host-test-dispatch-test.cc
-    ../common/main_altrsmi.cpp
-    PARENT_SCOPE)
-
-  # rccl-UnitTestsMicroCpuset -- src/include/cpuset.h. Own binary: the test defines os/linux.cc's
-  # ncclOsCpu* one-liners, which would otherwise sit in the shared binary as test-TU definitions.
-  set(TEST_MICRO_CPUSET_SOURCE_FILES
-    cpuset-test.cc
-    ../common/main_altrsmi.cpp
-    PARENT_SCOPE)
-
-  # rccl-UnitTestsMicroDebug -- src/debug.cc. Own binary: it is the real ncclDebugLog, which
-  # every shared fake set also defines.
-  set(TEST_MICRO_DEBUG_SOURCE_FILES
-    debug-test.cc
-    ../common/main_altrsmi.cpp
-    PARENT_SCOPE)
-
-  # rccl-UnitTestsMicroCe -- src/ce_coll.cc. Its own binary: every other target links ce_fakes.cc.
-  set(TEST_MICRO_CE_SOURCE_FILES
-    ce-coll-test.cc
-    fakes/allocator_fakes.cc             # src/allocator.cc
-    fakes/bootstrap_stubs.cc
-    fakes/topo_stubs.cc
-    fakes/transport_stubs.cc
-    fakes/nccl_stubs.cc
-    fakes/channel_fakes.cc
-    fakes/nccl_fakes.cc
-    fakes/hip_fakes.cc
-    fakes/ce_reduce_fakes.cc             # src/device/ce_reduce.cc
-    fakes/collectives_fakes.cc
-    fakes/comm_fakes.cc
-    fakes/dev_runtime_fakes.cc
-    fakes/devcomm_fakes.cc               # ncclTeamLsa
-    fakes/env_fakes.cc
-    fakes/mgmt_task_enq_fakes.cc
-    fakes/os_fakes.cc
-    fakes/profiler_fakes.cc
-    fakes/rccl_wrap_fakes.cc             # rcclParamCeAllReduce, rcclParamCeReduceScatter, rcclParamCeArStagingBytes
-    fakes/recorder_fakes.cc
-    fakes/rma_fakes.cc
-    fakes/roctx_fakes.cc
-    fakes/strongstream_stubs.cc
-    fakes/tuning_fakes.cc
-    ${RCCL_HOST_HIPIFY_DIR}/src/misc/argcheck.cc
-    ${RCCL_HOST_HIPIFY_DIR}/src/misc/archinfo.cc
-    ${RCCL_HOST_HIPIFY_DIR}/src/misc/utils.cc
-    ../common/main_altrsmi.cpp
-    PARENT_SCOPE)
-
   # rccl-UnitTestsMicroSymKernels -- REAL src/sym_kernels.cc + generated host TU.
   set(TEST_MICRO_SYM_KERNELS_SOURCE_FILES
     sym-kernels-test.cc
@@ -452,43 +361,6 @@ function(rccl_define_micro_source_lists)
     ${RCCL_HOST_HIPIFY_DIR}/src/misc/argcheck.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/misc/archinfo.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/misc/utils.cc
-    ../common/main_altrsmi.cpp
-    PARENT_SCOPE)
-
-  # rccl-UnitTestsMicroCftDevRuntime -- src/cft_dev_runtime.cc + src/nccl_device/core.cc. Own
-  # binary: rccl-UnitTestsMicro fakes most of core.cc, which the LE-info queries call.
-  set(TEST_MICRO_CFT_DEV_RUNTIME_SOURCE_FILES
-    cft-dev-runtime-test.cc
-    fakes/bootstrap_stubs.cc
-    fakes/topo_stubs.cc
-    fakes/transport_stubs.cc
-    fakes/nccl_stubs.cc
-    fakes/channel_fakes.cc
-    fakes/nccl_fakes.cc
-    fakes/hip_fakes.cc
-    fakes/collectives_fakes.cc
-    fakes/comm_fakes.cc
-    fakes/dev_runtime_fakes.cc
-    fakes/env_fakes.cc
-    fakes/mgmt_task_enq_fakes.cc
-    fakes/os_fakes.cc
-    fakes/recorder_fakes.cc
-    fakes/strongstream_stubs.cc
-    fakes/tuning_fakes.cc
-    ${RCCL_HOST_HIPIFY_DIR}/src/misc/argcheck.cc
-    ${RCCL_HOST_HIPIFY_DIR}/src/misc/archinfo.cc
-    ${RCCL_HOST_HIPIFY_DIR}/src/misc/utils.cc
-    ../common/main_altrsmi.cpp
-    PARENT_SCOPE)
-
-  # rccl-UnitTestsMicroProxy -- src/proxy.cc. Own binary: it compiles the real proxy.cc, which
-  # proxy_fakes.cc fakes for the other binaries.
-  set(TEST_MICRO_PROXY_SOURCE_FILES
-    proxy-test.cc
-    fakes/proxy_micro_fakes.cc
-    fakes/env_fakes.cc
-    fakes/hip_fakes.cc
-    fakes/os_fakes.cc
     ../common/main_altrsmi.cpp
     PARENT_SCOPE)
 endfunction()
@@ -1049,13 +921,22 @@ endif()
 # all targets -- no need to repeat it per binary.
 rccl_mark_oracle_tus_generated(${RCCL_HOST_HIPIFY_DIR} argcheck archinfo utils kernel_config)
 
+# Root binaries with OBJECT_PREFIX rccl-root-obj share its objects, so pass no COMMON_DEFS/COMMON_INCLUDES with that
+# prefix. A binary with EXTRA_DEFS compiles its own sources and takes its *_CC_PATH there; the rest set it with
+# target_compile_definitions().
 # ---------------------------------------------------------------------------
-# rccl-UnitTestsMicroBootstrap
+# rccl-UnitTestsMicroBootstrap -- src/bootstrap.cc
 # ---------------------------------------------------------------------------
-rccl_add_micro_binary(rccl-UnitTestsMicroBootstrap
-  SOURCES ${TEST_MICRO_BOOTSTRAP_SOURCE_FILES}
+rccl_add_unit_micro_binary(rccl-UnitTestsMicroBootstrap bootstrap-test.cc
+  OBJECT_PREFIX rccl-root-obj
+  SOURCES
+    fakes/bootstrap_micro_fakes.cc
+    fakes/env_fakes.cc
+    fakes/hip_fakes.cc
+    fakes/nccl_fakes.cc
+    fakes/os_fakes.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/misc/utils.cc
   EXTRA_DEFS
-    ${_MICRO_MODE_DEFS}
     BOOTSTRAP_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/bootstrap.cc"
     RCCL_OS_FAKES_OMIT_ncclSocketClose   # fakes/bootstrap_micro_fakes.cc defines it
   CATEGORIES_YAML "${CMAKE_CURRENT_SOURCE_DIR}/../test_categories_micro_bootstrap.yaml")
@@ -1093,14 +974,30 @@ rccl_add_micro_binary(rccl-UnitTestsMicro
 set_source_files_properties(wrap-test.cc PROPERTIES COMPILE_DEFINITIONS ENABLE_LL128)
 
 # ---------------------------------------------------------------------------
-# rccl-UnitTestsMicroCollectives
+# rccl-UnitTestsMicroCollectives -- src/collectives.cc
 # ---------------------------------------------------------------------------
-rccl_add_micro_binary(rccl-UnitTestsMicroCollectives
-  SOURCES ${TEST_MICRO_COLLECTIVES_SOURCE_FILES}
-  EXTRA_DEFS
-    ${_MICRO_MODE_DEFS}
-    COLLECTIVES_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/collectives.cc"
+rccl_add_unit_micro_binary(rccl-UnitTestsMicroCollectives collectives-test.cc
+  OBJECT_PREFIX rccl-root-obj
+  SOURCES
+    fakes/bootstrap_stubs.cc
+    fakes/ce_fakes.cc
+    fakes/collconfig_fakes.cc
+    fakes/comm_fakes.cc
+    fakes/dda_fakes.cc
+    fakes/dev_runtime_fakes.cc
+    fakes/enqueue_fakes.cc
+    fakes/group_fakes.cc
+    fakes/hip_fakes.cc
+    fakes/nccl_fakes.cc
+    fakes/nccl_stubs.cc
+    fakes/rccl_wrap_fakes.cc
+    fakes/recorder_fakes.cc
+    fakes/strongstream_stubs.cc
+    fakes/sym_kernels_fakes.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/misc/archinfo.cc
   CATEGORIES_YAML "${CMAKE_CURRENT_SOURCE_DIR}/../test_categories_micro_collectives.yaml")
+target_compile_definitions(rccl-UnitTestsMicroCollectives PRIVATE
+  COLLECTIVES_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/collectives.cc")
 # collectives.cc defines a kernel. An empty embedded device binary stands in for the device pass, so the
 # host-only object registers it without referencing a fatbin symbol nothing provides.
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/empty_gpubinary" "")
@@ -1110,12 +1007,10 @@ target_compile_options(rccl-UnitTestsMicroCollectives PRIVATE
 include("${CMAKE_CURRENT_LIST_DIR}/device/host_tests.cmake")
 
 # ---------------------------------------------------------------------------
-# rccl-UnitTestsMicroCpuset
+# rccl-UnitTestsMicroCpuset -- src/include/cpuset.h
 # ---------------------------------------------------------------------------
-rccl_add_micro_binary(rccl-UnitTestsMicroCpuset
-  SOURCES ${TEST_MICRO_CPUSET_SOURCE_FILES}
-  EXTRA_DEFS
-    ${_MICRO_MODE_DEFS}
+rccl_add_unit_micro_binary(rccl-UnitTestsMicroCpuset cpuset-test.cc
+  OBJECT_PREFIX rccl-root-obj
   CATEGORIES_YAML "${CMAKE_CURRENT_SOURCE_DIR}/../test_categories_micro_cpuset.yaml")
 
 # sym_kernels_host.cc only exists when sym kernels are generated (GENERATE_SYM_KERNELS
@@ -1133,14 +1028,13 @@ include("${CMAKE_CURRENT_LIST_DIR}/algorithms/dda/host_tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rma/host_tests.cmake")
 
 # ---------------------------------------------------------------------------
-# rccl-UnitTestsMicroDebug
+# rccl-UnitTestsMicroDebug -- src/debug.cc
 # ---------------------------------------------------------------------------
-rccl_add_micro_binary(rccl-UnitTestsMicroDebug
-  SOURCES ${TEST_MICRO_DEBUG_SOURCE_FILES}
-  EXTRA_DEFS
-    ${_MICRO_MODE_DEFS}
-    DEBUG_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/debug.cc"
+rccl_add_unit_micro_binary(rccl-UnitTestsMicroDebug debug-test.cc
+  OBJECT_PREFIX rccl-root-obj
   CATEGORIES_YAML "${CMAKE_CURRENT_SOURCE_DIR}/../test_categories_micro_debug.yaml")
+target_compile_definitions(rccl-UnitTestsMicroDebug PRIVATE
+  DEBUG_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/debug.cc")
 
 include("${CMAKE_CURRENT_LIST_DIR}/scheduler/host_tests.cmake")
 
@@ -1165,6 +1059,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/gin/host_tests.cmake")
 # ---------------------------------------------------------------------------
 # rccl-UnitTestsMicroInit and variants
 # ---------------------------------------------------------------------------
+# Not rccl_add_unit_micro_binary(): the variants REMOVE_DEFS and add defines every source must see.
 foreach(_variant "" "-uncached" "-faultinj")
   set(_init_tgt "rccl-UnitTestsMicroInit${_variant}")
   rccl_add_micro_binary(${_init_tgt}
@@ -1185,18 +1080,25 @@ include("${CMAKE_CURRENT_LIST_DIR}/nccl_device/host_tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/devcomm/host_tests.cmake")
 
 # ---------------------------------------------------------------------------
-# rccl-UnitTestsMicroCftDevRuntime
+# rccl-UnitTestsMicroCftDevRuntime -- src/cft_dev_runtime.cc + src/nccl_device/core.cc
 # ---------------------------------------------------------------------------
-rccl_add_micro_binary(rccl-UnitTestsMicroCftDevRuntime
-  SOURCES ${TEST_MICRO_CFT_DEV_RUNTIME_SOURCE_FILES}
-  EXTRA_DEFS
-    ${_MICRO_MODE_DEFS}
-    CORE_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/nccl_device/core.cc"
-    CFT_DEV_RUNTIME_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/cft_dev_runtime.cc"
+rccl_add_unit_micro_binary(rccl-UnitTestsMicroCftDevRuntime cft-dev-runtime-test.cc
+  OBJECT_PREFIX rccl-root-obj
+  SOURCES
+    fakes/bootstrap_stubs.cc
+    fakes/nccl_stubs.cc
+    fakes/nccl_fakes.cc
+    fakes/hip_fakes.cc
+    fakes/dev_runtime_fakes.cc
+    fakes/env_fakes.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/misc/argcheck.cc
   CATEGORIES_YAML "${CMAKE_CURRENT_SOURCE_DIR}/../test_categories_micro_cft_dev_runtime.yaml")
+target_compile_definitions(rccl-UnitTestsMicroCftDevRuntime PRIVATE
+  CORE_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/nccl_device/core.cc"
+  CFT_DEV_RUNTIME_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/cft_dev_runtime.cc")
 
 # ---------------------------------------------------------------------------
-# rccl-UnitTestsMicroCe
+# rccl-UnitTestsMicroCeColl -- src/ce_coll.cc
 # ---------------------------------------------------------------------------
 # In-build, CE_BATCH_ASYNC_SUPPORTED arrives with rccl's own compile definitions when CE_ENABLED.
 set(_MICRO_CE_BATCH_DEF "")
@@ -1211,10 +1113,23 @@ if(NOT BUILD_TESTS)
     set(_MICRO_CE_BATCH_DEF CE_BATCH_ASYNC_SUPPORTED)
   endif()
 endif()
-rccl_add_micro_binary(rccl-UnitTestsMicroCe
-  SOURCES ${TEST_MICRO_CE_SOURCE_FILES}
+rccl_add_unit_micro_binary(rccl-UnitTestsMicroCeColl ce-coll-test.cc
+  OBJECT_PREFIX rccl-root-obj
+  SOURCES
+    fakes/allocator_fakes.cc             # src/allocator.cc
+    fakes/nccl_stubs.cc
+    fakes/nccl_fakes.cc
+    fakes/hip_fakes.cc
+    fakes/ce_reduce_fakes.cc             # src/device/ce_reduce.cc
+    fakes/collectives_fakes.cc
+    fakes/comm_fakes.cc
+    fakes/dev_runtime_fakes.cc
+    fakes/devcomm_fakes.cc               # ncclTeamLsa
+    fakes/env_fakes.cc
+    fakes/rccl_wrap_fakes.cc             # rcclParamCeAllReduce, rcclParamCeReduceScatter, rcclParamCeArStagingBytes
+    fakes/rma_fakes.cc
+    fakes/tuning_fakes.cc
   EXTRA_DEFS
-    ${_MICRO_MODE_DEFS}
     ${_MICRO_AMDSMI_DEF}
     ${_MICRO_CE_BATCH_DEF}
     RCCL_STUBS_OMIT_ncclCeFinalize       # ce_coll.cc defines it
@@ -1248,12 +1163,16 @@ endif()
 include("${CMAKE_CURRENT_LIST_DIR}/tuning/host_tests.cmake")
 
 # ---------------------------------------------------------------------------
-# rccl-UnitTestsMicroProxy
+# rccl-UnitTestsMicroProxy -- src/proxy.cc
 # ---------------------------------------------------------------------------
-rccl_add_micro_binary(rccl-UnitTestsMicroProxy
-  SOURCES ${TEST_MICRO_PROXY_SOURCE_FILES}
+rccl_add_unit_micro_binary(rccl-UnitTestsMicroProxy proxy-test.cc
+  OBJECT_PREFIX rccl-root-obj
+  SOURCES
+    fakes/proxy_micro_fakes.cc
+    fakes/env_fakes.cc
+    fakes/hip_fakes.cc
+    fakes/os_fakes.cc
   EXTRA_DEFS
-    ${_MICRO_MODE_DEFS}
     PROXY_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/proxy.cc"
     RCCL_OS_FAKES_OMIT_ncclSocketClose   # fakes/proxy_micro_fakes.cc defines it
   CATEGORIES_YAML "${CMAKE_CURRENT_SOURCE_DIR}/../test_categories_micro_proxy.yaml")
@@ -1263,8 +1182,6 @@ include("${CMAKE_CURRENT_LIST_DIR}/graph/host_tests.cmake")
 # ---------------------------------------------------------------------------
 # rccl-UnitTestsMicroDiagnostics -- src/diagnostics.cc
 # ---------------------------------------------------------------------------
-# Root binaries share rccl-root-obj objects, so pass no COMMON_DEFS/COMMON_INCLUDES with that prefix. A binary with
-# EXTRA_DEFS compiles its own sources and takes its *_CC_PATH there; the rest set it with target_compile_definitions().
 rccl_add_unit_micro_binary(rccl-UnitTestsMicroDiagnostics diagnostics-test.cc
   OBJECT_PREFIX rccl-root-obj
   SOURCES
@@ -1284,11 +1201,10 @@ include("${CMAKE_CURRENT_LIST_DIR}/transport/host_tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/misc/host_tests.cmake")
 
 # ---------------------------------------------------------------------------
-# rccl-UnitTestsMicroHostDispatch
+# rccl-UnitTestsMicroHostTestDispatch -- host_test_dispatch.cc, the rccl-UnitTestsHostAll front end
 # ---------------------------------------------------------------------------
-rccl_add_micro_binary(rccl-UnitTestsMicroHostDispatch
-  SOURCES ${TEST_MICRO_HOST_DISPATCH_SOURCE_FILES}
-  EXTRA_DEFS ${_MICRO_MODE_DEFS}
+rccl_add_unit_micro_binary(rccl-UnitTestsMicroHostTestDispatch host-test-dispatch-test.cc
+  OBJECT_PREFIX rccl-root-obj
   CATEGORIES_YAML "${CMAKE_CURRENT_SOURCE_DIR}/../test_categories_micro.yaml")
 
 # ---------------------------------------------------------------------------
