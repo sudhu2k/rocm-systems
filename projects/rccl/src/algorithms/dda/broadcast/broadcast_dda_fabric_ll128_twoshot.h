@@ -176,7 +176,9 @@ __global__ void ddaBroadcastFabricLL128TwoShot(
       }
     }
 
-    // Phase 2: gather -- poll own gather slot[peer], unpack into recvbuff (unchanged)
+    // Phase 2: gather -- poll own gather slot[peer], unpack into recvbuff.
+    // O8: skip for root column (root has no chunk in the allgather).
+    if (peer != root) {
     const uint64_t* myGather = reinterpret_cast<const uint64_t*>(peerScratch[selfRank]) +
       gatherOff + (uint64_t)peer * slotWireWords;
     for (size_t s = gwarp; s < chunkSlices; s += wstride) {
@@ -193,6 +195,7 @@ __global__ void ddaBroadcastFabricLL128TwoShot(
       //ddaLL128ClearWire(const_cast<uint64_t*>(myGather) +
       //  s * (size_t)kDdaLL128WireWordsPerSlice + 2 * lane, lane);
     }
+    } // if (peer != root) -- O8 guard
   }
 
 #if (defined(__gfx1250__) || defined(__gfx1250_strict__))
