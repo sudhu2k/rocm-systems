@@ -64,6 +64,17 @@ panels:
   - type: metric_table
     id: 11
     title: Infinity Cache and GDDR6
+- file: roofline.yaml
+  panel_id: 4
+  panel_title: Roofline
+  panel_alias: roof
+  data_sources:
+  - type: metric_table
+    id: 1
+    title: Roofline Performance Rates
+  - type: metric_table
+    id: 2
+    title: Roofline Plot Points
 - file: command_processor_cpc.yaml
   panel_id: 5
   panel_title: CPC (Command Processor - Compute)
