@@ -39,10 +39,10 @@
     {"id": "l2", "title": "L2", "column": 3, "order": 0, "position": "grid", "style": "panel", "content": [
       {"metric": "GL2 Utilization", "title": "Util", "category": "util", "bar": true},
       {"metric": "GL2 Hit Rate", "title": "Hit Rate", "category": "hit", "bar": true},
-      {"metric": "Memory-Destined Read Requests", "title": "Memory Read Req", "category": "read", "bar": false},
-      {"metric": "Memory-Destined Write Requests", "title": "Memory Write Req", "category": "write", "bar": false},
-      {"metric": "Memory-Destined Read Bandwidth", "title": "Memory Read BW", "category": "read", "bar": false},
-      {"metric": "Memory-Destined Write Bandwidth", "title": "Memory Write BW", "category": "write", "bar": false}
+      {"metric": "DRAM Read Requests", "title": "Memory Read Req", "category": "read", "bar": false},
+      {"metric": "DRAM Write Requests", "title": "Memory Write Req", "category": "write", "bar": false},
+      {"metric": "DRAM Read Bandwidth", "title": "Memory Read BW", "category": "read", "bar": false},
+      {"metric": "DRAM Write Bandwidth", "title": "Memory Write BW", "category": "write", "bar": false}
     ]},
 
     {"id": "infinity_cache", "title": "Infinity Cache", "column": 4, "order": 0, "position": "grid", "style": "panel", "content": [

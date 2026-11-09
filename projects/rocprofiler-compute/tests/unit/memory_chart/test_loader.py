@@ -124,10 +124,10 @@ def test_gfx1201_memory_demand_belongs_to_l2():
     layout = Layouts.for_arch("gfx1201")
     blocks = {block.id: block for block in layout.blocks()}
     memory_demand = {
-        "Memory-Destined Read Requests",
-        "Memory-Destined Write Requests",
-        "Memory-Destined Read Bandwidth",
-        "Memory-Destined Write Bandwidth",
+        "DRAM Read Requests",
+        "DRAM Write Requests",
+        "DRAM Read Bandwidth",
+        "DRAM Write Bandwidth",
     }
     assert memory_demand <= {item.metric for item in blocks["l2"].items}
     assert {item.metric for item in blocks["gddr6"].items} == {

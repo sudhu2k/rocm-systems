@@ -237,7 +237,7 @@ def test_gfx1201_memory_demand_does_not_appear_as_gddr6_bandwidth():
         "GDDR6 Write Bandwidth",
     ):
         values.pop(name)
-    values["Memory-Destined Read Bandwidth"] = 2e12
+    values["DRAM Read Bandwidth"] = 2e12
     lines = render("gfx1201", values).splitlines()
     top, bottom, left = box_rows(lines, "L2")
     right = lines[top].index("╮", left)
