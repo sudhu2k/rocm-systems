@@ -15,6 +15,7 @@ test_categories:
       - test_utils_profile
       - test_common
       - test_amdsmi_interface
+      - test_gpu_identity
       - test_noise_clamper
       - test_benchmark_base
       - test_analysis_cli
@@ -59,6 +60,10 @@ test_categories:
       - test_tty
       - test-rocprofiler-compute-tool
       - test_soc_base
+      - test_sdk_config
+      - test_soc_gfx1201
+      - test_metric_description_manager
+      - test_verify_against_config_template
       - test-pc-sampling-collector
       - test-compression
       - test-csv
@@ -102,6 +107,7 @@ test_categories:
       - test_utils_profile
       - test_common
       - test_amdsmi_interface
+      - test_gpu_identity
       - test_noise_clamper
       - test_benchmark_base
       - test_analysis_cli
@@ -150,6 +156,10 @@ test_categories:
       - test_tty
       - test-rocprofiler-compute-tool
       - test_soc_base
+      - test_sdk_config
+      - test_soc_gfx1201
+      - test_metric_description_manager
+      - test_verify_against_config_template
       - test-pc-sampling-collector
       - test-compression
       - test-csv
@@ -207,6 +217,7 @@ test_categories:
       - test_utils_profile
       - test_common
       - test_amdsmi_interface
+      - test_gpu_identity
       - test_noise_clamper
       - test_benchmark_base
       - test_analysis_cli
@@ -255,6 +266,10 @@ test_categories:
       - test_tty
       - test-rocprofiler-compute-tool
       - test_soc_base
+      - test_sdk_config
+      - test_soc_gfx1201
+      - test_metric_description_manager
+      - test_verify_against_config_template
       - test-pc-sampling-collector
       - test-compression
       - test-csv
@@ -312,6 +327,7 @@ test_categories:
       - test_utils_profile
       - test_common
       - test_amdsmi_interface
+      - test_gpu_identity
       - test_noise_clamper
       - test_benchmark_base
       - test_analysis_cli
@@ -360,6 +376,10 @@ test_categories:
       - test_tty
       - test-rocprofiler-compute-tool
       - test_soc_base
+      - test_sdk_config
+      - test_soc_gfx1201
+      - test_metric_description_manager
+      - test_verify_against_config_template
       - test-pc-sampling-collector
       - test-compression
       - test-csv
