@@ -72,6 +72,8 @@ Full documentation for ROCm Compute Profiler is available at [https://rocm.docs.
 
 * Analyze shows each metric's formula, unit, peak and description from the metric library, so some panels change, for example `Gbps` is shown as `GB/s` and bandwidths shown in `Bytes/s` are now in `GB/s`. Rows that never showed a value are gone, so later gfx908 Speed-of-Light IDs such as `2.1.11` are renumbered, and the gfx1250 roofline `WMMA FLOPs (FP64)` row shows its theoretical peak.
 
+* `--set` selects metric IDs, which `--list-sets` lists, for example `compute.salu_util` instead of `11.2.2`. After `--set`, analyze shows only the set's metrics, wherever they appear.
+
 ### Removed
 
 * Removed the experimental `--gui` and `--tui` analyze modes and the `--random-port` option. Use the default CLI analyze mode for terminal output, or `--output-format db` to explore results in ROCm Optiq.
@@ -100,6 +102,8 @@ Full documentation for ROCm Compute Profiler is available at [https://rocm.docs.
 * Removed support for the gfx940 and gfx941 architectures (MI300A A0 and MI300X A0). MI300A and MI300X on gfx942 remain supported.
 
 * Removed the experimental `--torch-trace`, `--triton-trace`, `--ml-api-trace`, `--list-torch-operators`, `--list-triton-operators`, `--torch-operator`, and `--triton-operator` options. Use `--trace-ml-api`, `--list-operators`, and `--operator` instead.
+
+* Removed the gfx908 `compute_thruput_flops` set, whose metrics MI100 has no counters for; `--set compute_thruput_flops` now fails on gfx908.
 
 ### Optimized
 
