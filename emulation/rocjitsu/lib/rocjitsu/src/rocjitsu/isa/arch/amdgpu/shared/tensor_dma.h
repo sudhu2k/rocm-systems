@@ -20,7 +20,6 @@
 #include <cstdint>
 #include <cstring>
 #include <format>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -205,136 +204,26 @@ inline TensorDmaDescriptor parse_descriptor(std::array<uint32_t, 4> d0, std::arr
   return desc;
 }
 
-inline uint64_t saturating_add(uint64_t lhs, uint64_t rhs) {
-  return rhs > std::numeric_limits<uint64_t>::max() - lhs ? std::numeric_limits<uint64_t>::max()
-                                                          : lhs + rhs;
-}
-
-inline uint64_t saturating_multiply(uint64_t lhs, uint64_t rhs) {
-  return lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs
-             ? std::numeric_limits<uint64_t>::max()
-             : lhs * rhs;
-}
-
-struct TensorDmaAxis {
-  uint32_t dimension = 0;
-  uint32_t extent = 0;
-  uint64_t stride = 0;
-};
-
-// Iteration advances the global address linearly, but bounds checks need a
-// logical tensor origin. With no skipped axes, the layout can invert the offset
-// when every non-unit axis starts beyond the occupied span of all faster axes.
-// Fully in-bounds 2D whole-row steps can use the row start even when rows
-// overlap or an interior tile dimension is unused. Empty, single-iteration,
-// and zero-increment descriptors need no inverse. Rejecting other advancing
-// layouts is a rocJITsu support boundary.
+// Keep original dimension numbers because strides and bounds refer to descriptor axes.
 class TensorDmaLayout {
 public:
   explicit TensorDmaLayout(const TensorDmaDescriptor &desc) {
     for (uint32_t dim = 0; dim < desc.rank(); ++dim) {
-      // A zero higher tile dimension is unused, even between active dimensions.
-      // Keep the original dimension numbers for their bounds and global strides.
-      if (dim != 0 && !desc.gather && desc.tile_dims[dim] == 0)
+      // A zero interior tile and tensor extent together suppress dense transfers on gfx1250.
+      // With a positive tensor extent, keep treating a zero higher tile dimension as unused.
+      if (dim != 0 && !desc.gather && desc.tile_dims[dim] == 0 && desc.tensor_dims[dim] != 0)
         continue;
       dimensions_[dimension_count_++] = dim;
-      const uint32_t extent = desc.tensor_dims[dim];
-      empty_ |= extent == 0;
-      if (extent > 1) {
-        axes_[axis_count_++] = {.dimension = dim,
-                                .extent = extent,
-                                .stride = dim == 0 ? 1 : desc.global_strides[dim - 1]};
-      }
-    }
-
-    // Logical dimension order and increasing memory-stride order may differ.
-    // Validation and inversion must use the same storage-ordered basis.
-    // Extent-one axes have only coordinate zero and consume no address span.
-    // Use a bounded insertion sort: GCC 13 can report a false-positive
-    // -Warray-bounds error when std::sort is optimized for this five-element array.
-    for (uint32_t axis_idx = 1; axis_idx < axis_count_; ++axis_idx) {
-      const TensorDmaAxis axis = axes_[axis_idx];
-      uint32_t insertion_idx = axis_idx;
-      while (insertion_idx > 0) {
-        const TensorDmaAxis &previous = axes_[insertion_idx - 1];
-        const bool axis_precedes_previous =
-            axis.stride < previous.stride ||
-            (axis.stride == previous.stride && axis.dimension < previous.dimension);
-        if (!axis_precedes_previous)
-          break;
-        axes_[insertion_idx] = previous;
-        --insertion_idx;
-      }
-      axes_[insertion_idx] = axis;
+      empty_ |= desc.tensor_dims[dim] == 0;
     }
   }
 
   std::span<const uint32_t> dimensions() const { return {dimensions_.data(), dimension_count_}; }
   bool empty() const { return empty_; }
 
-  util::Result validate_iteration_origins(const TensorDmaDescriptor &desc) const {
-    if (empty_ || desc.iteration_count <= 1 || desc.global_increment == 0)
-      return util::Result::success();
-
-    // A whole-row step puts each tile at column zero. Even with overlapping
-    // rows, both tile-relative and original-tensor bounds admit the entire
-    // walk if its last tile fits. The stride-ordered inverse below picks the
-    // row before the column (also when both strides are one).
-    if (dimension_count_ == 2 && desc.tile_dims[0] <= desc.tensor_dims[0]) {
-      const uint32_t row_dim = dimensions_[1];
-      const uint64_t row_stride = desc.global_strides[row_dim - 1];
-      if (row_stride != 0 && desc.global_increment % row_stride == 0 &&
-          desc.tile_dims[row_dim] <= desc.tensor_dims[row_dim]) {
-        const uint64_t row_step = desc.global_increment / row_stride;
-        const uint32_t remaining_rows = desc.tensor_dims[row_dim] - desc.tile_dims[row_dim];
-        if (row_step <= remaining_rows / (desc.iteration_count - 1))
-          return util::Result::success();
-      }
-    }
-
-    // Dropping an interior axis can make a step along its stride look like an
-    // out-of-bounds column when the offset is inverted using the surviving axes.
-    if (dimension_count_ < desc.rank()) [[unlikely]]
-      return util::Result::failure();
-
-    uint64_t occupied_span = 1;
-    for (uint32_t axis_idx = 0; axis_idx < axis_count_; ++axis_idx) {
-      const TensorDmaAxis &axis = axes_[axis_idx];
-      // Each axis must begin beyond the complete span of all faster axes for
-      // greedy mixed-radix inversion to be unique.
-      if (axis.stride < occupied_span) [[unlikely]]
-        return util::Result::failure();
-
-      const uint64_t additional_span =
-          saturating_multiply(axis.stride, static_cast<uint64_t>(axis.extent - 1));
-      occupied_span = saturating_add(occupied_span, additional_span);
-    }
-    return util::Result::success();
-  }
-
-  std::array<uint64_t, 5> origin_from_linear_offset(uint64_t linear_offset) const {
-    std::array<uint64_t, 5> origin{};
-    if (linear_offset == 0)
-      return origin;
-
-    for (uint32_t axis_idx = axis_count_; axis_idx > 0; --axis_idx) {
-      const TensorDmaAxis &axis = axes_[axis_idx - 1];
-      origin[axis.dimension] = linear_offset / axis.stride;
-      linear_offset %= axis.stride;
-    }
-    // Dimension zero has implicit stride one. If it was omitted because its
-    // extent is one, preserve any padding remainder there so bounds masking
-    // rejects offsets outside the tensor domain.
-    if (linear_offset != 0)
-      origin[0] = linear_offset;
-    return origin;
-  }
-
 private:
-  std::array<TensorDmaAxis, 5> axes_{};
   std::array<uint32_t, 5> dimensions_{};
   uint32_t dimension_count_ = 0;
-  uint32_t axis_count_ = 0;
   bool empty_ = false;
 };
 
@@ -387,14 +276,10 @@ inline util::Result validate_supported_descriptor(const TensorDmaDescriptor &des
       return util::Result::failure();
     return tensor_element_count(desc, layout) ? util::Result::success() : util::Result::failure();
   }
-  // A dense tile with no elements is a NOP (see tensor_element_count). It
-  // visits no iteration origins, so its iteration fields need not describe a
-  // valid walk; pipelines drain an iterating prefetch this way.
+  // A zero-width tile can drain an iterating prefetch with the other dimensions unset.
   if (rank == 0 || desc.tile_dims[0] == 0)
     return util::Result::success();
   if (desc.iterate && (rank < 2 || rank > 3)) [[unlikely]]
-    return util::Result::failure();
-  if (desc.iterate && layout.validate_iteration_origins(desc).failed()) [[unlikely]]
     return util::Result::failure();
   if (!tensor_element_count(desc, layout)) [[unlikely]]
     return util::Result::failure();
@@ -459,39 +344,22 @@ inline bool validate_global_address_range(const TensorDmaDescriptor &desc,
         include_element(*last);
       }
     }
-  } else {
-    const uint32_t iterations = desc.iterate ? desc.iteration_count : 1;
-    for (uint32_t iter = 0; iter < iterations; ++iter) {
-      const auto iteration_offset = util::checked_mul(uint64_t{iter}, desc.global_increment);
-      if (!iteration_offset) [[unlikely]]
-        return false;
-      if (layout.empty())
-        continue;
-      const auto origin = desc.iterate ? layout.origin_from_linear_offset(*iteration_offset)
-                                       : std::array<uint64_t, 5>{};
-      bool in_bounds = true;
-      uint64_t last = *iteration_offset;
-      for (uint32_t dim : layout.dimensions()) {
-        if (origin[dim] >= desc.tensor_dims[dim]) {
-          in_bounds = false;
-          break;
-        }
-        const uint64_t extent =
-            std::min<uint64_t>(desc.tile_dims[dim], uint64_t{desc.tensor_dims[dim]} - origin[dim]);
-        if (extent == 0) {
-          in_bounds = false;
-          break;
-        }
-        const uint64_t stride = dim == 0 ? 1 : desc.global_strides[dim - 1];
-        const auto delta = util::checked_mul(extent - 1, stride);
-        const auto next = delta ? util::checked_add(last, *delta) : std::nullopt;
-        if (!next) [[unlikely]]
-          return false;
-        last = *next;
-      }
-      if (in_bounds)
-        include_element(last);
+  } else if (!layout.empty()) {
+    // Each iteration uses the same tensor bounds at its own base. The highest
+    // reachable address is the last in-bounds tile element at the last base.
+    const uint32_t last_iteration = desc.iterate ? desc.iteration_count - 1 : 0;
+    auto last = util::checked_mul(uint64_t{last_iteration}, desc.global_increment);
+    for (uint32_t dim : layout.dimensions()) {
+      const uint32_t extent = std::min(desc.tile_dims[dim], desc.tensor_dims[dim]);
+      if (extent == 0)
+        return true;
+      const uint64_t stride = dim == 0 ? 1 : desc.global_strides[dim - 1];
+      const auto delta = util::checked_mul(uint64_t{extent - 1}, stride);
+      last = last && delta ? util::checked_add(*last, *delta) : std::nullopt;
     }
+    if (!last) [[unlikely]]
+      return false;
+    include_element(*last);
   }
 
   if (!max_global_element)
@@ -684,10 +552,6 @@ inline void for_each_dense_tensor_element(const TensorDmaDescriptor &desc,
   uint64_t element_count = 1;
   for (uint32_t dim : dimensions)
     element_count *= desc.tile_dims[dim];
-  // Without elements there is nothing to visit, so reconstruct no origins.
-  // validate_supported_descriptor accepts an empty tile without validating its
-  // iteration inverse, so its layout may hold a zero stride, which
-  // origin_from_linear_offset would divide by.
   if (element_count == 0)
     return;
 
@@ -695,32 +559,23 @@ inline void for_each_dense_tensor_element(const TensorDmaDescriptor &desc,
   for (uint32_t iter = 0; iter < iteration_count; ++iter) {
     const uint64_t iteration_offset = uint64_t{iter} * desc.global_increment;
     const uint64_t iteration_lds = uint64_t{iter} * desc.lds_increment;
-    const std::array<uint64_t, 5> origin = desc.iterate && !layout.empty()
-                                               ? layout.origin_from_linear_offset(iteration_offset)
-                                               : std::array<uint64_t, 5>{};
-    bool origin_in_bounds = !layout.empty();
-    for (uint32_t dim : dimensions) {
-      if (origin[dim] >= desc.tensor_dims[dim]) {
-        origin_in_bounds = false;
-        break;
-      }
-    }
+    // Each iteration advances the global base and checks coordinates within the new tile.
     for (uint64_t linear = 0; linear < element_count; ++linear) {
       uint64_t remaining = linear;
-      bool in_bounds = origin_in_bounds;
+      bool in_bounds = !layout.empty();
       uint64_t global_element = iteration_offset;
 
-      for (uint32_t dim : dimensions) {
-        const uint32_t tile_dim = desc.tile_dims[dim];
-        const uint32_t coord = static_cast<uint32_t>(remaining % tile_dim);
-        remaining /= tile_dim;
-        if (in_bounds) {
-          if (coord >= uint64_t{desc.tensor_dims[dim]} - origin[dim]) {
+      if (in_bounds) {
+        for (uint32_t dim : dimensions) {
+          const uint32_t tile_dim = desc.tile_dims[dim];
+          const uint32_t coord = static_cast<uint32_t>(remaining % tile_dim);
+          remaining /= tile_dim;
+          if (coord >= desc.tensor_dims[dim]) {
             in_bounds = false;
-          } else {
-            global_element +=
-                uint64_t{coord} * (dim == 0 ? uint64_t{1} : desc.global_strides[dim - 1]);
+            break;
           }
+          global_element +=
+              uint64_t{coord} * (dim == 0 ? uint64_t{1} : desc.global_strides[dim - 1]);
         }
       }
 

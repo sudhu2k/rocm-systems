@@ -7002,13 +7002,13 @@ TEST(Gfx1250CvtF16Test, PackedStochasticConversionsUseSeparateSeedHalves) {
   struct FormatCase {
     uint32_t opcode;
     uint32_t midpoint;
-    uint16_t bias;
+    uint16_t round_up_seed;
     uint16_t one;
     uint32_t overflow_input;
     uint16_t infinity;
   };
   for (const FormatCase &format_case : {
-           FormatCase{cdna5::kVCvtSrPkF16F32Vop3, 0x3f801000, 0x1000, 0x3c00,
+           FormatCase{cdna5::kVCvtSrPkF16F32Vop3, 0x3f801000, 0xffff, 0x3c00,
                       std::bit_cast<uint32_t>(70000.0f), 0x7c00},
            FormatCase{cdna5::kVCvtSrPkBf16F32Vop3, 0x3f808000, 0x8000, 0x3f80, 0x7f7fffff, 0x7f80},
        }) {
@@ -7025,12 +7025,19 @@ TEST(Gfx1250CvtF16Test, PackedStochasticConversionsUseSeparateSeedHalves) {
     };
 
     wf->set_mode_raw(0);
-    check(format_case.midpoint, format_case.midpoint, pack16(format_case.bias, 0),
+    check(format_case.midpoint, format_case.midpoint, pack16(format_case.round_up_seed, 0),
           pack16(format_case.one + 1, format_case.one));
-    check(format_case.midpoint, format_case.midpoint, pack16(0, format_case.bias),
+    check(format_case.midpoint, format_case.midpoint, pack16(0, format_case.round_up_seed),
           pack16(format_case.one, format_case.one + 1));
-    if (format_case.opcode == cdna5::kVCvtSrPkF16F32Vop3)
-      check(0x3f801000u, 0x3f800000u, 0x80000000u, 0x3c043c00u);
+    if (format_case.opcode == cdna5::kVCvtSrPkF16F32Vop3) {
+      // Measured on gfx1250: the nonzero upper seed leaves FP16 1.0 exact.
+      check(0x3f801000u, 0x3f800000u, 0x80000000u, 0x3c003c00u);
+      check(0xbf800000u, 0x3f800000u, 0xffffffffu, 0x3c00bc00u);
+      // Model expectation for an inexact midpoint: 0x1000 rounds down and 0xe000 rounds up
+      // when using the leading seed bits. Using the low bits reverses the two results.
+      check(format_case.midpoint, format_case.midpoint, pack16(0x1000, 0xe000),
+            pack16(format_case.one, format_case.one + 1));
+    }
     // A zero addend truncates even above the midpoint.
     check(format_case.midpoint + 1, format_case.midpoint + 1, 0,
           pack16(format_case.one, format_case.one));

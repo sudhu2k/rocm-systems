@@ -1768,8 +1768,13 @@ def gen_vector_cvt_pk(
             L.extend(vop3_src_mod('s1', 1, has_abs))
         L.append(f'    uint32_t lo = util::f32_to_f16_mode(s0, wf.fp16_ovfl());')
         L.append(f'    uint32_t hi = util::f32_to_f16_mode(s1, wf.fp16_ovfl());')
+        packed = (
+            'amdgpu::fp_mode::pack_f16_results(lo, hi, wf.fp_denorm_mode_f16_f64())'
+            if arch_name == 'cdna5'
+            else 'lo | (hi << 16)'
+        )
         L.append(
-            f'    amdgpu::RegisterAccess(wf).write_lane({dst[0]}, lane, lo | (hi << 16));'
+            f'    amdgpu::RegisterAccess(wf).write_lane({dst[0]}, lane, {packed});'
         )
     elif cls == 'vector_cvt_pk_bf16_f32':
         L.append(
