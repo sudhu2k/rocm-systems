@@ -220,6 +220,14 @@ void WaveRaceState::prepareForCounterIncrement(amdgpu::WaitCounterType type, uin
   if (increment == 0 || increment > capacity)
     return;
 
+  // Each pending event holds at most MAX_COUNTER_INCREMENT tokens on a counter.
+  // When even that many leave room for this issue, the counter cannot be full,
+  // so the common case skips counting the wave's pending events.
+  if (waveMemoryEvents.size() * amdgpu::MemoryCounterObligation::MAX_COUNTER_INCREMENT +
+          increment <=
+      static_cast<size_t>(capacity))
+    return;
+
   int pending_tokens = 0;
   for (const EventId event_id : waveMemoryEvents)
     pending_tokens += detector->events().pendingCounterIncrement(event_id, type);
