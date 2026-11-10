@@ -608,13 +608,35 @@ void MemoryWaitScoreboard::check_instruction_pending(const Instruction &inst, Wa
     const uint64_t coordinate_lanes = modifiers.image_implicit_gradients
                                           ? whole_active_quads(lanes) & 0x7777777777777777ull
                                           : lanes;
+    uint64_t ray_lanes = coordinate_lanes;
+    if (const auto resource = modifiers.bvh_resource) {
+      const auto word2 = registers.scalar_control_value(*resource + 2);
+      const auto word3 = registers.scalar_control_value(*resource + 3);
+      if (!word2 || !word3 || (*word3 >> 28) != 8)
+        ray_lanes = 0;
+      else {
+        const uint64_t last_node = *word2 | (uint64_t{*word3 & 0x3ff} << 32);
+        for (uint64_t pending = coordinate_lanes; pending; pending &= pending - 1) {
+          const uint32_t lane = std::countr_zero(pending);
+          const auto pointer_word = [&](unsigned i) {
+            const auto index = gfx115_source_vgpr(modifiers.image_coordinates[i], wf.num_vgprs());
+            return wf.debug_read_vgpr(index, lane);
+          };
+          uint64_t pointer = pointer_word(0);
+          if (modifiers.bvh_pointer_words == 2)
+            pointer |= uint64_t{pointer_word(1)} << 32;
+          if (!bvh_node_can_load(pointer, last_node))
+            ray_lanes &= ~(uint64_t{1} << lane);
+        }
+      }
+    }
     for (uint32_t component = 0; component < components; ++component) {
       const uint32_t word = prefix + (modifiers.image_a16 ? component / 2 : component);
       uint16_t reg = modifiers.image_coordinates[word];
       if (modifiers.image_implicit_gradients && reg >= wf.num_vgprs())
         reg = 0;
       check_coordinate(reg, modifiers.image_a16 ? (component % 2 ? 0xc : 0x3) : 0xf,
-                       coordinate_lanes);
+                       component < modifiers.bvh_pointer_words ? coordinate_lanes : ray_lanes);
     }
   }
   if (modifiers.exec_all_if_nonzero)

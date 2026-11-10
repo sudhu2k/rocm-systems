@@ -107,8 +107,8 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   const bool packed_signed = transfer_mode == ImageTransferMode::PackedSigned ||
                              transfer_mode == ImageTransferMode::MipPackedSigned;
   if ((!gfx12 && arch != ROCJITSU_CODE_ARCH_RDNA3 && arch != ROCJITSU_CODE_ARCH_RDNA3_5) ||
-      (packed && d16) || (mask & ~15u) || (query && (d16 || (mask & ~3u))) ||
-      (gather && std::popcount(mask) != 1))
+      (atomic && !controls.unorm) || (packed && d16) || (mask & ~15u) ||
+      (query && (d16 || (mask & ~3u))) || (gather && std::popcount(mask) != 1))
     return unsupported();
   const uint32_t words = controls.r128 ? 4 : 8;
   const bool dropped = mask == 0;
@@ -174,11 +174,11 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     return false;
   }
   const uint32_t warn_lod = rdna_image_lod_warning_threshold(arch, r[5]);
-  if (!query && d.is_load && !atomic &&
+  if (!query && (d.is_load || atomic) &&
       (warn_lod || controls.tfe || controls.lwe || image_may_have_sparse_pages(wf))) {
     d.image_status = std::make_unique<ImageFeedback>();
     d.image_status->warning_threshold = warn_lod;
-    d.image_status->tfe = controls.tfe;
+    d.image_status->tfe = controls.tfe && d.is_load;
     d.image_status->lwe = sampler != ~0u && controls.lwe;
   }
   const bool multisample = type == 14 || type == 15;
@@ -548,17 +548,19 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     if (multisample) {
       const uint32_t relative_layer = type == 15 ? load_coordinate(2) : 0;
       const uint32_t fragment = load_coordinate(load_components - 1);
+      const uint32_t samples = 1u << fragment_log2;
       if (x >= width || y >= height || relative_layer > last_layer - first_layer ||
-          fragment >= (1u << fragment_log2))
+          (!quad_fragments && fragment >= samples))
         continue;
       const uint32_t surface_pitch =
           type == 14 && pitch_field ? std::max(width, pitch_field + 1) : width;
       const uint32_t layer = first_layer + relative_layer;
-      const uint32_t first = quad_fragments ? fragment & ~3u : fragment;
-      const uint32_t count = quad_fragments ? std::min(4u, (1u << fragment_log2) - first) : 1;
+      const uint32_t first = quad_fragments ? std::min(fragment, samples - 1) & ~3u : fragment;
+      const uint32_t count = quad_fragments ? 4 : 1;
       for (uint32_t i = 0; i < count; ++i) {
-        const uint64_t address = gfx11_msaa_address(base, x, y, layer, first + i, surface_pitch,
-                                                    height, bytes, fragment_log2, swizzle);
+        const uint64_t address =
+            gfx11_msaa_address(base, x, y, layer, (first + i) % samples, surface_pitch, height,
+                               bytes, fragment_log2, swizzle);
         if (quad_fragments) {
           auto &tap = d.graphics_sample->taps[i];
           tap.addresses[lane] = address;

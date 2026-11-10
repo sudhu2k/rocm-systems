@@ -11,6 +11,7 @@
 #include "rocjitsu/isa/arch/amdgpu/shared/image_transfer.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/simd_glue.h"
 #include "rocjitsu/vm/amdgpu/wavefront.h"
+#include "rocjitsu/vm/graphics/bvh_intersection.h"
 #include "util/data_types.h"
 #include "util/except.h"
 #include <algorithm>
@@ -116,23 +117,79 @@ void ImageLoadMipMimg::execute_impl(amdgpu::Wavefront &wf) {
 }
 
 void ImageLoadPckMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = true;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type = amdgpu::WaitCounterType::LOADCNT;
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16, nullptr,
+          amdgpu::ImageTransferMode::Packed))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageLoadPckSgnMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = true;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type = amdgpu::WaitCounterType::LOADCNT;
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16, nullptr,
+          amdgpu::ImageTransferMode::PackedSigned))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageLoadMipPckMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = true;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type = amdgpu::WaitCounterType::LOADCNT;
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16, nullptr,
+          amdgpu::ImageTransferMode::MipPacked))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageLoadMipPckSgnMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = true;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type = amdgpu::WaitCounterType::LOADCNT;
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16, nullptr,
+          amdgpu::ImageTransferMode::MipPackedSigned))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageStoreMimg::execute_impl(amdgpu::Wavefront &wf) {
@@ -229,78 +286,301 @@ void ImageStoreMipMimg::execute_impl(amdgpu::Wavefront &wf) {
 }
 
 void ImageStorePckMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = false;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type = amdgpu::WaitCounterType::STORECNT;
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16, nullptr,
+          amdgpu::ImageTransferMode::Packed))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageStoreMipPckMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = false;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type = amdgpu::WaitCounterType::STORECNT;
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16, nullptr,
+          amdgpu::ImageTransferMode::MipPacked))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicSwapMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::SWAP;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicCmpswapMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::CMPSWAP;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicAddMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::ADD;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicSubMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::SUB;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicSminMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::SMIN;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicUminMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::UMIN;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicSmaxMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::SMAX;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicUmaxMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::UMAX;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicAndMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::AND;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicOrMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::OR;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicXorMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::XOR;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicIncMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::INC;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageAtomicDecMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = (inst_.glc != 0);
+  d->atomic_op = amdgpu::AtomicOp::DEC;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type =
+      ((inst_.glc != 0) ? amdgpu::WaitCounterType::LOADCNT : amdgpu::WaitCounterType::STORECNT);
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageGetResinfoMimg::execute_impl(amdgpu::Wavefront &wf) {
@@ -310,18 +590,40 @@ void ImageGetResinfoMimg::execute_impl(amdgpu::Wavefront &wf) {
 }
 
 void ImageMsaaLoadMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = true;
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type = amdgpu::WaitCounterType::LOADCNT;
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.srsrc * 4, inst_.vdata,
+          amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding()),
+          inst_.dim, inst_.dmask, inst_.d16,
+          {.r128 = bool(inst_.r128),
+           .tfe = bool(inst_.tfe),
+           .lwe = bool(inst_.lwe),
+           .unorm = bool(inst_.unorm)},
+          ~0u, amdgpu::GraphicsSampleMode::Implicit, inst_.a16, nullptr,
+          amdgpu::ImageTransferMode::Msaa))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageBvhIntersectRayMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type = amdgpu::WaitCounterType::LOADCNT;
+  if (!amdgpu::prepare_bvh_intersection(wf, *d, inst_, raw_encoding(), false))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageBvh64IntersectRayMimg::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  amdgpu::apply_rdna35_cache_policy(*d, inst_.glc);
+  d->wait_counter_type = amdgpu::WaitCounterType::LOADCNT;
+  if (!amdgpu::prepare_bvh_intersection(wf, *d, inst_, raw_encoding(), true))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageSampleMimg::execute_impl(amdgpu::Wavefront &wf) {

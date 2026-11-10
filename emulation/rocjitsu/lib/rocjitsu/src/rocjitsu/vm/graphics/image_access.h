@@ -11,6 +11,19 @@
 
 namespace rocjitsu::amdgpu {
 
+/// @brief Ray inputs and resource controls captured before a BVH memory request.
+struct BvhIntersectionAccess {
+  struct Ray {
+    std::array<float, 3> origin{}, direction{}, inverse{};
+    float extent = 0;
+    uint16_t flags = 0;
+    uint8_t node_type = 0;
+  };
+  std::array<Ray, 64> rays{};
+  uint8_t grow = 0, sort = 0;
+  bool sort_enabled = false, barycentrics = false;
+};
+
 /// A partially resident texture records the requested mip and fetch outcome per lane.
 /// A resident access leaves the shader-initialized feedback register untouched.
 struct ImageFeedback {

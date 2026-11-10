@@ -180,6 +180,29 @@ inline ImageAddressRegisters mimg_nsa_image_address_registers(bool nsa, uint32_t
   return mimg_image_address_registers(nsa, true, first, raw_encoding);
 }
 
+/// GFX11 BVH NSA lists name groups: pointer, extent, origin.xyz, direction.xyz,
+/// and inverse direction.xyz. A16 packs both directions into three registers.
+constexpr bool bvh_node_can_load(uint64_t pointer, uint64_t last_node) {
+  const uint32_t type = pointer & 7;
+  const uint64_t index = (pointer >> 3) & ((uint64_t{1} << 42) - 1);
+  return type < 6 && (index < last_node || (index == last_node && type != 5));
+}
+
+inline ImageAddressRegisters gfx11_bvh_registers(bool wide, bool a16, uint32_t first,
+                                                 const uint32_t *nsa) {
+  if (!nsa)
+    return contiguous_image_address_registers(first);
+  ImageAddressRegisters registers{};
+  const unsigned widths[] = {1u + wide, 1, 3, 3, 3};
+  unsigned word = 0;
+  for (unsigned group = 0; group < (a16 ? 4u : 5u); ++group) {
+    const unsigned start = group ? (*nsa >> ((group - 1) * 8)) & 255 : first;
+    for (unsigned i = 0; i < widths[group]; ++i)
+      registers[word++] = start + i;
+  }
+  return registers;
+}
+
 /// @brief Decode GFX12 explicit selectors and its trailing consecutive group.
 /// VIMAGE has five explicit selectors; VSAMPLE has four.
 template <typename ImageMachineInst>

@@ -274,6 +274,8 @@ struct RegisterModifiers {
 
   /// VADDR operand enabling coordinate tracking.
   const Operand *image_address = nullptr;
+  std::optional<uint16_t> bvh_resource;
+  uint8_t bvh_pointer_words = 0;
   const Operand *image_atomic_data = nullptr;
   const Operand *image_resource = nullptr;
   bool image_resource_info = false;
