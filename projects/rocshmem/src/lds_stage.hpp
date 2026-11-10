@@ -22,12 +22,10 @@
  * IN THE SOFTWARE.
  *****************************************************************************/
 
-// LDS-staged async IPC copy: global<->global byte copies staged through LDS,
-// double-buffered and tiled. Both gfx1250 only, picked by USE_TDM:
-//   - TDM (requires USE_TDM): tensor_load_to_lds/store_from_lds,
-//     2D-descriptor tensor-mover engine, VGPR-free both legs.
-//   - async (USE_LDS_STAGE without USE_TDM): sized (b32) global<->LDS VMEM
-//     instructions, independent of TDM, VGPR-free both legs.
+// LDS-staged IPC copy: global<->global byte copies staged through LDS.
+// TDM (USE_TDM): tensor_load_to_lds/store_from_lds, 2D-descriptor engine.
+// Async (USE_LDS_STAGE only): sized b32 global<->LDS VMEM instructions.
+// Both gfx1250-only.
 
 #ifndef LIBRARY_SRC_LDS_STAGE_HPP_
 #define LIBRARY_SRC_LDS_STAGE_HPP_
@@ -46,7 +44,7 @@
 #define __has_builtin(x) 0
 #endif
 
-#if defined(__HIP_PLATFORM_AMD__) &&                       \
+#if defined(__HIP_PLATFORM_AMD__) &&                        \
     __has_builtin(__builtin_amdgcn_tensor_load_to_lds) &&   \
     __has_builtin(__builtin_amdgcn_tensor_store_from_lds)
 #define HIP_HAVE_TDM_INTRINSICS 1
@@ -57,20 +55,24 @@
 #if defined(__HIP_PLATFORM_AMD__) &&                                   \
     __has_builtin(__builtin_amdgcn_global_load_async_to_lds_b32) &&    \
     __has_builtin(__builtin_amdgcn_global_store_async_from_lds_b32) && \
-    __has_builtin(__builtin_amdgcn_asyncmark) &&                      \
+    __has_builtin(__builtin_amdgcn_asyncmark) &&                       \
     __has_builtin(__builtin_amdgcn_wait_asyncmark)
 #define HIP_HAVE_LDS_ASYNC_INTRINSICS 1
 #else
 #define HIP_HAVE_LDS_ASYNC_INTRINSICS 0
 #endif
 
-// Both backends are gfx1250-only; USE_TDM picks TDM, plain USE_LDS_STAGE picks async.
-#if defined(USE_TDM) && (defined(__gfx1250__) || defined(__gfx1250_strict__)) && HIP_HAVE_TDM_INTRINSICS
+// USE_TDM picks TDM; plain USE_LDS_STAGE picks async. Both gfx1250-only.
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+#if defined(USE_TDM) && HIP_HAVE_TDM_INTRINSICS
 #define ROCSHMEM_LDS_STAGE_ENABLED 1
 #define ROCSHMEM_LDS_STAGE_BACKEND_TDM 1
-#elif defined(USE_LDS_STAGE) && !defined(USE_TDM) && HIP_HAVE_LDS_ASYNC_INTRINSICS
+#elif defined(USE_LDS_STAGE) && HIP_HAVE_LDS_ASYNC_INTRINSICS
 #define ROCSHMEM_LDS_STAGE_ENABLED 1
 #define ROCSHMEM_LDS_STAGE_BACKEND_ASYNC 1
+#else
+#define ROCSHMEM_LDS_STAGE_ENABLED 0
+#endif
 #else
 #define ROCSHMEM_LDS_STAGE_ENABLED 0
 #endif
@@ -78,8 +80,8 @@
 namespace rocshmem {
 namespace lds_stage {
 
-// Under plain USE_LDS_STAGE, not ROCSHMEM_LDS_STAGE_ENABLED: host code needs
-// this too, and host compiles don't have the arch macros ENABLED depends on.
+// Host code needs this too; gated on USE_LDS_STAGE, not ENABLED, since host
+// compiles lack the arch macros ENABLED depends on.
 #if defined(USE_LDS_STAGE)
 constexpr uint32_t FlatCopyElementLog2 = 3;  // 8 bytes/element
 
@@ -90,8 +92,8 @@ __host__ __device__ constexpr size_t lds_bytes_for_tile(uint32_t tile_bytes) {
 
 #if ROCSHMEM_LDS_STAGE_ENABLED
 
-// Largest multiple of tile_bytes_cap not exceeding total_bytes (or a single
-// undersized tile if total_bytes is smaller than one).
+// Bytes covered by whole tiles of tile_bytes_cap (or a partial single tile
+// if total_bytes is smaller than one).
 __device__ __forceinline__ size_t covered_bytes(size_t total_bytes, uint32_t tile_bytes_cap) {
   if (total_bytes == 0) return 0;
   if (total_bytes < tile_bytes_cap) {
@@ -175,9 +177,8 @@ __device__ __forceinline__ u32x4 make_group0(uintptr_t lds_addr, uintptr_t globa
   };
 }
 
-// GROUP1: element size, full-tensor/tile dims, and strides (in elements).
-// Strides are genuinely 48-bit here, unlike AMD's own amd_gfx1250_TDM.h
-// header, whose tensorDimNStride() setters truncate to 32 bits.
+// Element size, full-tensor/tile dims, and strides (in elements). Strides
+// are genuinely 48-bit.
 __device__ __forceinline__ i32x8 make_group1(DataSize data_size, uint32_t tensor_dim0,
                                              uint32_t tensor_dim1, uint32_t tile_dim0,
                                              uint32_t tile_dim1, uint64_t tensor_dim0_stride,
@@ -242,14 +243,149 @@ __device__ __forceinline__ void store_from_lds(const Descriptor2D &d) {
   store_from_lds<CachePolicy>(d.group0, d.group1);
 }
 
+// Tile-by-tile copy via lds_scratch. double_buffered: pipeline depth 1
+// (tensor_wait<0>() drains each load+store pair). Otherwise serialized.
+// tile_bytes_cap must be a multiple of 8 bytes.
+template <int LoadCachePolicy, int StoreCachePolicy>
+__device__ inline void copy_pipelined_shallow(void *dst, const void *src, size_t bytes,
+                                              void *lds_scratch, uint32_t tile_bytes_cap,
+                                              bool double_buffered) {
+  const size_t covered = covered_bytes(bytes, tile_bytes_cap);
+  if (covered == 0) return;
+  const uint32_t tile_bytes =
+      (bytes < tile_bytes_cap) ? static_cast<uint32_t>(covered) : tile_bytes_cap;
+  const size_t full_tiles = covered / tile_bytes;
+  const uint32_t tile_dim0 = tile_bytes >> FlatCopyElementLog2;
+
+  // Layout is invariant across tiles -- only GROUP0 (addresses) changes.
+  Descriptor2D desc;
+  desc.group1 = make_group1(DataSize::Bits64, /*tensor_dim0=*/tile_dim0, /*tensor_dim1=*/1,
+                            /*tile_dim0=*/tile_dim0, /*tile_dim1=*/1,
+                            /*tensor_dim0_stride=*/tile_dim0, /*tensor_dim1_stride=*/tile_dim0);
+
+  auto *dst_bytes = static_cast<char *>(dst);
+  const auto *src_bytes = static_cast<const char *>(src);
+  auto *lds_base = static_cast<uint8_t *>(lds_scratch);
+
+  if (double_buffered) {
+    uintptr_t ping = reinterpret_cast<uintptr_t>(lds_base);
+    uintptr_t pong = reinterpret_cast<uintptr_t>(lds_base + tile_bytes);
+
+    // Prologue: start loading tile 0 into ping.
+    desc.group0 = make_group0(ping, reinterpret_cast<uintptr_t>(src_bytes));
+    load_to_lds<LoadCachePolicy>(desc);
+
+    for (size_t i = 0; i < full_tiles; ++i) {
+      const bool has_next = (i + 1) < full_tiles;
+
+      // Wait for tile i's load before storing it.
+      tensor_wait<0>();
+
+      // Prefetch i+1 into pong and store i from ping before the next wait.
+      if (has_next) {
+        desc.group0 =
+            make_group0(pong, reinterpret_cast<uintptr_t>(src_bytes + (i + 1) * tile_bytes));
+        load_to_lds<LoadCachePolicy>(desc);
+      }
+      desc.group0 = make_group0(ping, reinterpret_cast<uintptr_t>(dst_bytes + i * tile_bytes));
+      store_from_lds<StoreCachePolicy>(desc);
+
+      uintptr_t tmp = ping;
+      ping = pong;
+      pong = tmp;
+    }
+    // Drain the last in-flight load+store pair.
+    tensor_wait<0>();
+  } else {
+    const uintptr_t lds_addr = reinterpret_cast<uintptr_t>(lds_base);
+    for (size_t i = 0; i < full_tiles; ++i) {
+      const size_t offset = i * tile_bytes;
+
+      desc.group0 = make_group0(lds_addr, reinterpret_cast<uintptr_t>(src_bytes + offset));
+      load_to_lds<LoadCachePolicy>(desc);
+      tensor_wait<0>();
+
+      desc.group0 = make_group0(lds_addr, reinterpret_cast<uintptr_t>(dst_bytes + offset));
+      store_from_lds<StoreCachePolicy>(desc);
+      tensor_wait<0>();
+    }
+  }
+}
+
+// Same as copy_pipelined_shallow, but pipeline depth 2 (tensor_wait<1>()):
+// op N-2 is always done by the time op N waits.
+template <int LoadCachePolicy, int StoreCachePolicy>
+__device__ inline void copy_pipelined_deep(void *dst, const void *src, size_t bytes,
+                                           void *lds_scratch, uint32_t tile_bytes_cap) {
+  const size_t covered = covered_bytes(bytes, tile_bytes_cap);
+  if (covered == 0) return;
+  const uint32_t tile_bytes =
+      (bytes < tile_bytes_cap) ? static_cast<uint32_t>(covered) : tile_bytes_cap;
+  const size_t full_tiles = covered / tile_bytes;
+  const uint32_t tile_dim0 = tile_bytes >> FlatCopyElementLog2;
+
+  Descriptor2D desc;
+  desc.group1 = make_group1(DataSize::Bits64, tile_dim0, 1, tile_dim0, 1, tile_dim0, tile_dim0);
+
+  auto *dst_bytes = static_cast<char *>(dst);
+  const auto *src_bytes = static_cast<const char *>(src);
+  const uintptr_t buf[2] = {
+      reinterpret_cast<uintptr_t>(lds_scratch),
+      reinterpret_cast<uintptr_t>(static_cast<uint8_t *>(lds_scratch) + tile_bytes)};
+
+  auto issue_load = [&](uintptr_t lds_addr, uintptr_t global_addr) {
+    desc.group0 = make_group0(lds_addr, global_addr);
+    load_to_lds<LoadCachePolicy>(desc);
+  };
+  auto issue_store = [&](uintptr_t lds_addr, uintptr_t global_addr) {
+    desc.group0 = make_group0(lds_addr, global_addr);
+    store_from_lds<StoreCachePolicy>(desc);
+  };
+
+  // Prologue: load tile 0 into buf[0].
+  issue_load(buf[0], reinterpret_cast<uintptr_t>(src_bytes));
+
+  for (size_t tile_even = 0; tile_even < full_tiles; tile_even += 2) {
+    const size_t tile_odd = tile_even + 1;
+    const bool has_odd = tile_odd < full_tiles;
+
+    if (has_odd) {
+      tensor_wait<1>();
+      issue_load(buf[tile_odd & 1u], reinterpret_cast<uintptr_t>(src_bytes + tile_odd * tile_bytes));
+    }
+
+    // No odd tile: load(tile_even) was one op ago, not two -- drain fully.
+    if (has_odd) {
+      tensor_wait<1>();
+    } else {
+      tensor_wait<0>();
+    }
+    issue_store(buf[tile_even & 1u], reinterpret_cast<uintptr_t>(dst_bytes + tile_even * tile_bytes));
+
+    if (has_odd) {
+      tensor_wait<1>();
+      issue_store(buf[tile_odd & 1u], reinterpret_cast<uintptr_t>(dst_bytes + tile_odd * tile_bytes));
+
+      const size_t next_even = tile_even + 2;
+      if (next_even < full_tiles) {
+        tensor_wait<1>();
+        issue_load(buf[next_even & 1u],
+                   reinterpret_cast<uintptr_t>(src_bytes + next_even * tile_bytes));
+      }
+    }
+  }
+
+  // Drain everything still in flight.
+  tensor_wait<0>();
+}
+
 }  // namespace tdm
 #endif  // ROCSHMEM_LDS_STAGE_BACKEND_TDM
 
 #if defined(ROCSHMEM_LDS_STAGE_BACKEND_ASYNC)
-// Async backend (gfx1250 only): sized global_load/store_async_*_lds_b32
-// VMEM instructions, both legs VGPR-free. asyncmark()/wait_asyncmark(N)
-// lower to s_wait_asynccnt, one counter draining both op kinds -- a wait
-// compatible with TDM's tensor_wait<Cnt>() pipeline shapes.
+// Async backend (gfx1250-only): sized global_load/store_async_*_lds_b32.
+// asyncmark()/wait_asyncmark(N) wait at tile (not op) granularity -- needed
+// since the per-tile op count is runtime-variable.
 namespace async_lds {
 
 // 4 bytes/issue; the builtins support larger sizes too, unused here.
@@ -302,60 +438,8 @@ __device__ __forceinline__ void issue_store_tile_lane(void *dst_tile, const void
   mark();
 }
 
-}  // namespace async_lds
-#endif  // ROCSHMEM_LDS_STAGE_BACKEND_ASYNC
-
-// Unified surface copy_pipelined_shallow/deep call; TDM ignores lane_id/
-// num_lanes (single-lane issue), async stripes both legs across them.
-template <int LoadCachePolicy, int StoreCachePolicy>
-__device__ __forceinline__ void issue_load_tile(void *lds_tile, const void *src_tile,
-                                                uint32_t tile_bytes,
-                                                [[maybe_unused]] uint32_t lane_id,
-                                                [[maybe_unused]] uint32_t num_lanes) {
-#if defined(ROCSHMEM_LDS_STAGE_BACKEND_TDM)
-  const uint32_t tile_dim0 = tile_bytes >> FlatCopyElementLog2;
-  tdm::Descriptor2D desc = tdm::make_descriptor_2d(
-      reinterpret_cast<uintptr_t>(lds_tile), reinterpret_cast<uintptr_t>(src_tile),
-      tdm::DataSize::Bits64, /*tensor_dim0=*/tile_dim0, /*tensor_dim1=*/1,
-      /*tile_dim0=*/tile_dim0, /*tile_dim1=*/1, /*tensor_dim0_stride=*/tile_dim0,
-      /*tensor_dim1_stride=*/tile_dim0);
-  tdm::load_to_lds<LoadCachePolicy>(desc);
-#elif defined(ROCSHMEM_LDS_STAGE_BACKEND_ASYNC)
-  async_lds::issue_load_tile_lane(lds_tile, src_tile, tile_bytes, lane_id, num_lanes);
-#endif
-}
-
-template <int LoadCachePolicy, int StoreCachePolicy>
-__device__ __forceinline__ void issue_store_tile(void *dst_tile, const void *lds_tile,
-                                                 uint32_t tile_bytes,
-                                                 [[maybe_unused]] uint32_t lane_id,
-                                                 [[maybe_unused]] uint32_t num_lanes) {
-#if defined(ROCSHMEM_LDS_STAGE_BACKEND_TDM)
-  const uint32_t tile_dim0 = tile_bytes >> FlatCopyElementLog2;
-  tdm::Descriptor2D desc = tdm::make_descriptor_2d(
-      reinterpret_cast<uintptr_t>(lds_tile), reinterpret_cast<uintptr_t>(dst_tile),
-      tdm::DataSize::Bits64, /*tensor_dim0=*/tile_dim0, /*tensor_dim1=*/1,
-      /*tile_dim0=*/tile_dim0, /*tile_dim1=*/1, /*tensor_dim0_stride=*/tile_dim0,
-      /*tensor_dim1_stride=*/tile_dim0);
-  tdm::store_from_lds<StoreCachePolicy>(desc);
-#elif defined(ROCSHMEM_LDS_STAGE_BACKEND_ASYNC)
-  async_lds::issue_store_tile_lane(dst_tile, lds_tile, tile_bytes, lane_id, num_lanes);
-#endif
-}
-
-// wait<0>() drains all in-flight ops; wait<Cnt>() leaves up to Cnt.
-template <uint16_t Cnt>
-__device__ __forceinline__ void wait() {
-#if defined(ROCSHMEM_LDS_STAGE_BACKEND_TDM)
-  tdm::tensor_wait<Cnt>();
-#elif defined(ROCSHMEM_LDS_STAGE_BACKEND_ASYNC)
-  async_lds::wait_mark<Cnt>();
-#endif
-}
-
-// Tile-by-tile copy through lds_scratch. double_buffered: pipeline depth 1
-// (load N+1 overlaps store N, drained every pair). Otherwise serialized.
-template <int LoadCachePolicy, int StoreCachePolicy>
+// Tile-by-tile copy, striped across [lane_id, lane_id+num_lanes). pipeline
+// depth 1 when double_buffered (wait_mark<0>() drains each pair).
 __device__ inline void copy_pipelined_shallow(void *dst, const void *src, size_t bytes,
                                               void *lds_scratch, uint32_t tile_bytes_cap,
                                               bool double_buffered, uint32_t lane_id = 0,
@@ -371,55 +455,46 @@ __device__ inline void copy_pipelined_shallow(void *dst, const void *src, size_t
   auto *lds_base = static_cast<uint8_t *>(lds_scratch);
 
   if (double_buffered) {
-    uintptr_t ping = reinterpret_cast<uintptr_t>(lds_base);
-    uintptr_t pong = reinterpret_cast<uintptr_t>(lds_base + tile_bytes);
+    uint8_t *ping = lds_base;
+    uint8_t *pong = lds_base + tile_bytes;
 
     // Prologue: start loading tile 0 into ping.
-    issue_load_tile<LoadCachePolicy, StoreCachePolicy>(reinterpret_cast<void *>(ping), src_bytes,
-                                                       tile_bytes, lane_id, num_lanes);
+    issue_load_tile_lane(ping, src_bytes, tile_bytes, lane_id, num_lanes);
 
     for (size_t i = 0; i < full_tiles; ++i) {
       const bool has_next = (i + 1) < full_tiles;
 
-      // Wait for the current tile's load to land before storing from it.
-      wait<0>();
+      // Wait for tile i's load before storing it.
+      wait_mark<0>();
 
-      // Prefetch tile i+1 into pong and store tile i from ping — both
-      // enqueued before the next wait, so loads/stores can overlap.
+      // Prefetch i+1 into pong and store i from ping before the next wait.
       if (has_next) {
-        issue_load_tile<LoadCachePolicy, StoreCachePolicy>(
-            reinterpret_cast<void *>(pong), src_bytes + (i + 1) * tile_bytes, tile_bytes, lane_id,
-            num_lanes);
+        issue_load_tile_lane(pong, src_bytes + (i + 1) * tile_bytes, tile_bytes, lane_id,
+                             num_lanes);
       }
-      issue_store_tile<LoadCachePolicy, StoreCachePolicy>(
-          dst_bytes + i * tile_bytes, reinterpret_cast<void *>(ping), tile_bytes, lane_id,
-          num_lanes);
+      issue_store_tile_lane(dst_bytes + i * tile_bytes, ping, tile_bytes, lane_id, num_lanes);
 
-      uintptr_t tmp = ping;
+      uint8_t *tmp = ping;
       ping = pong;
       pong = tmp;
     }
     // Drain the last in-flight load+store pair.
-    wait<0>();
+    wait_mark<0>();
   } else {
-    const uintptr_t lds_addr = reinterpret_cast<uintptr_t>(lds_base);
     for (size_t i = 0; i < full_tiles; ++i) {
       const size_t offset = i * tile_bytes;
 
-      issue_load_tile<LoadCachePolicy, StoreCachePolicy>(
-          reinterpret_cast<void *>(lds_addr), src_bytes + offset, tile_bytes, lane_id, num_lanes);
-      wait<0>();
+      issue_load_tile_lane(lds_base, src_bytes + offset, tile_bytes, lane_id, num_lanes);
+      wait_mark<0>();
 
-      issue_store_tile<LoadCachePolicy, StoreCachePolicy>(
-          dst_bytes + offset, reinterpret_cast<void *>(lds_addr), tile_bytes, lane_id, num_lanes);
-      wait<0>();
+      issue_store_tile_lane(dst_bytes + offset, lds_base, tile_bytes, lane_id, num_lanes);
+      wait_mark<0>();
     }
   }
 }
 
-// Same as copy_pipelined_shallow, but pipeline depth 2 (wait<1>() instead of
-// draining every iteration): op N-2 is always done by the time op N waits.
-template <int LoadCachePolicy, int StoreCachePolicy>
+// Same as copy_pipelined_shallow, but pipeline depth 2 (wait_mark<1>()):
+// tile N-2 is always done by the time tile N waits.
 __device__ inline void copy_pipelined_deep(void *dst, const void *src, size_t bytes,
                                            void *lds_scratch, uint32_t tile_bytes_cap,
                                            uint32_t lane_id = 0, uint32_t num_lanes = 1) {
@@ -431,18 +506,14 @@ __device__ inline void copy_pipelined_deep(void *dst, const void *src, size_t by
 
   auto *dst_bytes = static_cast<char *>(dst);
   const auto *src_bytes = static_cast<const char *>(src);
-  const uintptr_t buf[2] = {
-      reinterpret_cast<uintptr_t>(lds_scratch),
-      reinterpret_cast<uintptr_t>(static_cast<uint8_t *>(lds_scratch) + tile_bytes)};
+  uint8_t *const buf[2] = {static_cast<uint8_t *>(lds_scratch),
+                           static_cast<uint8_t *>(lds_scratch) + tile_bytes};
 
-  auto issue_load = [&](uintptr_t lds_addr, const void *global_addr) {
-    issue_load_tile<LoadCachePolicy, StoreCachePolicy>(reinterpret_cast<void *>(lds_addr),
-                                                       global_addr, tile_bytes, lane_id,
-                                                       num_lanes);
+  auto issue_load = [&](uint8_t *lds_addr, const void *global_addr) {
+    issue_load_tile_lane(lds_addr, global_addr, tile_bytes, lane_id, num_lanes);
   };
-  auto issue_store = [&](uintptr_t lds_addr, void *global_addr) {
-    issue_store_tile<LoadCachePolicy, StoreCachePolicy>(
-        global_addr, reinterpret_cast<void *>(lds_addr), tile_bytes, lane_id, num_lanes);
+  auto issue_store = [&](uint8_t *lds_addr, void *global_addr) {
+    issue_store_tile_lane(global_addr, lds_addr, tile_bytes, lane_id, num_lanes);
   };
 
   // Prologue: load tile 0 into buf[0].
@@ -453,38 +524,39 @@ __device__ inline void copy_pipelined_deep(void *dst, const void *src, size_t by
     const bool has_odd = tile_odd < full_tiles;
 
     if (has_odd) {
-      wait<1>();
+      wait_mark<1>();
       issue_load(buf[tile_odd & 1u], src_bytes + tile_odd * tile_bytes);
     }
 
-    // No odd tile: load(tile_even) was only one op ago, not two, so
-    // wait<1>() would race ahead of it -- drain fully instead.
+    // No odd tile: load(tile_even) was one mark ago, not two -- drain fully.
     if (has_odd) {
-      wait<1>();
+      wait_mark<1>();
     } else {
-      wait<0>();
+      wait_mark<0>();
     }
     issue_store(buf[tile_even & 1u], dst_bytes + tile_even * tile_bytes);
 
     if (has_odd) {
-      wait<1>();
+      wait_mark<1>();
       issue_store(buf[tile_odd & 1u], dst_bytes + tile_odd * tile_bytes);
 
       const size_t next_even = tile_even + 2;
       if (next_even < full_tiles) {
-        wait<1>();
+        wait_mark<1>();
         issue_load(buf[next_even & 1u], src_bytes + next_even * tile_bytes);
       }
     }
   }
 
-  // Drain everything still in flight before returning.
-  wait<0>();
+  // Drain everything still in flight.
+  wait_mark<0>();
 }
 
-// Backs rocshmem_set_lds_stage()/rocshmem_query_lds_stage_bytes(). Every
-// thread must call set_lds() (barrier needs all of them) before any put/get
-// in that kernel using this path; wave put/get splits the buffer per wave.
+}  // namespace async_lds
+#endif  // ROCSHMEM_LDS_STAGE_BACKEND_ASYNC
+
+// Backs rocshmem_set_lds_stage()/query_lds_stage_bytes(). set_lds() must run
+// before any put/get using this path; wave put/get splits the buffer per wave.
 struct LdsRegistration {
   void* ptr;
   size_t bytes;
