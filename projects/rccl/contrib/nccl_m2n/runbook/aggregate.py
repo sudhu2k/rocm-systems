@@ -62,7 +62,7 @@ for r in rows:
     k = (r['label'], r['shape'], r['size'], r['config'])
     meta[k] = (r['src'], r['dst'], r['np'])
     status[k].add(r['result'])
-    if r['result'] in ('OK', 'PASS'):
+    if r['result'] in ('OK', 'PASS') and r['round'] != 'v':   # round v: validation-only shape
         sb = src_bw(r)
         if sb is None and not r['bw_rank_avg']:
             continue

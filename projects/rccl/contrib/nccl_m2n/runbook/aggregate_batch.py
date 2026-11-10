@@ -5,16 +5,16 @@ from collections import defaultdict
 root = sys.argv[1]
 d = defaultdict(list); st = defaultdict(set)
 for f in sorted(glob.glob(os.path.join(root, '*_c*_r*.log'))):
-    m = re.match(r'(.+)_(pack|direct|pipe)_c(\d+)_r(\d+)\.log', os.path.basename(f))
+    m = re.match(r'(.+)_(pack|direct|pipe)_c(\d+)_r(\d+|v)\.log', os.path.basename(f))
     lab, cp, nc, rnd = m.groups()
     t = open(f, errors='ignore').read()
     ex = re.search(r'=== EXIT (\d+)', t)
     rc = int(ex.group(1)) if ex else None
     # Success markers precede teardown: a launch counts only with a recorded zero exit.
     ok = rc == 0 and 'Benchmark completed successfully' in t and 'VALIDATION FAILED' not in t
-    res = ('PASS' if rnd == '0' else 'OK') if ok else ('HANG' if rc == 124 else f'FAIL_rc{rc}')
+    res = ('PASS' if rnd in ('0', 'v') else 'OK') if ok else ('HANG' if rc == 124 else f'FAIL_rc{rc}')
     st[(lab, cp, nc)].add(res)
-    if not ok:
+    if not ok or rnd == 'v':   # round v: validation-only tensors, not in the tables
         continue
     for line in t.splitlines():
         p = line.split()

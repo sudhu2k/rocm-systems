@@ -23,7 +23,7 @@ for ph in $PHASES; do
     auto) mkdir -p $R/$a; L=$R/$a/auto_cross01_64M.log
        NCCL_RESHARD_LOG_LEVEL=INFO \
          timeout 300 bash -c "$(declare -f mpi); HF=$HF; SSHA='$SSHA'; mpi $b $e $BIN/reshard_bench --algorithm auto --src-mesh-dims 1,$c --dst-mesh-dims 1,$d \
-         --src-shard-dim 0 --dst-shard-dim 1 --tensor-dims 2048,2048,16 --iterations 10 --warmup 2 --validate" > $L 2>&1
+         --src-shard-dim 0 --dst-shard-dim 1 --tensor-dims 2032,2032,17 --iterations 10 --warmup 2 --validate" > $L 2>&1
        rc=$?; echo "=== EXIT $rc" >> $L; res=FAIL_rc$rc
        (( rc == 0 )) && grep -qx '\*\*\* VALIDATION PASSED \*\*\*' $L && res=PASS; [[ $res == PASS ]] || ST=1
        echo "auto $res $(grep -m1 'Algorithm setting' $L) | $(grep -m1 -oE 'copy_algo=[0-9]+' $L) | $(grep -m1 'Bandwidth' $L)" ;;

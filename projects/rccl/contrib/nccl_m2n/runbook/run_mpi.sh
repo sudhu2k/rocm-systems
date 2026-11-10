@@ -17,3 +17,4 @@ PLACE=()
     $BIN/basic_api_test_mpi "$@" --gtest_color=no
   echo "=== EXIT $? $(date -u)"; } > $LOG 2>&1
 grep -E "^\[  PASSED|^\[  FAILED  \] [0-9]|^\[  SKIPPED \] [0-9]|^=== EXIT" $LOG | sort | uniq -c
+exit $(grep '^=== EXIT' $LOG | cut -d' ' -f3)

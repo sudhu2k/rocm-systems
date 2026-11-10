@@ -172,13 +172,18 @@ up to 1 GiB, 1x4 -> 2x2 below 1 GiB here): those are copied one row per thread.
 Known FAIL on the current base: PIPE with a destination replicated inside a node (1x4 -> 2x2, LSA-sourced
 tiles) ends with `VALIDATION FAILED` and `exit 1` at every size, because this base does not carry the AMD
 LSA-tile path without TMA (`e0f6f109c26`). `dl_check.sh` and the aggregators report it as FAIL.
+`dl_check.sh` now validates on odd dims (124x124x129 / 508x508x257 / 1020x1020x1021) so that source shards do
+not alias under the `% 256` pattern; correctness is the same as above, but rows are unaligned and bandwidth is
+lower than in the table (measured on power-of-two dims), e.g. ~1 GB PACK cross-dim ~84 GiB/s.
 
 ## 8. reshard_bench matrix (1, 2, 4 nodes + asymmetric)
 
 `bench_matrix.sh` runs one scale: shapes x sizes (64 KiB ... 4 GiB, x4 steps, int8 tensors
 `[n, n, 16]`) x configs `D_PACK, D_DIRECT, D_PIPE, R_PACK` (`--algorithm direct|ring --copy-algorithm ...`).
 Each point is launched `ROUNDS=4` times; the config order alternates per round (ABBA) to spread drift,
-the first round runs with `--validate`, the others are perf-only. Per-launch timeout 240 s (400 s for
+a validate-only launch on non-aliasing dims (`16m x 16m x 17`, m odd; round `v`, not in the tables) runs first
+(the bench validates `(global index) % 256`, which aliases on power-of-two dims), then round 0 with `--validate`,
+the others perf-only. Per-launch timeout 240 s (400 s for
 1 GiB, 600 s for 4/16 GiB); a `HANG` or `FAIL` stops that config at that point. One CSV line per launch
 goes to `~/m2n-ruby/logs/bench/<label>/results.csv`, logs next to it.
 
@@ -247,7 +252,8 @@ for the replicated shape the bench's `Overall` average is larger because destina
 ## 9. reshard_batch_bench_user_window (sequential vs concurrent, `--num-comms`)
 
 `batch_phases.sh`: 4 tensors (`[1024,1024]`, `[4096,4096]`, `[16384,16384]` int8), same-dim and
-cross-dim patterns, copy PACK/DIRECT/PIPE x `--num-comms 1 2 4`, 3 launches (first with `--validate`).
+cross-dim patterns, copy PACK/DIRECT/PIPE x `--num-comms 1 2 4`, 3 launches (first with `--validate`),
+after a validate-only launch on non-aliasing tensors (`1008`/`4080`/`16368`, round `v`).
 
 ```bash
 PHASES_SCRIPT=batch_phases.sh PHASES="b1:8:4:4:0" sbatch -J m2n-b1 -N 1 -t 2:00:00 --export=ALL m2n_job.sbatch

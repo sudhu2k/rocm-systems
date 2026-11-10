@@ -23,7 +23,9 @@ declare -A SHAPE=(
   [cross10]="--src-mesh-dims 1,4 --dst-mesh-dims 1,4 --src-shard-dim 1 --dst-shard-dim 0"
   [mesh22]="--src-mesh-dims 1,4 --dst-mesh-dims 2,2 --src-shard-dim 0 --dst-shard-dim 1"
 )
-declare -A SIZE=( [2M]="128,128,128 --iterations 20 --warmup 3" [64M]="512,512,256 --iterations 10 --warmup 2" [1G]="1024,1024,1024 --iterations 5 --warmup 1" )
+# reshard_bench validates (global index) % 256: with power-of-two dims the column/depth terms and the shard
+# offsets vanish modulo 256 and source shards look identical. Odd local shard sizes keep them distinct.
+declare -A SIZE=( [2M]="124,124,129 --iterations 20 --warmup 3" [64M]="508,508,257 --iterations 10 --warmup 2" [1G]="1020,1020,1021 --iterations 5 --warmup 1" )
 declare -A TMO=( [2M]=180 [64M]=180 [1G]=300 )
 MODES=${MODES:-pack direct pipe default auto}
 

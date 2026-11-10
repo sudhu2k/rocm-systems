@@ -4,6 +4,7 @@
 #   shapes : comma list of same00,cross01,cross10,mesh2 (+ rcross01,rmesh for > 16 ranks per side)
 #   configs: comma list of D_PACK,D_DIRECT,D_PIPE,R_PACK
 # Env: SIZES (default 64K..4G x4, space or comma separated), ROUNDS (4 launches per point, ABBA order).
+# Each point first runs a validate-only launch (round v) on non-aliasing dims, then the aligned perf rounds.
 D=$(dirname "$(readlink -f "$0")")
 . $D/env.sh
 LAB=$1; NP=$2; S=$3; D=$4; SHAPES=${5//,/ }; CONFIGS=${6//,/ }; HF=$7
@@ -27,6 +28,9 @@ MPI=(mpirun -np $NP "${PLACE[@]}" --map-by ppr:8:node --bind-to none --mca pml o
 dims() { case $1 in 64K) echo 64,64,16;; 256K) echo 128,128,16;; 1M) echo 256,256,16;; 4M) echo 512,512,16;;
   16M) echo 1024,1024,16;; 64M) echo 2048,2048,16;; 256M) echo 4096,4096,16;; 1G) echo 8192,8192,16;;
   4G) echo 16384,16384,16;; 16G) echo 32768,32768,16;; esac; }
+# reshard_bench validates (global index) % 256; with the power-of-two dims above shards and columns alias.
+# 16*m x 16*m x 17 (m odd) keeps up to 16 shards per dim distinct and the column/depth terms nonzero.
+vdims() { local n=${1%%,*} m; m=$(( n / 16 - 1 )); echo $((16*m)),$((16*m)),17; }
 iters() { case $1 in 64K|256K|1M) echo "--iterations 50 --warmup 5";; 4M|16M|64M) echo "--iterations 20 --warmup 3";;
   256M|1G) echo "--iterations 10 --warmup 2";; *) echo "--iterations 5 --warmup 1";; esac; }
 tmo() { case $1 in 4G|16G) echo 600;; 1G) echo 400;; *) echo 240;; esac; }
@@ -53,13 +57,14 @@ cleanup_procs() {
 declare -A DEAD
 for shp in $SHAPES; do
   for z in $SIZES; do
-    for r in $(seq 0 $((ROUNDS-1))); do
-      list=($CONFIGS); (( r % 2 )) && list=($(printf '%s\n' "${list[@]}" | tac))
+    for r in v $(seq 0 $((ROUNDS-1))); do
+      list=($CONFIGS); [[ $r != v ]] && (( r % 2 )) && list=($(printf '%s\n' "${list[@]}" | tac))
       for c in "${list[@]}"; do
         key=$shp/$z/$c; [[ -n ${DEAD[$key]} ]] && continue
-        V=""; (( r == 0 )) && V="--validate"
+        V=""; [[ $r == v || $r == 0 ]] && V="--validate"
+        TD=$(dims $z); [[ $r == v ]] && TD=$(vdims $TD)
         L=$OUT/${shp}_${z}_${c}_r${r}_$RUN.log
-        A="$(cfg_args $c) $(shape_args $shp) --tensor-dims $(dims $z) $(iters $z) $V"
+        A="$(cfg_args $c) $(shape_args $shp) --tensor-dims $TD $(iters $z) $V"
         echo "=== $LAB $key r$r $(date -u +%FT%T) args: $A" > $L
         "${MPI[@]}" $BIN/reshard_bench $A >> $L 2>&1 &
         mp=$!; t=0; T=$(tmo $z)

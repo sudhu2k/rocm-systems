@@ -1,7 +1,8 @@
 #!/bin/bash
 # reshard_batch_bench_user_window: N tensors sequential vs concurrent across C comms.
 # BATCH_RUNS="<label>:<np>:<src>:<dst>:<hf 0|1>" ...; per copy mode x --num-comms, 3 launches
-# (first with --validate), ABBA order over num-comms.
+# (first with --validate), ABBA order over num-comms, after a validate-only launch (round v) on
+# non-aliasing tensors (the batch bench validates (global index) % 256; power-of-two dims alias).
 D=$(dirname "$(readlink -f "$0")")
 . $D/env.sh
 R=$WORK/logs/bench/batch; mkdir -p $R
@@ -17,13 +18,14 @@ for run in $BATCH_RUNS; do
   IFS=: read -r lab np s d hf <<<"$run"
   P=(); [[ $hf == 1 ]] && P=(--hostfile $HF)
   for cp in $COPIES; do
-    for r in 0 1 2; do
-      list=($COMMS); (( r % 2 )) && list=($(printf '%s\n' "${list[@]}" | tac))
+    for r in v 0 1 2; do
+      list=($COMMS); [[ $r != v ]] && (( r % 2 )) && list=($(printf '%s\n' "${list[@]}" | tac))
       for nc in "${list[@]}"; do
-        V=""; (( r == 0 )) && V="--validate"
+        V=""; [[ $r == v || $r == 0 ]] && V="--validate"
+        TD=1024,1024:4096,4096:16384,16384; [[ $r == v ]] && TD=1008,1008:4080,4080:16368,16368
         L=$R/${lab}_${cp}_c${nc}_r$r.log
         A="--algorithm direct --copy-algorithm $cp --src-mesh-dims 1,$s --dst-mesh-dims 1,$d \
-           --tensor-dims 1024,1024:4096,4096:16384,16384 --src-shard-dims 0,0 --dst-shard-dims 0,1 \
+           --tensor-dims $TD --src-shard-dims 0,0 --dst-shard-dims 0,1 \
            --num-comms $nc --num-tensors $NT --iterations 10 --warmup 2 $V"
         echo "=== $lab $cp c$nc r$r $(date -u +%FT%T) args: $A" > $L
         NCCL_RESHARD_ALGORITHM=DIRECT timeout 900 mpirun -np $np "${P[@]}" --map-by ppr:8:node --bind-to none --mca pml ob1 \

@@ -13,13 +13,14 @@ for m in $MODES; do
     2node) RUNS+=("mpi2_ring:2node:--algorithm ring" "mpi2_direct:2node:--algorithm direct" "mpi2_all:2node:--algorithm all") ;;
   esac
 done
+ST=0
 for r in "${RUNS[@]}"; do
   L=${r%%:*}; rest=${r#*:}; LAY=${rest%%:*}; ARGS=${rest#*:}
   echo ">>> $L ($LAY) $ARGS"
   case $LAY in
-    local) bash $D/run_local.sh $L $ARGS >/dev/null ;;
-    1node) bash $D/run_mpi.sh $L 8 1node $ARGS >/dev/null ;;
-    2node) bash $D/run_mpi.sh $L 16 2node $ARGS >/dev/null ;;
+    local) bash $D/run_local.sh $L $ARGS >/dev/null || ST=1 ;;
+    1node) bash $D/run_mpi.sh $L 8 1node $ARGS >/dev/null || ST=1 ;;
+    2node) bash $D/run_mpi.sh $L 16 2node $ARGS >/dev/null || ST=1 ;;
   esac
 done
 printf "\n%-14s %-7s %-7s %-7s %s\n" run passed failed skipped exit
@@ -31,3 +32,4 @@ for r in "${RUNS[@]}"; do
     "$(grep -m1 -oE '^\[  SKIPPED \] [0-9]+' $LOG | grep -oE '[0-9]+$' || echo 0)" \
     "$(grep '^=== EXIT' $LOG | cut -d' ' -f3)"
 done
+exit $ST
