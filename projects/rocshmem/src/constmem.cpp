@@ -1,5 +1,3 @@
-#include <string_view>
-
 #include "constmem.hpp"
 #include "backend_bc.hpp"
 #include "envvar.hpp"
@@ -15,24 +13,6 @@
 namespace rocshmem {
 
 extern Backend *backend;
-
-#if defined(USE_LDS_STAGE)
-namespace {
-// Runtime arch check for the 65535-element TDM tile_dim0 cap below.
-// gfx1250 alone isn't enough: TDM only activates there with USE_TDM.
-bool device_uses_tdm_encoding(int device_id) {
-#if defined(USE_TDM)
-  hipDeviceProp_t prop{};
-  CHECK_HIP(hipGetDeviceProperties(&prop, device_id));
-  std::string_view arch(prop.gcnArchName);
-  return arch.rfind("gfx1250", 0) == 0;  // matches gfx1250, gfx1250:xnack+, -strict, etc.
-#else
-  (void)device_id;
-  return false;
-#endif
-}
-}  // namespace
-#endif  // USE_LDS_STAGE
 
 void init_constant_memory(void) {
   std::string envstr;
@@ -86,8 +66,9 @@ void init_constant_memory(void) {
                                      device_id));
 
     constexpr uint32_t element_bytes = 1u << lds_stage::FlatCopyElementLog2;
-    // TDM's tile_dim0 is a 16-bit field; the async backend has no such cap.
-    const bool uses_tdm = device_uses_tdm_encoding(device_id);
+    // TDM's tile_dim0 is a 16-bit field (see lds_stage.hpp GROUP1), so the
+    // tile can never encode more than 65535 elements regardless of available
+    // LDS. Both backends are gfx1250-only, so apply the same cap uniformly.
     constexpr uint32_t max_encodable_tile_bytes = 65535u * element_bytes;
     // Reserve 16KB for rocSHMEM's own (small) static __shared__ usage plus
     // headroom for the caller's, then halve the rest for double buffering.
@@ -99,8 +80,8 @@ void init_constant_memory(void) {
     const uint32_t avail_tile_bytes =
         static_cast<uint32_t>((avail_bytes / 2) / element_bytes) * element_bytes;
     const uint32_t fittable_tile_bytes =
-        (!uses_tdm || avail_tile_bytes < max_encodable_tile_bytes) ? avail_tile_bytes
-                                                                    : max_encodable_tile_bytes;
+        (avail_tile_bytes < max_encodable_tile_bytes) ? avail_tile_bytes
+                                                      : max_encodable_tile_bytes;
 
     if (constmem_values.lds_stage_tile_bytes == 0) {
       constmem_values.lds_stage_tile_bytes = fittable_tile_bytes;
@@ -124,10 +105,10 @@ void init_constant_memory(void) {
             constmem_values.lds_stage_tile_bytes, element_bytes, aligned_tile_bytes);
         constmem_values.lds_stage_tile_bytes = aligned_tile_bytes;
       }
-      if (uses_tdm && constmem_values.lds_stage_tile_bytes > max_encodable_tile_bytes) {
+      if (constmem_values.lds_stage_tile_bytes > max_encodable_tile_bytes) {
         LOG_WARN(
-            "ROCSHMEM_LDS_STAGE_TILE_BYTES=%u exceeds the TDM descriptor's "
-            "65535-element tile_dim0 field (%u bytes); falling back to %u bytes.",
+            "ROCSHMEM_LDS_STAGE_TILE_BYTES=%u exceeds the 65535-element "
+            "tile_dim0 encoding cap (%u bytes); falling back to %u bytes.",
             constmem_values.lds_stage_tile_bytes, max_encodable_tile_bytes, fittable_tile_bytes);
         constmem_values.lds_stage_tile_bytes = fittable_tile_bytes;
       }
