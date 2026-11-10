@@ -136,7 +136,7 @@ void WaveRaceState::registerEventWithIntervals(
     InstructionSnapshot instruction, MemoryEventType type, std::vector<uint32_t> regIds,
     uint64_t execMask, uint8_t byteMask, IntervalSet ldsIntervals,
     std::span<const amdgpu::MemoryCounterObligation> counterObligations,
-    MemoryOrderClass memoryOrder, uint8_t lastRegisterByteMask) {
+    MemoryOrderClass memoryOrder, uint8_t lastRegisterByteMask, LdsAccess ldsAccess) {
   ProfileScope ps(*profiler_, "registerEvent");
   bool toSgpr = isToSgpr(type);
   bool toTtmp = isToTtmp(type);
@@ -153,7 +153,7 @@ void WaveRaceState::registerEventWithIntervals(
 
   auto eventId = detector->allocateEventId(waveId, instruction, type, std::move(regIds), execMask,
                                            byteMask, std::move(ldsIntervals), counterObligations,
-                                           memoryOrder, lastRegisterByteMask);
+                                           memoryOrder, lastRegisterByteMask, ldsAccess);
   for (uint32_t reg : detector->events().registers(eventId)) {
     if (toSgpr) {
       sgprMemoryEvents[reg].push_back(eventId);
@@ -253,7 +253,7 @@ void WaveRaceState::registerLdsEvent(
     uint64_t execMask, int waveSize, std::span<const uint32_t> laneBaseAddresses, int bytesPerLane,
     uint8_t byteMask, std::span<const amdgpu::MemoryCounterObligation> counterObligations,
     MemoryOrderClass memoryOrder, uint64_t ldsLaneMask, int elementBytes,
-    std::optional<uint64_t> allocationEnd) {
+    std::optional<uint64_t> allocationEnd, LdsAccess ldsAccess) {
   IntervalSet intervals;
   forEachActiveLane(execMask & ldsLaneMask, waveSize, [&](int lane) {
     appendLdsInterval(intervals, laneBaseAddresses[lane], bytesPerLane, *detector, elementBytes,
@@ -261,7 +261,7 @@ void WaveRaceState::registerLdsEvent(
   });
   intervals.finalize();
   registerEventWithIntervals(instruction, type, std::move(registers), execMask, byteMask,
-                             std::move(intervals), counterObligations, memoryOrder);
+                             std::move(intervals), counterObligations, memoryOrder, 0, ldsAccess);
 }
 
 void WaveRaceState::registerLdsEvent(
@@ -269,7 +269,7 @@ void WaveRaceState::registerLdsEvent(
     uint64_t execMask, int waveSize, std::span<const uint32_t> firstLaneBaseAddresses,
     std::span<const uint32_t> secondLaneBaseAddresses, int bytesPerLane, uint8_t byteMask,
     std::span<const amdgpu::MemoryCounterObligation> counterObligations,
-    MemoryOrderClass memoryOrder, int elementBytes) {
+    MemoryOrderClass memoryOrder, int elementBytes, LdsAccess ldsAccess) {
   IntervalSet intervals;
   forEachActiveLane(execMask, waveSize, [&](int lane) {
     for (const auto addresses : {firstLaneBaseAddresses, secondLaneBaseAddresses})
@@ -277,7 +277,7 @@ void WaveRaceState::registerLdsEvent(
   });
   intervals.finalize();
   registerEventWithIntervals(instruction, type, std::move(registers), execMask, byteMask,
-                             std::move(intervals), counterObligations, memoryOrder);
+                             std::move(intervals), counterObligations, memoryOrder, 0, ldsAccess);
 }
 
 void WaveRaceState::registerLdsRangeEvent(
@@ -457,12 +457,34 @@ void WaveRaceState::applyWaitCounter(amdgpu::WaitCounterType type, int threshold
   applyCounterConstraint(type, threshold, /*includeUnordered=*/false);
 }
 
+void WaveRaceState::recordLdsOperandRead(InstructionSnapshot instruction, uint32_t address,
+                                         uint32_t bytes, uint32_t lane) {
+  if (!detector->validLdsRange(address, bytes))
+    return;
+  // Each actual read can conflict with a newer write, even when these bytes
+  // are already represented in the wave's completed read history.
+  detector->validateRead(address, waveId, lane, bytes, MemoryOrderClass::UNORDERED);
+  auto &covered = directLdsReadWidths[address];
+  if (bytes <= covered)
+    return;
+  // Preserve the first instruction to consume each byte. Only a wider read
+  // adds to this DWORD's barrier history, without creating a counter token.
+  IntervalSet intervals;
+  intervals.append(address + covered, address + bytes);
+  auto event = detector->allocateEventId(
+      waveId, instruction, MemoryEventType::LDS_OPERAND_READ, {}, 0, 0, std::move(intervals),
+      std::span<const amdgpu::MemoryCounterObligation>{}, MemoryOrderClass::UNORDERED);
+  barrierPendingEvents.push_back(event);
+  covered = bytes;
+}
+
 void WaveRaceState::flushBarrierPendingEvents() {
   ProfileScope ps(*profiler_, "removeEvents");
   for (EventId eventId : barrierPendingEvents) {
     detector->retireEvent(eventId);
   }
   barrierPendingEvents.clear();
+  directLdsReadWidths.clear();
 }
 
 void WaveRaceState::checkVgprRead(int reg, int lane, uint8_t byteMask) const {

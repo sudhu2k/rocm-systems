@@ -76,6 +76,11 @@ TEST_P(BufferLdsTransfer, BufferNarrowAndX3TransfersUseDwordLaneLayout) {
   for (unsigned opcode :
        {cdna4::kBufferLoadSbyteMubuf,
         cdna4::kBufferLoadDwordx3Mubuf}) { // BUFFER_LOAD_SBYTE / BUFFER_LOAD_DWORDX3.
+    if (GetParam() == ROCJITSU_CODE_ARCH_CDNA1 && opcode == cdna4::kBufferLoadDwordx3Mubuf) {
+      const auto words = cdna4::build_mubuf(opcode, {.lds = 1});
+      EXPECT_TRUE(decoder_->decode(words.data()).failed());
+      continue;
+    }
     clear_lds();
     wave_->set_exec(0x25);
     wave_->set_m0(0xfffc0040);

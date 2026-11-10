@@ -127,6 +127,8 @@ public:
     const bool observes_sgpr_reads = p->observes_sgpr_reads();
     const bool observes_scalar_register_writes = p->observes_scalar_register_writes();
     const bool observes_memory_routing = p->observes_memory_routing();
+    auto *lds_direct_reader = dynamic_cast<AmdgpuLdsDirectReadObserver *>(p.get());
+    observes_lds_direct_reads_ |= lds_direct_reader != nullptr;
     const bool observes_tensor_dma_memory_access = p->observes_tensor_dma_memory_access();
     const bool observes_tensor_dma_issue = p->observes_tensor_dma_issue();
     serialize_hot_hooks_ |= p->requires_serial_hot_hooks();
@@ -145,12 +147,12 @@ public:
     SinkBundle sink = build_sink_bundle(p->name() + ".log");
     if (auto *configured_sink = sink.get())
       p->sink_ = configured_sink;
-    plugins_.push_back(
-        PluginEntry{std::move(sink), observes_before_execute_instruction,
-                    observes_after_execute_instruction, observes_async_instruction_issued,
-                    observes_memory_instruction_routing, observes_vgpr_reads, observes_vgpr_writes,
-                    observes_sgpr_reads, observes_scalar_register_writes, observes_memory_routing,
-                    observes_tensor_dma_memory_access, observes_tensor_dma_issue, std::move(p)});
+    plugins_.push_back(PluginEntry{
+        std::move(sink), observes_before_execute_instruction, observes_after_execute_instruction,
+        observes_async_instruction_issued, observes_memory_instruction_routing, observes_vgpr_reads,
+        observes_vgpr_writes, observes_sgpr_reads, observes_scalar_register_writes,
+        observes_memory_routing, observes_tensor_dma_memory_access, observes_tensor_dma_issue,
+        lds_direct_reader, std::move(p)});
     return true;
   }
 
@@ -301,6 +303,25 @@ public:
         auto &entry = plugins_[index];
         if (entry.observes_memory_routing && plugin_observes_hot_hooks(index, &wf, cached))
           entry.plugin->onAmdgpuMemoryAccessRouted(access, inst, wf);
+      }
+    });
+  }
+
+  void onAmdgpuLdsDirectRead(const amdgpu::Wavefront &wf, uint32_t address, uint32_t bytes,
+                             uint32_t lane) {
+    if (!observes_lds_direct_reads_ || wf.observing_lds_direct_read_)
+      return;
+    // An observer may inspect this same operand while handling the notification.
+    struct Restore {
+      bool &flag;
+      ~Restore() { flag = false; }
+    } restore{wf.observing_lds_direct_read_};
+    wf.observing_lds_direct_read_ = true;
+    dispatch_wave_hot_hook(&wf, [&](bool cached) {
+      for (size_t index = 0; index != plugins_.size(); ++index) {
+        const auto &entry = plugins_[index];
+        if (entry.lds_direct_reader && plugin_observes_hot_hooks(index, &wf, cached))
+          entry.lds_direct_reader->onAmdgpuLdsDirectRead(wf, address, bytes, lane);
       }
     });
   }
@@ -641,6 +662,7 @@ private:
   bool observes_vgpr_reads_ = false;
   bool observes_vgpr_writes_ = false;
   bool observes_memory_routing_ = false;
+  bool observes_lds_direct_reads_ = false;
   bool observes_tensor_dma_memory_access_ = false;
   bool observes_tensor_dma_issue_ = false;
   bool observes_sgpr_reads_ = false;
@@ -731,6 +753,7 @@ private:
     bool observes_memory_routing = false;
     bool observes_tensor_dma_memory_access = false;
     bool observes_tensor_dma_issue = false;
+    AmdgpuLdsDirectReadObserver *lds_direct_reader = nullptr;
     OwnedPlugin plugin;
   };
 

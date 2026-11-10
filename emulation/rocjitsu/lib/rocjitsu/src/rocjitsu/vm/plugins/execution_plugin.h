@@ -28,6 +28,14 @@
 
 namespace rocjitsu {
 
+/// Optional observation of a VALU lane sourcing bytes directly from LDS.
+class AmdgpuLdsDirectReadObserver {
+public:
+  virtual ~AmdgpuLdsDirectReadObserver() = default;
+  virtual void onAmdgpuLdsDirectRead(const amdgpu::Wavefront &wf, uint32_t address, uint32_t bytes,
+                                     uint32_t lane) = 0;
+};
+
 /// @brief Abstract plugin interface for execution hooks.
 ///
 /// Plugins receive callbacks at key points during simulation execution.

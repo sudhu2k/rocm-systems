@@ -32,6 +32,27 @@ inline std::optional<uint32_t> relative_vgpr_index(std::optional<uint32_t> base,
   return *base + offset;
 }
 
+/// GFX11.5 VALU can broadcast at most two different scalar values. Inline
+/// constants and VGPRs use no scalar port. A repeated literal of another
+/// width is a different broadcast; SGPR tuples at the same base share one.
+constexpr bool gfx115_scalar_sources_fit(uint32_t a, unsigned a_bits, uint32_t b, unsigned b_bits,
+                                         uint32_t c, unsigned c_bits, bool implicit_vcc = false) {
+  auto bus_key = [implicit_vcc](uint32_t selector, unsigned bits) -> int {
+    // FMAS already broadcasts the full VCC pair; VCC_LO alone is a distinct value.
+    if (implicit_vcc && selector == 106 && bits == 64)
+      return -1;
+    if (selector == 255)
+      return static_cast<int>(selector + bits);
+    if ((selector < 128 && selector != 124) || selector == 253)
+      return static_cast<int>(selector);
+    return -1;
+  };
+  const int x = bus_key(a, a_bits), y = bus_key(b, b_bits), z = bus_key(c, c_bits);
+  if (implicit_vcc)
+    return (x < 0 || y < 0 || x == y) && (x < 0 || z < 0 || x == z) && (y < 0 || z < 0 || y == z);
+  return x < 0 || y < 0 || z < 0 || x == y || x == z || y == z;
+}
+
 /// M0 carries the barrier ID in its low five bits; other operands carry the ID itself.
 constexpr int32_t barrier_operand_id(uint32_t source, bool source_is_m0) {
   return static_cast<int32_t>(source_is_m0 ? source & 0x1fu : source);
@@ -219,11 +240,13 @@ struct RegisterModifiers {
   uint8_t bound_ctrl = 0;
   uint8_t fi = 1;
   const Operand *src0 = nullptr;
+  const Operand *dpp_masked_compare_rhs = nullptr;
   const Operand *src1 = nullptr;
   uint8_t src0_selection = 6;
   uint8_t src1_selection = 6;
   uint8_t dst_selection = 6;
   uint8_t dst_unused = 0;
+  bool constant_float_compare = false; // Only reads inputs when checking for FP exceptions.
 };
 
 /// @brief VOP1/VOP2 src0 encoding values that indicate DPP or SDWA modifiers.

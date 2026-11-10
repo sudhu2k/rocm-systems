@@ -2177,10 +2177,6 @@ class Cdna2Profile(CdnaProfile):
         return 8
 
     @property
-    def dpp_64bit_input_row_select_only(self) -> bool:
-        return False
-
-    @property
     def flat_scratch_mechanism(self) -> str:
         return 'sgpr_pair'
 
@@ -2207,16 +2203,6 @@ class Cdna2Profile(CdnaProfile):
     @property
     def skip_encodings(self) -> frozenset[str]:
         return frozenset()
-
-    def dpp_opcode_rule(
-        self,
-        enc_name: str,
-        inst_name: str,
-        *,
-        src0_size_bits: int | None = None,
-    ) -> DppOpcodeRule:
-        del enc_name, src0_size_bits
-        return _legacy_dpp_opcode_rule(inst_name)
 
 
 class Rdna1Profile(_AmdgpuProfileBase):
@@ -2256,6 +2242,15 @@ class Rdna1Profile(_AmdgpuProfileBase):
     flat_offset_bits = 12
     scratch_has_vaddr_expr = '(inst_.saddr == 0x7D || inst_.saddr == 0x7F)'
 
+    def skip_inst_encoding(
+        self, enc_name: str, enc_cond: str, *, unique_segment_opcode: bool = False
+    ) -> bool:
+        # The XML spells the unmodified VOP3 relative-move form as a
+        # conjunction of negative modifier conditions rather than "default".
+        return super().skip_inst_encoding(
+            enc_name, enc_cond, unique_segment_opcode=unique_segment_opcode
+        )
+
     def saddr_null_selector_expr(self, enc_name: str) -> str | None:
         if enc_name.upper() == 'ENC_FLAT':
             return '0x7D'
@@ -2271,6 +2266,18 @@ class Rdna1Profile(_AmdgpuProfileBase):
     @property
     def ds_compare_store_compare_first(self) -> bool:
         # CDNA1-4 / RDNA1-2 DS CMPST reverses the BUFFER operand order.
+        return True
+
+    @property
+    def dpp_supports_wave_controls(self) -> bool:
+        return False
+
+    @property
+    def dpp_supports_row_broadcast_controls(self) -> bool:
+        return False
+
+    @property
+    def dpp_supports_row_xmask(self) -> bool:
         return True
 
     @property
@@ -2363,6 +2370,30 @@ class Rdna2Profile(Rdna1Profile):
     Inherits the RDNA1 Wave32 default and Wave64 maximum. DPP/SDWA variants
     remain skipped (``_SKIP_DPP_SDWA = True``).
     """
+
+    @property
+    def dpp_supports_row_xmask(self) -> bool:
+        return True
+
+    @property
+    def dpp_supports_wave_controls(self) -> bool:
+        return False
+
+    @property
+    def dpp_supports_row_broadcast_controls(self) -> bool:
+        return False
+
+    def skip_inst_encoding(
+        self, enc_name: str, enc_cond: str, *, unique_segment_opcode: bool = False
+    ) -> bool:
+        # The three relative-source moves use this spelling for their plain VOP3 form.
+        return super().skip_inst_encoding(
+            enc_name, enc_cond, unique_segment_opcode=unique_segment_opcode
+        )
+
+    @property
+    def integer_clamp_dtypes(self) -> dict[str, str]:
+        return {**super().integer_clamp_dtypes, 'V_MUL_LO_U16': 'u16'}
 
     # GFX10.3 assigns SADDR=127 to the immediate-only scratch form.
     scratch_has_vaddr_expr = 'inst_.saddr == 0x7D'
@@ -2732,6 +2763,19 @@ class Rdna4Profile(_AmdgpuProfileBase):
     _SKIP_DPP_SDWA = True
     _SKIP = frozenset({'VOPDXY', 'VOPDXY_INST_LITERAL'})
     _SOP1_BASE_COND = 'Nothas_lit_0_Nothas_lit_1'
+
+    def normalize_operand_type(
+        self, enc_name: str, field_name: str, operand_type: str
+    ) -> str:
+        # The five V_S_*_F16 operations can source M0, EXEC or SCC on GFX12.
+        # The XML's narrower class omits them from the otherwise scalar input.
+        if (
+            enc_name.upper() == 'ENC_VOP3'
+            and field_name == 'src0'
+            and operand_type == 'OPR_SREG_LITERAL'
+        ):
+            return 'OPR_SSRC'
+        return super().normalize_operand_type(enc_name, field_name, operand_type)
 
     def normalize_encoding_condition(self, enc_name: str, cond_name: str) -> str:
         if enc_name.upper() == 'ENC_SOP1' and cond_name == self._SOP1_BASE_COND:

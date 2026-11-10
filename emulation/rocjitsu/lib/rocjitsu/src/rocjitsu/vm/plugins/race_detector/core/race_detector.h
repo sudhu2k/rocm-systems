@@ -64,7 +64,8 @@ public:
                           std::vector<uint32_t> registers, uint64_t execMask, uint8_t byteMask,
                           IntervalSet ldsIntervals,
                           std::span<const amdgpu::MemoryCounterObligation> counterObligations,
-                          MemoryOrderClass memoryOrder, uint8_t lastRegisterByteMask = 0);
+                          MemoryOrderClass memoryOrder, uint8_t lastRegisterByteMask = 0,
+                          LdsAccess ldsAccess = {});
 
   /// Transition an event from ACTIVE to WAVE_COMPLETE.
   void markEventWaveComplete(EventId);
@@ -82,7 +83,8 @@ public:
   /// Same-wave operations are ordered only when both belong to the same
   /// non-UNORDERED completion class.
   void validateRead(int addr, WaveId, int lane, int nBytes,
-                    MemoryOrderClass currentMemoryOrder = MemoryOrderClass::LDS) const;
+                    MemoryOrderClass currentMemoryOrder = MemoryOrderClass::LDS,
+                    uint8_t atomicBytes = 0) const;
 
   /// Check for WAR hazards: no outstanding LDS reads overlap the range.
   /// Same-wave operations are ordered only when both belong to the same
@@ -90,7 +92,8 @@ public:
   /// TODO(newling): WAW detection (write vs outstanding writes) is not
   /// implemented.
   void validateWrite(int addr, WaveId, int lane, int nBytes,
-                     MemoryOrderClass currentMemoryOrder = MemoryOrderClass::LDS) const;
+                     MemoryOrderClass currentMemoryOrder = MemoryOrderClass::LDS,
+                    uint8_t atomicBytes = 0) const;
 
   /// True only when the complete access lies in the CU's logical LDS backing.
   bool validLdsRange(uint64_t address, uint64_t bytes) const {
@@ -117,6 +120,13 @@ public:
   /// getSourceLine(i) returns the original source text for line index i.
   std::string decorateException(const RaceViolation &, uint64_t wavePc, int numSourceLines,
                                 std::function<std::string_view(int)> getSourceLine) const;
+
+  /// A resolved workgroup barrier publishes completed LDS intervals from all
+  /// its waves, including ones that have already halted.
+  void flushWorkgroupBarrierEvents() {
+    for (auto &wave : waveRaceStates)
+      wave.flushBarrierPendingEvents();
+  }
 
   WaveRaceState &getWaveRaceState(int waveIndex);
 

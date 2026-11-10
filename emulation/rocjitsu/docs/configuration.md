@@ -352,11 +352,12 @@ does not select direct-CU groups; their WGP IDs still follow CU child order.
 
 This policy currently applies to RDNA3/RDNA4 dense WMMA, RDNA4 sparse WMMA, and
 RDNA3/RDNA4 fused floating-point arithmetic, basic floating-point arithmetic and
-selection, division, dot products, conversions, comparisons, graphics operations and register/lane routing. Other instructions retain their
+selection, division, dot products, conversions, comparisons, graphics operations and register/lane routing.
+On RDNA2 it also applies to legacy FP32 FMA/FMAC, FP64 FMA, FP16 add/subtract/multiply, and VOP3 floating-point comparisons. Other instructions retain their
 existing implementations while integration proceeds by instruction family.
 
 The optional top-level `arithmetic` object selects one semantics mode for
-RDNA3/RDNA4 instructions executed through rj-arith:
+instructions executed through rj-arith:
 
 ```json
 "arithmetic": {

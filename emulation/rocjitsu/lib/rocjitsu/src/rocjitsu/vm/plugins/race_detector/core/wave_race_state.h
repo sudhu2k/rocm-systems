@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace rocjitsu::plugins::race_detector {
@@ -116,7 +117,8 @@ public:
                         uint8_t byteMask,
                         std::span<const amdgpu::MemoryCounterObligation> counterObligations,
                         MemoryOrderClass memoryOrder, uint64_t ldsLaneMask = ~uint64_t{0},
-                        int elementBytes = 0, std::optional<uint64_t> allocationEnd = std::nullopt);
+                        int elementBytes = 0, std::optional<uint64_t> allocationEnd = std::nullopt,
+                        LdsAccess ldsAccess = {});
   /// Register two LDS address sets per lane. elementBytes selects the granularity
   /// of complete elements retained at the backing boundary; zero treats the
   /// whole per-lane access in each address set as one element.
@@ -126,7 +128,7 @@ public:
                         std::span<const uint32_t> secondLaneBaseAddresses, int bytesPerLane,
                         uint8_t byteMask,
                         std::span<const amdgpu::MemoryCounterObligation> counterObligations,
-                        MemoryOrderClass memoryOrder, int elementBytes = 0);
+                        MemoryOrderClass memoryOrder, int elementBytes = 0, LdsAccess ldsAccess = {});
 
   /// Register an LDS event described by byte ranges rather than lanes, such as
   /// a tensor DMA transfer. The event has no registers. Each range is retained
@@ -175,6 +177,11 @@ public:
 
   /// Dispatch the counter thresholds changed by one wait instruction.
   void dispatch(const PendingWaitCount &);
+
+  /// Check a synchronous VALU source against older writers and remember the
+  /// completed read until a barrier publishes it to peer waves.
+  void recordLdsOperandRead(InstructionSnapshot instruction, uint32_t address, uint32_t bytes,
+                            uint32_t lane);
 
   /// Retire non-trimmable events whose owning wave completed them before a workgroup barrier.
   void flushBarrierPendingEvents();
@@ -234,7 +241,8 @@ private:
                                   std::vector<uint32_t> registers, uint64_t execMask,
                                   uint8_t byteMask, IntervalSet ldsIntervals,
                                   std::span<const amdgpu::MemoryCounterObligation>,
-                                  MemoryOrderClass memoryOrder, uint8_t lastRegisterByteMask = 0);
+                                  MemoryOrderClass memoryOrder, uint8_t lastRegisterByteMask = 0,
+                                  LdsAccess ldsAccess = {});
   void retireEventRegisters(EventId);
   void checkScalarAccess(RegisterRef reg, bool isWrite) const;
 
@@ -262,6 +270,7 @@ private:
   std::array<std::vector<int>, kNumEventTypes> regEventCount;
 
   std::vector<EventId> waveMemoryEvents;
+  std::unordered_map<uint32_t, uint8_t> directLdsReadWidths;
   std::vector<EventId> barrierPendingEvents;
 
   CounterCapacities counterCapacities;

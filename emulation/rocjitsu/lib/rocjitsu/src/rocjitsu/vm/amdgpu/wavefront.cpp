@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 #include "rocjitsu/vm/amdgpu/wavefront.h"
+#include "rocjitsu/vm/amdgpu/register_access.h"
 
 #include "rocjitsu/isa/arch/amdgpu/generated/shared/isa_properties.h"
+#include "rocjitsu/isa/arch/amdgpu/shared/instruction_encoding.h"
 #include "rocjitsu/vm/amdgpu/compute_unit.h"
 #include "rocjitsu/vm/amdgpu/gpu_vm.h"
 #include "rocjitsu/vm/amdgpu/hsa_clock.h"
@@ -21,6 +23,33 @@ Wavefront::Wavefront(ComputeUnitCore &cu, uint32_t wf_id, uint32_t default_wf_si
       default_wf_size_(default_wf_size), max_wf_size_(max_wf_size), max_sgprs_(max_sgprs),
       max_vgprs_(max_vgprs), mode_has_gpr_idx_en_(mode_has_gpr_idx_en),
       memory_wait_checks_enabled_(cu.config().memory_wait_checks_enabled()) {}
+
+bool Wavefront::valu_destinations_allocated(const Instruction &inst) const {
+  for (int i = 0; i < inst.num_dst_operands(); ++i) {
+    const auto *op = inst.dst_operand(i);
+    const auto ref = op->to_register_ref();
+    if (ref && ref->cls == RegClass::SGPR && inst.num_dst_operands() > 1 &&
+        !sgpr_alloc().contains(sgpr_alloc().base + ref->index, ref->width))
+      return false;
+    if (!ref || (ref->cls != RegClass::VGPR && ref->cls != RegClass::ACC_VGPR))
+      continue;
+    const uint32_t start = ref->cls == RegClass::ACC_VGPR
+                               ? ref->index
+                               : apply_gpr_idx(*this, ref->index, op->vgpr_msb_role());
+    if (start >= num_vgprs() || ref->width > num_vgprs() - start)
+      return false;
+  }
+  return true;
+}
+
+bool Wavefront::cdna2_memory_destination_out_of_range(const Instruction &inst) const {
+  for (int i = 0; i < inst.num_dst_operands(); ++i) {
+    const auto reg = inst.dst_operand(i)->decoded_vgpr();
+    if (reg && !cdna2_vgpr_range_is_allocated(reg->index, reg->width))
+      return true;
+  }
+  return false;
+}
 
 void Wavefront::update_activity_counts(bool was_active, bool was_runnable) {
   if (!activity_tracked_)
@@ -50,6 +79,47 @@ void Wavefront::update_activity_counts(bool was_active, bool was_runnable) {
 
 bool Wavefront::uses_separate_trap_ctrl() const {
   return isa_properties(cu_.arch()).wave_state_layout != WaveStateLayout::Legacy;
+}
+
+bool Wavefront::discards_valu_result(const Instruction &inst) const {
+  if (!(inst.flags() & VALU))
+    return false;
+  switch (cu_.arch()) {
+  case ROCJITSU_CODE_ARCH_CDNA1:
+    return !valu_destinations_allocated(inst);
+  case ROCJITSU_CODE_ARCH_RDNA1:
+  case ROCJITSU_CODE_ARCH_RDNA2:
+  case ROCJITSU_CODE_ARCH_RDNA3_5:
+    return !vgpr_destinations_allocated(inst);
+  default:
+    return false;
+  }
+}
+
+bool Wavefront::vgpr_destinations_allocated(const Instruction &inst) const {
+  for (int i = 0; i < inst.num_dst_operands(); ++i) {
+    const auto &operand = *inst.dst_operand(i);
+    const auto reg =
+        cu_.arch() == ROCJITSU_CODE_ARCH_RDNA3_5 && (inst.flags() & MATRIX_REGISTER_ACCESSES)
+            ? RegisterAccess(*this).gfx115_wmma_register(operand, true)
+            : operand.decoded_vgpr();
+    if (reg && operand.size_bits() &&
+        !vgpr_alloc().contains(vgpr_alloc().base + reg->index, reg->width))
+      return false;
+  }
+  return true;
+}
+
+uint64_t Wavefront::memory_exec(const Instruction &inst) const {
+  if ((cu_.arch() == ROCJITSU_CODE_ARCH_RDNA1 || cu_.arch() == ROCJITSU_CODE_ARCH_RDNA2) &&
+      (inst.flags() & (VMEM | LDS)) && !vgpr_destinations_allocated(inst))
+    return 0;
+  return exec();
+}
+
+void Wavefront::observe_lds_direct_read(uint32_t address, uint32_t bytes, uint32_t lane) const {
+  record_lds_source_read(address, bytes);
+  cu_.plugin_group().onAmdgpuLdsDirectRead(*this, address, bytes, lane);
 }
 
 bool Wavefront::has_gpu_memory() const { return cu_.memory() != nullptr; }

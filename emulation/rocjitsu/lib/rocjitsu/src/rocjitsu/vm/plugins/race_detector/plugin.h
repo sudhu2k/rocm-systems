@@ -74,9 +74,15 @@ struct RaceWavefrontState : WavefrontState {
   /// rewritten or unmapped.
   RingBuffer<InstructionSnapshot, 256> trace;
   WaveRaceState *race_state = nullptr;
+  struct LdsOperandRead {
+    uint32_t address;
+    uint32_t bytes;
+    uint32_t lane;
+  };
+  std::optional<LdsOperandRead> lds_operand_read;
 };
 
-class RaceDetectorPlugin : public ExecutionPlugin {
+class RaceDetectorPlugin : public ExecutionPlugin, public AmdgpuLdsDirectReadObserver {
 public:
   /// @param config_json Plugin configuration object as a JSON string (unused;
   ///        this plugin takes no configuration). May be null.
@@ -105,6 +111,9 @@ public:
 
   void onAmdgpuMemoryAccessRouted(const amdgpu::MemoryAccessObservation &access,
                                   const Instruction &inst, amdgpu::Wavefront &wf) override;
+
+  void onAmdgpuLdsDirectRead(const amdgpu::Wavefront &wf, uint32_t address, uint32_t bytes,
+                             uint32_t lane) override;
 
   /// Register an issued tensor DMA instruction's LDS side as an event on TENSORCNT.
   void onAmdgpuTensorDmaIssued(const amdgpu::TensorDmaIssueObservation &issue,

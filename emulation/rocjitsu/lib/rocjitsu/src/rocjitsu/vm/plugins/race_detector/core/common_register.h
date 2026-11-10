@@ -43,11 +43,19 @@ enum class MemoryEventType {
   /// store (TENSORCNT, TENSOR).
   LDS_TO_GLOBAL,
 
+  /// A synchronous VALU operand read visible to peers until a barrier.
+  LDS_OPERAND_READ,
+
   N
 };
 
 /// Race-detector name for the decoded hardware completion-order classification.
 using MemoryOrderClass = amdgpu::MemoryCompletionClass;
+
+struct LdsAccess {
+  bool read_modify_write = false;
+  uint8_t aligned_atomic_bytes = 0;
+};
 
 /// Derive the ordering usable for whole-event hazards such as destination WAW.
 /// Per-counter ordering remains useful for partial waits, but an event spanning
@@ -82,7 +90,8 @@ inline bool isToTtmp(MemoryEventType t) { return t == MemoryEventType::GLOBAL_TO
 inline bool isToScalar(MemoryEventType t) { return isToSgpr(t) || isToTtmp(t); }
 
 inline bool isFromLds(MemoryEventType t) {
-  return t == MemoryEventType::LDS_TO_VGPR || t == MemoryEventType::LDS_TO_GLOBAL;
+  return t == MemoryEventType::LDS_TO_VGPR || t == MemoryEventType::LDS_TO_GLOBAL ||
+         t == MemoryEventType::LDS_OPERAND_READ;
 }
 
 /// True if the event touches LDS (read or write).
@@ -111,6 +120,7 @@ inline amdgpu::WaitCounterType defaultWaitCounterType(MemoryEventType t) {
     return amdgpu::WaitCounterType::LGKMCNT;
   case MemoryEventType::LDS_TO_GLOBAL:
     return amdgpu::WaitCounterType::TENSORCNT;
+  case MemoryEventType::LDS_OPERAND_READ:
   case MemoryEventType::N:
     break;
   }
@@ -135,6 +145,7 @@ inline MemoryOrderClass defaultMemoryOrder(MemoryEventType t) {
     return MemoryOrderClass::UNORDERED;
   case MemoryEventType::LDS_TO_GLOBAL:
     return MemoryOrderClass::TENSOR;
+  case MemoryEventType::LDS_OPERAND_READ:
   case MemoryEventType::N:
     break;
   }
