@@ -547,6 +547,10 @@ BlitKernel::BlitKernel(core::Queue* queue)
 BlitKernel::~BlitKernel() {}
 
 hsa_status_t BlitKernel::Initialize(const core::Agent& agent) {
+  // A blit without a queue cannot copy anything. Fail here rather than let the
+  // object reach blits_[], where every later copy on that engine would use it.
+  if (queue_ == nullptr) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+
   agent_ = &agent;
   queue_bitmask_ = queue_->public_handle()->size - 1;
 
@@ -615,6 +619,10 @@ hsa_status_t BlitKernel::Destroy() {
 
 hsa_status_t BlitKernel::SubmitLinearCopyCommand(void* dst, const void* src,
                                                  size_t size) {
+  // Never submit on a blit that has no queue: report the failure instead of
+  // dereferencing a null queue_ in AcquireWriteIndex.
+  if (queue_ == nullptr) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+
   // Protect completion_signal_.
   std::lock_guard<std::mutex> guard(lock_);
 
@@ -656,6 +664,9 @@ hsa_status_t BlitKernel::SubmitLinearCopyCommand(
     void* dst, const void* src, size_t size,
     std::vector<core::Signal*>& dep_signals, core::Signal& out_signal,
     std::vector<core::Signal*>& gang_signals) {
+  // Never submit on a blit that has no queue: report the failure instead of
+  // dereferencing a null queue_ in AcquireWriteIndex.
+  if (queue_ == nullptr) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
 
   if (core::Runtime::runtime_singleton_->flag().enable_dtif_fast_copy() && dep_signals.empty()) {
     LogPrint(HSA_AMD_LOG_FLAG_BLIT_KERNEL_PKTS, "[ROCDTIF blit kernel] src = %p, dst = %p, size = 0x%lx", src, dst, size);
@@ -973,6 +984,9 @@ void BlitKernel::RecordBlitHistory(uint64_t size, uint64_t index) {
 }
 
 uint64_t BlitKernel::PendingBytes() {
+  // Nothing can be queued on a blit that has no queue.
+  if (queue_ == nullptr) return 0;
+
   uint64_t read = queue_->LoadReadIndexRelaxed();
   uint64_t index = pending_search_index_.load();
   uint64_t last = last_queued_;
