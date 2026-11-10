@@ -39,7 +39,7 @@ string(
     _profile_json
     "${_profile_json}"
 )
-file(WRITE "${_config_dir}/gfx950_mi355x.json" "${_profile_json}")
+file(WRITE "${_config_dir}/gfx950_mi350x.json" "${_profile_json}")
 
 execute_process(
     COMMAND
