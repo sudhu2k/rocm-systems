@@ -725,12 +725,15 @@ void RaceDetectorPlugin::onAmdgpuBeforeExecuteInstruction(uint64_t pc, const Ins
 
     // Messages are not memory instructions, so they remain outside memory
     // issue metadata. They count on LGKMCNT before GFX12 and on KMcnt on
-    // gfx1250 (CDNA5 ISA 5.7.1.5).
-    if (std::string_view(inst.mnemonic()).starts_with("s_sendmsg")) {
-      const auto counter = wf.cu().arch() == ROCJITSU_CODE_ARCH_CDNA5
-                               ? amdgpu::WaitCounterType::KMCNT
-                               : amdgpu::WaitCounterType::LGKMCNT;
-      s->race_state->prepareForCounterIncrement(counter);
+    // gfx1250 (CDNA5 ISA 5.7.1.5), where S_SENDMSG_RTN_B* adds two tokens, one
+    // for the message and one for its returned data (CDNA5 ISA 5.4).
+    const std::string_view mnemonic = inst.mnemonic();
+    if (mnemonic.starts_with("s_sendmsg")) {
+      const bool cdna5 = wf.cu().arch() == ROCJITSU_CODE_ARCH_CDNA5;
+      const auto counter =
+          cdna5 ? amdgpu::WaitCounterType::KMCNT : amdgpu::WaitCounterType::LGKMCNT;
+      const uint8_t increment = cdna5 && mnemonic.starts_with("s_sendmsg_rtn") ? 2 : 1;
+      s->race_state->prepareForCounterIncrement(counter, increment);
     }
   }
   s->trace.push(instruction);
