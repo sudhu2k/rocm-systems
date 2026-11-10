@@ -1110,7 +1110,8 @@ public:
   /// words participate in a memory transaction's bounds check without becoming writes.
   [[nodiscard]] std::optional<RegisterRef> destination_register(const Operand &op,
                                                                 bool memory_result = false,
-                                                                unsigned extra_words = 0) const {
+                                                                unsigned extra_words = 0,
+                                                                bool compact_wave64 = false) const {
     auto reg = op.to_register_ref();
     if (!reg) {
       if (auto special = op.to_special_reg_class())
@@ -1118,6 +1119,8 @@ public:
       return std::nullopt;
     }
     if (reg->cls == RegClass::VGPR || reg->cls == RegClass::ACC_VGPR) {
+      if (compact_wave64)
+        reg->width /= 2;
       auto &wf = mutable_wavefront();
       auto base = op.simd_vgpr_base_mut(wf);
       if (!base ||
@@ -1128,6 +1131,13 @@ public:
       reg->index = static_cast<uint16_t>(*base - wf.vgpr_alloc().base);
     }
     return reg;
+  }
+
+  [[nodiscard]] std::optional<RegisterRef> memory_destination_register(const Instruction &inst,
+                                                                       const Operand &op) const {
+    return destination_register(op, true, bool(inst.flags() & RESERVES_UNWRITTEN_VGPR),
+                                wavefront().wf_size() == 64 &&
+                                    (inst.flags() & COMPACT_WAVE64_MEMORY_RESULT));
   }
 
   /// @brief Resolve a source using the execution bank and scalar selector.

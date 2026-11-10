@@ -390,6 +390,13 @@ void RaceDetectorPlugin::onAmdgpuMemoryAccessRouted(const amdgpu::MemoryAccessOb
   auto *detector = rs->getDetector();
   auto waveId = rs->getWaveId();
   const InstructionSnapshot &instruction = current_instruction(*s, wf);
+  // One DDS request faults the entire FLAT operation before any segment accesses memory.
+  if (access.flat_dds_lane_mask)
+    return;
+  if (const auto *data = inst.data();
+      data && (data->tag() == amdgpu::LOCAL_MEM || data->tag() == amdgpu::GLOBAL_MEM) &&
+      inst.data_as<amdgpu::VectorMemState>()->rejects_routed_access(wf.cu().arch()))
+    return;
   const auto *decoded = inst.amdgpu_memory_issue_info();
   assert(decoded && "memory instruction reached the race detector without issue metadata");
   if (!decoded)

@@ -167,6 +167,14 @@ bool SimulatedKfd::gem_va_map(uint64_t gpu_va, void *host_ptr, size_t size, uint
   return true;
 }
 
+void SimulatedKfd::publish_prt_ranges(amdgpu::PrtRanges ranges) {
+  if (auto proc = find_process(local_process_id_)) {
+    std::ranges::sort(ranges, {}, &amdgpu::PrtRange::begin);
+    proc->prt_residency->nonresident.store(
+        std::make_shared<const amdgpu::PrtRanges>(std::move(ranges)));
+  }
+}
+
 bool SimulatedKfd::gem_va_unmap(uint64_t gpu_va, size_t size) {
   auto proc = find_process(local_process_id_);
   if (!proc)
@@ -1538,6 +1546,7 @@ bool SimulatedKfd::register_process_address_spaces(const std::shared_ptr<KfdProc
          .request_mutex = proc->page_table_request_mutex(),
          .mutation_epoch = proc->page_table_mutation_epoch(),
          .page_table_cache_state = proc->page_table_cache_state(),
+         .prt_residency = proc->prt_residency,
          .client_pid = client_pid,
          .client_mem_fd = -1,
          .passthrough = passthrough,
@@ -2834,7 +2843,10 @@ int SimulatedKfd::get_process_apertures_ioctl(void *arg) {
 }
 
 kfd_process_device_apertures SimulatedKfd::gpu_apertures(uint32_t ordinal) const {
-  const uint64_t offset = static_cast<uint64_t>(ordinal) * kApertureStride;
+  // The gfx10.3 KFD programs the same high-16-bit tags per VMID on every GPU.
+  const bool gfx103 =
+      ordinal < gpus_.size() && gpus_[ordinal].soc->arch() == ROCJITSU_CODE_ARCH_RDNA2;
+  const uint64_t offset = gfx103 ? 0 : static_cast<uint64_t>(ordinal) * kApertureStride;
   const uint64_t lds_base = 0x1000000000000ULL + offset;
   const uint64_t scratch_base = 0x2000000000000ULL + offset;
   return {

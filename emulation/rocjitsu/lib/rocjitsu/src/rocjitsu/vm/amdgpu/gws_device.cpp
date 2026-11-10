@@ -4,6 +4,8 @@
 #include "rocjitsu/vm/amdgpu/gws_device.h"
 
 #include "rocjitsu/vm/amdgpu/compute_unit.h"
+#include "rocjitsu/vm/amdgpu/mem_state.h"
+#include "rocjitsu/vm/amdgpu/register_access.h"
 #include "rocjitsu/vm/amdgpu/wavefront.h"
 
 #include <algorithm>
@@ -187,11 +189,12 @@ void GwsDevice::sema_release_all(ComputeUnitCore &cu, Wavefront &wf, uint32_t ri
     return;
   std::lock_guard<std::mutex> lock(mutex_);
   Resource &res = resources_[wf.process_id()][rid];
-  // Release every currently parked waiter via a generation bump and clear credits
-  // so waiters that park afterwards (with the new generation) are not spuriously
-  // released by this one.
+  // Release all queued P waiters. GFX11 adds their count to the existing
+  // credits, while earlier targets replace the counter with the waiter count.
+  // The generation wake below consumes each newly released waiter's credit.
   ++res.release_gen;
-  res.counter = 0;
+  if (cu.arch() != ROCJITSU_CODE_ARCH_RDNA3 && cu.arch() != ROCJITSU_CODE_ARCH_RDNA3_5)
+    res.counter = 0;
   // Retire the released waiters' credit reservations now. The generation bump above
   // wakes every currently queued P-waiter regardless of credits, so their arrival
   // stamps no longer entitle them to a credit; leaving the stamps queued would let a

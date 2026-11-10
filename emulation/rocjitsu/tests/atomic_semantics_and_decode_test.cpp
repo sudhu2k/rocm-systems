@@ -57,6 +57,7 @@
 using namespace rocjitsu;
 namespace {
 constexpr uint32_t kGfx9DataFormat32 = 4u << 15;
+constexpr uint32_t kGfx10Format32Uint = 20u << 12;
 
 class InstructionPolicyMachine {
 public:
@@ -74,6 +75,7 @@ public:
       return;
     decoder = Decoder::create(arch);
     wave = cu->dispatch_wf(0, 0, 106, 256);
+    wave->set_lds_size(1024);
     wave->set_exec(1);
     base = wave->vgpr_alloc().base;
   }
@@ -116,8 +118,10 @@ public:
     cu->write_sgpr(scalar + 4, 0x1000);
     cu->write_sgpr(scalar + 5, 0);
     cu->write_sgpr(scalar + 6, 4096);
-    // CDNA requires a valid DATA_FORMAT; RDNA selects COMPLETE byte-range bounds.
-    cu->write_sgpr(scalar + 7, arch_is_cdna_4_or_lower(cu->arch()) ? kGfx9DataFormat32 : 3u << 28);
+    // Bind a 32-bit format and select complete byte-range bounds on RDNA.
+    cu->write_sgpr(scalar + 7, arch_is_cdna_4_or_lower(cu->arch())
+                                   ? kGfx9DataFormat32
+                                   : (3u << 28) | kGfx10Format32Uint);
     cu->write_vgpr(base + 4, 0, 0);
     cu->write_vgpr(base + 5, 0, 0);
     util::FailureOr<uint32_t> returned = run(words, src, 0, 0, 0xf0, true, buffer);
@@ -382,6 +386,7 @@ TEST(AtomicSemanticsAndDecode, CdnaFlatOpcodesRespectSegment) {
     }
   }
 }
+
 TEST(AtomicSemanticsAndDecode, GlobalOnlyCsubRejectsOtherSegments) {
   for (rj_code_arch_t arch :
        {ROCJITSU_CODE_ARCH_RDNA2, ROCJITSU_CODE_ARCH_RDNA3, ROCJITSU_CODE_ARCH_RDNA3_5}) {
@@ -536,7 +541,11 @@ protected:
                                                                     config, &memory_, &cache_));
     decoder_ = Decoder::create(arch);
     wave_ = compute_unit_->dispatch_wf(0, 0, 106, 256);
+    ASSERT_NE(wave_, nullptr);
+    wave_->set_lds_base(compute_unit_->allocate_lds(512));
+    wave_->set_lds_size(512);
     wave_->set_exec(1);
+    wave_->set_lds_size(config.lds_size_kb * 1024);
     base_ = wave_->vgpr_alloc().base;
   }
 
@@ -771,9 +780,13 @@ protected:
     // CDNA5 uses the default descriptor encoding.
     uint32_t word3 = 0;
     if (amdgpu::addr_calc::uses_rdna_buffer_range_check(GetParam()))
-      word3 = 2u << 28;
+      word3 = (2u << 28) | (20u << 12);
+    else if (GetParam() == ROCJITSU_CODE_ARCH_RDNA1)
+      word3 = 20u << 12; // Valid 32_UINT resource.
     else if (arch_is_cdna_4_or_lower(GetParam()))
       word3 = kGfx9DataFormat32;
+    if (amdgpu::addr_calc::uses_gfx10_buffer_addressing(GetParam()))
+      word3 |= kGfx10Format32Uint;
     compute_unit_->write_sgpr(scalar_base + 7, word3);
     compute_unit_->write_vgpr(base_, 0, source_bits);
     compute_unit_->write_vgpr(base_ + 1, 0, compare_bits);

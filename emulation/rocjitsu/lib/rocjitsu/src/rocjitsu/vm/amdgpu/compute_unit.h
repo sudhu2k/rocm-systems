@@ -804,7 +804,8 @@ public:
   /// @brief Allocate a per-WG LDS region and return its base offset.
   uint32_t allocate_lds(uint32_t size_bytes) {
     uint32_t base = next_lds_alloc_;
-    uint32_t aligned = util::align_up(size_bytes, lds_allocation_granule(arch()));
+    const uint64_t aligned = lds_allocation_bytes(arch(), size_bytes);
+    assert(base + aligned <= lds_.size_bytes());
     // Reusing a physical LDS region does not initialize its contents. Keep the
     // bytes written by prior workgroups until another instruction overwrites them.
     lds_.materialize_range(base, aligned);
@@ -812,10 +813,20 @@ public:
     return base;
   }
 
-  uint32_t reserved_lds_bytes() const { return next_lds_alloc_; }
-
   /// @brief Reset LDS allocation when no resident waves or pinned clusters remain.
   void reset_lds_alloc() { next_lds_alloc_ = 0; }
+  uint32_t reserved_lds_bytes() const { return next_lds_alloc_; }
+
+  // Historical checkpoint reservations can use 256-byte placement on any CU. When the
+  // next native boundary exceeds capacity, the valid old windows exhaust the allocator.
+  bool restore_lds_cursor(uint32_t saved) {
+    const uint64_t capacity = lds_.size_bytes();
+    const uint64_t next = std::min(capacity, lds_allocation_bytes(arch(), saved));
+    if (saved > capacity || saved % 256 != 0 || next > UINT32_MAX)
+      return false;
+    next_lds_alloc_ = static_cast<uint32_t>(next);
+    return true;
+  }
 
   /// @brief Hold LDS allocation state while a workgroup cluster is resident.
   ///
@@ -904,11 +915,12 @@ public:
 
   /// @brief Set flat-address-space aperture boundaries (SPI programs these once per node).
   void set_apertures(uint64_t shared_base, uint64_t shared_limit, uint64_t private_base,
-                     uint64_t private_limit) {
+                     uint64_t private_limit, bool ptr32 = false) {
     shared_aperture_base_ = shared_base;
     shared_aperture_limit_ = shared_limit;
     private_aperture_base_ = private_base;
     private_aperture_limit_ = private_limit;
+    flat_pointer32_ = arch() == ROCJITSU_CODE_ARCH_RDNA1 && ptr32;
   }
 
   /// @brief Query SRAM ECC mode. When true, D16 loads zero unused VGPR bits.
@@ -1035,13 +1047,18 @@ public:
   /// allocated VGPR tuple, even if that tuple fits in the simulator's register slot.
   [[nodiscard]] bool owns_memory_result_range(const Wavefront &wf, uint32_t base,
                                               uint32_t count) const {
-    if (arch() == ROCJITSU_CODE_ARCH_RDNA3 || arch() == ROCJITSU_CODE_ARCH_RDNA3_5 ||
-        arch() == ROCJITSU_CODE_ARCH_RDNA1 || arch() == ROCJITSU_CODE_ARCH_RDNA2)
+    if (arch() == ROCJITSU_CODE_ARCH_RDNA4 || arch() == ROCJITSU_CODE_ARCH_RDNA3 ||
+        arch() == ROCJITSU_CODE_ARCH_RDNA3_5 || arch() == ROCJITSU_CODE_ARCH_RDNA1 ||
+        arch() == ROCJITSU_CODE_ARCH_RDNA2)
       return &wf.raw_cu() == this && wf.vgpr_alloc().contains(base, count);
     return owns_memory_result_vgprs(wf, base, count);
   }
 
 private:
+  static bool nullify_unallocated_memory_result(Instruction &inst, const Wavefront &wf);
+  VmAccessOutcome route_prepared_memory_inst(Instruction *inst, Wavefront &wf,
+                                             uint64_t deferred_gds_sources = 0);
+
   // RegisterAccess is the instruction-facing register boundary. These
   // ownership and SGPR access helpers validate the complete operation, fire
   // callbacks, and only then expose or modify storage.
@@ -1412,6 +1429,9 @@ public:
     // The decoded instruction already selects its ISA execution callback.
     try {
       inst->execute(*inst, &wf);
+      if (inst->is_memory_op() && inst->data() &&
+          (config_.arch == ROCJITSU_CODE_ARCH_RDNA3 || config_.arch == ROCJITSU_CODE_ARCH_RDNA3_5))
+        qualify_gfx11_memory(*inst, wf);
     } catch (const util::UnimplementedInst &error) {
       // Some implemented instructions reject particular operand or mode
       // combinations through the legacy exception path. Treat those guest
@@ -1420,14 +1440,20 @@ public:
       if (failure_detail)
         *failure_detail = error.what();
     }
+    if (config_.arch == ROCJITSU_CODE_ARCH_RDNA4 && inst->data())
+      nullify_unallocated_memory_result(*inst, wf);
     if (preserve_scc)
       wf.write_scc(saved_scc);
+    if (inst->data() && config_.arch == ROCJITSU_CODE_ARCH_CDNA4)
+      qualify_cdna4_memory_destination(*inst, wf);
     if (failure_detail && wf.instruction_execution_error_detail())
       *failure_detail = wf.instruction_execution_error_detail();
     return wf.instruction_execution_failed() ? util::Result::failure() : util::Result::success();
   }
 
 protected:
+  void qualify_gfx11_memory(Instruction &inst, const Wavefront &wf);
+
   /// @brief Defer a runtime queue exception until the wave-state lock is released.
   /// @details Instruction callbacks run under @ref wave_state_mutex_. The command
   /// processor takes its queue lock before this lock, so reporting synchronously
@@ -1518,7 +1544,10 @@ protected:
   /// @brief Route a memory instruction into the appropriate pipeline.
   /// @param inst The memory instruction (ownership transferred).
   /// @param wf The issuing wavefront.
-  VmAccessOutcome route_memory_inst(Instruction *inst, Wavefront &wf);
+  VmAccessOutcome route_memory_inst(Instruction *inst, Wavefront &wf,
+                                    uint64_t deferred_gds_sources = 0);
+  void track_memory_wait(Instruction &inst, Wavefront &wf, uint64_t *deferred_gds_sources);
+  void lock_gds_sources(const Instruction &inst, Wavefront &wf, uint64_t sequence);
 
   [[nodiscard]] bool owns_memory_result_vgprs(const Wavefront &wf, uint32_t base,
                                               uint32_t count) const {
@@ -1540,6 +1569,7 @@ protected:
     return RegAllocation{bank_base, std::min<uint32_t>(extent, ACC_VGPR_OFFSET)}.contains(base,
                                                                                           count);
   }
+  void qualify_cdna4_memory_destination(Instruction &inst, const Wavefront &wf);
 
   /// @brief Tell the plugin group what the memory system is about to be asked
   ///        for, once routing has settled.
@@ -1823,6 +1853,7 @@ protected:
   uint64_t shared_aperture_limit_ = 0;
   uint64_t private_aperture_base_ = 0;
   uint64_t private_aperture_limit_ = 0;
+  bool flat_pointer32_ = false;
 
   std::shared_ptr<ExecutionPluginGroup> plugin_group_ = ExecutionPluginGroup::empty_group();
   bool observes_before_execute_instruction_ = false;

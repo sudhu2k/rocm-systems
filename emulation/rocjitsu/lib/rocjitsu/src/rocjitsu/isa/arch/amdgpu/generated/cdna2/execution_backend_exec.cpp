@@ -43,6 +43,11 @@ template <typename Derived> void execute_with_backend(Instruction &instruction, 
   ScopedIsaExecutionBackend scope(&execution_backend());
   if ((instruction.flags() & VALU) && !valu_destinations_in_range(instruction, wf))
     return;
+  if (instruction.is_memory_op() && wf.cdna2_memory_destination_out_of_range(instruction))
+      [[unlikely]] {
+    execute_with_empty_memory_mask(static_cast<Derived &>(instruction), wf);
+    return;
+  }
   static_cast<Derived &>(instruction).execute_impl(wf);
 }
 

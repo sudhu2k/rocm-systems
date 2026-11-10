@@ -1185,7 +1185,8 @@ TEST_P(KfdCuMaskPlacementTest, CuMaskSelectsOnlyTheRequestedPhysicalUnits) {
   alignas(4096) std::array<uint8_t, 4096> code{};
   kernel_descriptor_t kd{};
   kd.kernel_code_entry_byte_offset = sizeof(kd);
-  kd.group_segment_fixed_size = 128 * 1024;
+  // GFX12 limits one workgroup to 64 KiB, including in WGP mode.
+  kd.group_segment_fixed_size = (rdna ? 64u : 128u) * 1024;
   RJ_AMDHSA_BITS_SET(kd.kernel_code_properties, KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32, rdna);
   RJ_AMDHSA_BITS_SET(kd.compute_pgm_rsrc1, COMPUTE_PGM_RSRC1_WGP_MODE, rdna);
   std::memcpy(code.data(), &kd, sizeof(kd));
@@ -9121,6 +9122,27 @@ TEST_F(KfdIoctlTest, AllocationBackingPreservesDeviceDumpIdentity) {
   driver.close();
 }
 
+TEST(Rdna2KfdTest, AllDeviceOrdinalsUseTheHardwareApertureTags) {
+  rocjitsu::amdgpu::GpuMemory first_memory("aperture_mem0"), second_memory("aperture_mem1");
+  rocjitsu::SoC first("aperture_soc0", &first_memory, ROCJITSU_CODE_ARCH_RDNA2);
+  rocjitsu::SoC second("aperture_soc1", &second_memory, ROCJITSU_CODE_ARCH_RDNA2);
+  rocjitsu::SimulatedKfd driver({&first, &second}, {kGpuId, kGpuId + 1});
+  ASSERT_GE(driver.open(), 0);
+  std::array<kfd_process_device_apertures, 2> apertures{};
+  kfd_ioctl_get_process_apertures_new_args args{};
+  args.kfd_process_device_apertures_ptr = reinterpret_cast<uint64_t>(apertures.data());
+  args.num_of_nodes = apertures.size();
+  ASSERT_EQ(driver.ioctl(AMDKFD_IOC_GET_PROCESS_APERTURES_NEW, &args), 0);
+  ASSERT_EQ(args.num_of_nodes, apertures.size());
+  for (size_t i = 0; i < apertures.size(); ++i) {
+    EXPECT_EQ(apertures[i].gpu_id, kGpuId + i);
+    EXPECT_EQ(apertures[i].lds_base, 1ull << 48);
+    EXPECT_EQ(apertures[i].scratch_base, 2ull << 48);
+    EXPECT_EQ(apertures[i].lds_limit - apertures[i].lds_base, UINT32_MAX);
+    EXPECT_EQ(apertures[i].scratch_limit - apertures[i].scratch_base, UINT32_MAX);
+  }
+  driver.close();
+}
 TEST_F(KfdIoctlTest, DbgTrapDeviceSnapshotEnumeratesMultipleAgentsWithCallerStride) {
   constexpr uint32_t kSecondGpuId = kGpuId + 1;
   auto first_soc = load_standalone_soc(CONFIG_PATH);
@@ -9762,7 +9784,8 @@ void KfdIoctlTest::check_debug_resume_across_active_xcc_areas() {
   adjacent->set_queue_id(queues[0].queue_id);
   adjacent->set_wg_coord(99, 0, 0);
   const uint32_t adjacent_lds_base = cu0->allocate_lds(256);
-  ASSERT_EQ(adjacent_lds_base, first_lds_base + live_lds);
+  ASSERT_EQ(adjacent_lds_base,
+            first_lds_base + rocjitsu::amdgpu::lds_allocation_bytes(cu0->arch(), live_lds));
   adjacent->set_lds_base(adjacent_lds_base);
   adjacent->set_lds_size(256);
   std::array<uint8_t, 256> sentinel{};

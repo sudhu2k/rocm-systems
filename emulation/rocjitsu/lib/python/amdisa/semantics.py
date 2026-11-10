@@ -2079,7 +2079,7 @@ _FLAT_ATOMIC_OPS: dict[str, tuple[str, int]] = {
     'MIN_NUM_F64': ('fmin', 2),
     'MAX_NUM_F64': ('fmax', 2),
     'COND_SUB': ('cond_sub', 1),
-    'ORDERED_ADD': ('add', 2),
+    'ORDERED_ADD': ('ordered_add', 2),
     # RDNA3+ typed MIN/MAX (suffix stripped from the full instruction name).
     'MIN_I32': ('smin', 1),
     'MIN_U32': ('umin', 1),
@@ -2149,11 +2149,17 @@ def _derive_flat_atomic_info(suffix: str, is_x2: bool) -> tuple[str, int, int] |
 def _derive_flat(name: str) -> InstructionSemantics | None:
     """Derive semantics for a FLAT (Flat/Global/Scratch memory) instruction."""
     upper = name.upper()
-    if upper in ('GLOBAL_LOAD_LDS_DWORDX3', 'GLOBAL_LOAD_LDS_DWORDX4'):
-        size, count, _ = _FLAT_DATA_MAP[upper.removeprefix('GLOBAL_LOAD_LDS_')]
-        return InstructionSemantics(
-            name, 'global_load_lds', elem_size=size, num_elems=count
-        )
+    if upper.startswith('GLOBAL_LOAD_LDS_'):
+        suffix = upper.removeprefix('GLOBAL_LOAD_LDS_')
+        if suffix in ('DWORDX3', 'DWORDX4'):
+            size, count, signed = _FLAT_DATA_MAP[suffix]
+            return InstructionSemantics(
+                name,
+                'global_load_lds',
+                elem_size=size,
+                num_elems=count,
+                sign_extend=signed,
+            )
     if upper.startswith('SCRATCH_LOAD_LDS_'):
         suffix = upper.removeprefix('SCRATCH_LOAD_LDS_')
         info = _FLAT_DATA_MAP.get(suffix)

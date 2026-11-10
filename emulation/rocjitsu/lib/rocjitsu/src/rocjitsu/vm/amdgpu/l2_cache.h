@@ -143,6 +143,7 @@ public:
   /// ordinary access result determines whether execution succeeds or faults.
   [[nodiscard]] bool can_fetch_range(uint64_t addr, uint32_t size, uint32_t vmid = 0) const;
 
+
   /// @brief Read a cache line worth of data (or partial line).
   ///
   /// Used by L1 controllers to fetch on miss. In functional mode this refetches
@@ -153,6 +154,7 @@ public:
   /// @param mtype Memory type for caching policy.
   VmAccessOutcome read(uint64_t addr, uint8_t *dst, uint32_t size, Mtype mtype = Mtype::RW,
                        uint32_t vmid = 0);
+
 
   /// Batch an unobserved scalar UC request only when this line is absent and
   /// the direct VM backing proves private, fault-free RAM. False has no guest
@@ -362,6 +364,10 @@ public:
   /// vmid (recorded in the line tag), so a caller-supplied vmid cannot be
   /// correct for a global flush. Retained only for call-site signature symmetry.
   VmAccessOutcome flush_all(uint32_t vmid = 0);
+
+  /// Apply CDNA4 BUFFER_INV to this XCD's noncoherent lines. Device scope
+  /// retains a sole L2. System scope applies regardless of the topology.
+  VmAccessOutcome invalidate_buffer_scope(bool system_scope);
 
   /// @brief Publish and invalidate only the specified address space.
   /// @details On failure, no line in this VMID is invalidated. Previously published lines

@@ -273,6 +273,11 @@ public:
   /// @brief Set the dispatch ID (called by DispatchController).
   void set_dispatch_id(uint32_t id) { dispatch_id_ = id; }
 
+  void set_workgroup_dispatch(uint32_t id, uint32_t wave_count) {
+    set_dispatch_id(id);
+    set_status_raw((status_raw() & ~kStatusInTgMask) | (wave_count > 1 ? kStatusInTgMask : 0u));
+  }
+
   /// @brief Return the wrapped AQL ring slot associated with this wave.
   /// @details ROCdbgapi reconstructs its monotonic dispatch index from the
   /// consumer cursor and this slot (TTMP11[6:30] on gfx9.4).
@@ -380,6 +385,12 @@ public:
 
   /// @brief Return the aligned LDS allocation size for this workgroup.
   uint32_t lds_size() const { return lds_size_; }
+
+  /// Whether a complete access lies inside this workgroup's LDS allocation.
+  bool contains_lds_range(uint64_t address, uint32_t bytes) const {
+    const uint64_t end = uint64_t{lds_base_} + lds_size_;
+    return address >= lds_base_ && address <= end && bytes <= end - address;
+  }
 
   /// @brief Set the aligned LDS allocation size for this workgroup.
   void set_lds_size(uint32_t size) { lds_size_ = size; }
@@ -562,6 +573,7 @@ public:
   static constexpr uint32_t IEEE_BIT = 1u << 9;
   static constexpr uint32_t GPR_IDX_EN_BIT = 1u << 27;
   static constexpr uint32_t VSKIP_BIT = 1u << 28;
+  static constexpr uint32_t kRdna2MemoryViolationEnable = 1u << 20;
   static constexpr uint32_t FP16_OVFL_BIT = 1u << 23;
   /// Short for conditional stack pointer, used by fork/join instructions
   static constexpr uint32_t CSP_SHIFT = 29;
@@ -644,8 +656,12 @@ public:
   uint64_t shared_aperture_base() const { return shared_aperture_base_; }
   uint64_t shared_aperture_limit() const { return shared_aperture_limit_; }
   uint64_t private_aperture_base() const { return private_aperture_base_; }
+  bool flat_pointer32() const { return flat_pointer32_; }
   uint64_t private_aperture_limit() const { return private_aperture_limit_; }
-  void set_apertures(uint64_t sb, uint64_t sl, uint64_t pb, uint64_t pl) {
+  bool use_wave_apertures() const { return flat_pointer32_ || aperture_override_; }
+  void set_apertures(uint64_t sb, uint64_t sl, uint64_t pb, uint64_t pl,
+                     bool override_launch = true) {
+    aperture_override_ = override_launch;
     shared_aperture_base_ = sb;
     shared_aperture_limit_ = sl;
     private_aperture_base_ = pb;
@@ -998,8 +1014,18 @@ public:
   /// @brief Read the trap status register (TRAPSTS / EXCP flags).
   uint32_t trapsts() const { return trapsts_; }
 
+  /// A CDNA2 FLAT memory response latches TRAPSTS even when delivery is masked.
+  void complete_flat_memory_violation() {
+    trapsts_ |= 1u << 8;
+  }
+
   /// @brief Write the trap status register.
   void set_trapsts(uint32_t val) { trapsts_ = val; }
+
+  /// @brief Accept MEM_VIOL on an RDNA2 memory instruction's completion bus.
+  void record_rdna2_memory_violation() {
+    trapsts_ |= 1u << 8;
+  }
 
   /// @brief EXCP causes raised by the instruction currently executing.
   /// @details TRAPSTS.EXCP is a sticky accumulator: hardware records a cause
@@ -1233,6 +1259,8 @@ public:
     shared_aperture_limit_ = 0;
     private_aperture_base_ = 0;
     private_aperture_limit_ = 0;
+    flat_pointer32_ = false;
+    aperture_override_ = false;
     named_barrier_id_ = 0;
     barrier_complete_.fill(false);
     waiting_barrier_bit_ = kNoBarrierWait;
@@ -1382,6 +1410,8 @@ private:
   uint64_t shared_aperture_limit_ = 0;
   uint64_t private_aperture_base_ = 0;
   uint64_t private_aperture_limit_ = 0;
+  bool flat_pointer32_ = false;
+  bool aperture_override_ = false;
   static constexpr uint8_t kNoBarrierWait = 0xff;
   uint32_t named_barrier_id_ = 0; ///< Currently joined named barrier.
   /// Completion bits: named, workgroup, workgroup trap, cluster, cluster trap.

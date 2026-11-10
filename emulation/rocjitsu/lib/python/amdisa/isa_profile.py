@@ -1298,6 +1298,12 @@ _SMEM_MODIFIERS_GLC_DLC = [
     EncodingModifier('dlc'),
 ]
 
+# The trailing conditionally written VGPR distinguishes feedback-capable fetches
+# and returning atomics from stores and instructions that ignore the encoded bit.
+_BUFFER_FEEDBACK_MODIFIER = EncodingModifier(
+    'tfe', condition='inst->tfe && (flags_ & CONDITIONAL_LAST_VGPR_DEF)'
+)
+
 _MUBUF_MODIFIERS_GLC_DLC = [
     EncodingModifier('offen'),
     EncodingModifier('idxen'),
@@ -1306,6 +1312,7 @@ _MUBUF_MODIFIERS_GLC_DLC = [
     EncodingModifier('dlc'),
     EncodingModifier('slc'),
     EncodingModifier('lds'),
+    _BUFFER_FEEDBACK_MODIFIER,
 ]
 
 _MTBUF_MODIFIERS_GLC_DLC = [
@@ -1314,6 +1321,7 @@ _MTBUF_MODIFIERS_GLC_DLC = [
     EncodingModifier('glc'),
     EncodingModifier('dlc'),
     EncodingModifier('slc'),
+    _BUFFER_FEEDBACK_MODIFIER,
 ]
 
 _FLAT_MODIFIERS_GLC_DLC = [
@@ -2159,6 +2167,12 @@ class Cdna2Profile(CdnaProfile):
     - ENC_VOP3PX2 does not exist in CDNA2 XML.
     """
 
+    @property
+    def semantic_overrides(self) -> dict[str, tuple[str, ...]]:
+        return {
+            **super().semantic_overrides,
+        }
+
     legacy_flat_lds = True
     scratch_has_vaddr_expr = 'inst_.saddr == 0x7F'
 
@@ -2192,12 +2206,25 @@ class Cdna2Profile(CdnaProfile):
         upper = enc_name.upper()
         if upper == 'ENC_SMEM':
             return _SMEM_MODIFIERS  # soffset_en/imm/glc/nv present in CDNA2
-        if upper == 'ENC_MUBUF':
-            return _MUBUF_MODIFIERS_GLC
-        if upper == 'ENC_MTBUF':
-            return _MTBUF_MODIFIERS_GLC
+        if upper in ('ENC_MUBUF', 'ENC_MTBUF'):
+            # Assembly requires IDXEN before OFFEN when both address components are used.
+            modifiers = [
+                EncodingModifier('idxen'),
+                EncodingModifier('offen'),
+                EncodingModifier('offset', is_offset=True),
+                EncodingModifier('glc'),
+                EncodingModifier('slc'),
+                EncodingModifier('scc'),
+            ]
+            if upper == 'ENC_MUBUF':
+                modifiers.append(EncodingModifier('lds'))
+            return modifiers
         if upper == 'ENC_FLAT':
-            return _FLAT_MODIFIERS_GLC
+            return [
+                *_FLAT_MODIFIERS_GLC,
+                EncodingModifier('scc'),
+                EncodingModifier('lds'),
+            ]
         return []
 
     @property
@@ -2225,6 +2252,9 @@ class Rdna1Profile(_AmdgpuProfileBase):
     - Reserved field omissions (versions 1.0.0): the parser synthesizes
       padding fields for gaps in the MicrocodeFormat bitfield layout.
     """
+
+    semantic_class_overrides = {
+    }
 
     @property
     def mimg_max_nsa_words(self) -> int:
@@ -2687,6 +2717,12 @@ class Rdna3_5Profile(Rdna3Profile):
     class so the codegen pipeline can auto-detect RDNA3.5 XML files
     separately from RDNA3.
     """
+
+    @property
+    def semantic_class_overrides(self) -> dict[str, str]:
+        return {
+            **super().semantic_class_overrides,
+        }
 
     @property
     def uses_rj_arith_matrix(self) -> bool:

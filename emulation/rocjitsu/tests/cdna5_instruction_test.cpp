@@ -1495,6 +1495,7 @@ TEST(Gfx1250SimulationTest, DsStorexchg2addrB64ExchangesBothAddresses) {
 
   auto &cu = *sim.cu();
   wf->set_lds_base(cu.allocate_lds(256));
+  wf->set_lds_size(256);
   constexpr uint32_t kAddr = 1;
   constexpr uint32_t kData0 = 2;
   constexpr uint32_t kData1 = 4;
@@ -1553,6 +1554,7 @@ TEST(Gfx1250SimulationTest, NonReturningDsAddU32DoesNotWriteVgpr) {
 
   auto &cu = *sim.cu();
   wf->set_lds_base(cu.allocate_lds(64));
+  wf->set_lds_size(64);
   constexpr uint32_t kAddr = 1;
   constexpr uint32_t kData = 2;
   constexpr uint32_t kUnusedVdst = 4;
@@ -1594,6 +1596,7 @@ TEST(Gfx1250SimulationTest, NonReturningDsAddU64DoesNotWriteVgpr) {
 
   auto &cu = *sim.cu();
   wf->set_lds_base(cu.allocate_lds(64));
+  wf->set_lds_size(64);
   constexpr uint32_t kAddr = 1;
   constexpr uint32_t kData = 2;
   constexpr uint32_t kUnusedVdst = 4;
@@ -1639,6 +1642,7 @@ TEST(Gfx1250SimulationTest, DsStorexchg2addrStride64B32UsesScaledOffsetsForActiv
 
   auto &cu = *sim.cu();
   wf->set_lds_base(cu.allocate_lds(1024));
+  wf->set_lds_size(1024);
   constexpr uint32_t kAddr = 1;
   constexpr uint32_t kData0 = 2;
   constexpr uint32_t kData1 = 3;
@@ -1718,6 +1722,7 @@ TEST(Gfx1250SimulationTest, DsStorexchg2addrSameAddressAppliesBothExchangesInOrd
 
   auto &cu = *sim.cu();
   wf->set_lds_base(cu.allocate_lds(64));
+  wf->set_lds_size(64);
   constexpr uint32_t kAddr = 1;
   constexpr uint32_t kData0 = 2;
   constexpr uint32_t kData1 = 3;
@@ -2006,6 +2011,7 @@ TEST(Gfx1250SimulationTest, DsAddtidLoadAndStoreUseM0ByteBaseAddresses) {
 
   auto &cu = *sim.cu();
   wf->set_lds_base(cu.allocate_lds(0x4000));
+  wf->set_lds_size(0x4000);
   constexpr uint32_t kM0ByteBase = 0x1000;
   wf->set_m0(kM0ByteBase);
 

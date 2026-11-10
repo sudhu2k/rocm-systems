@@ -28,6 +28,10 @@ void buffer_register_modifiers(const Inst &inst, RegisterModifiers &modifiers) {
     modifiers.buffer_resource = &inst.srsrc;
   if constexpr (requires { inst.vaddr; })
     modifiers.buffer_address = &inst.vaddr;
+  if constexpr (requires { inst.inst_.tfe; })
+    modifiers.buffer_tfe = inst.inst_.tfe;
+  if constexpr (requires { inst.inst_.format; })
+    modifiers.encoded_buffer_format = inst.inst_.format;
   if constexpr (requires { inst.soffset; })
     modifiers.buffer_offset = &inst.soffset;
   if constexpr (ResultBytes != 0xf)

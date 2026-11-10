@@ -77,9 +77,10 @@ constexpr bool valid_lds_direct_operand(uint32_t m0) {
 enum class DsPermutation : uint8_t { None, Permute, Bpermute, BpermuteFi, Swizzle };
 
 constexpr unsigned ds_permute_group_width(rj_code_arch_t arch, unsigned wave_size) {
-  return wave_size == 64 && (arch == ROCJITSU_CODE_ARCH_RDNA3 || arch == ROCJITSU_CODE_ARCH_RDNA3_5)
-             ? 32
-             : wave_size;
+  if (arch == ROCJITSU_CODE_ARCH_RDNA1 || arch == ROCJITSU_CODE_ARCH_RDNA2 ||
+      arch == ROCJITSU_CODE_ARCH_RDNA3 || arch == ROCJITSU_CODE_ARCH_RDNA3_5)
+    return 32;
+  return wave_size;
 }
 
 constexpr unsigned ds_permute_lane(unsigned lane, uint32_t address, unsigned offset,
@@ -185,6 +186,11 @@ constexpr uint64_t valu_swap_write_lanes(uint64_t exec, unsigned wave_size, unsi
   return exec & wave & (upper ? lower << stride : lower);
 }
 
+/// VMEM and EXP substitute v0 independently for each missing source DWORD.
+constexpr uint16_t gfx115_source_vgpr(uint32_t selector, uint32_t allocation) {
+  return selector < allocation ? static_cast<uint16_t>(selector) : 0;
+}
+
 /// @brief Decoded register-access modifiers.
 /// @details This view contains no wave state or values.
 struct RegisterModifiers {
@@ -192,9 +198,19 @@ struct RegisterModifiers {
   ValuPermutation valu_permutation = ValuPermutation::None;
   uint16_t ds_offset = 0;
   uint8_t memory_result_bytes = 0xf;
-  uint8_t memory_result_last_bytes = 0xf;
+  uint8_t memory_result_last_bytes = 0xf; // Last data word, excluding optional image status.
+  /// A nonzero count bounds the payload masks. An appended status word owns all four bytes.
+  uint8_t memory_result_payload_words = 0;
+
+  void set_packed_image_result(unsigned components) {
+    if (components & 1u) {
+      memory_result_last_bytes = 0x3;
+      memory_result_payload_words = (components + 1) / 2;
+    }
+  }
   bool exec_all_if_nonzero = false;
   bool exec_whole_quads = false;
+  bool exec_parameter_quads = false;
 
   /// VADDR operand enabling coordinate tracking.
   const Operand *image_address = nullptr;
@@ -230,6 +246,7 @@ struct RegisterModifiers {
   const Operand *flat_scalar_address = nullptr;
   int32_t flat_offset = 0;
   uint16_t flat_scale = 1;
+  uint16_t flat_access_bytes = 0;
   bool dpp = false;
   bool dpp8 = false;
   bool sdwa = false;
@@ -246,6 +263,8 @@ struct RegisterModifiers {
   uint8_t src1_selection = 6;
   uint8_t dst_selection = 6;
   uint8_t dst_unused = 0;
+  uint8_t encoded_buffer_format = 0; // Explicit FORMAT on typed buffer instructions.
+  bool buffer_tfe = false;           // VBUFFER reserves an additional status VGPR.
   bool constant_float_compare = false; // Only reads inputs when checking for FP exceptions.
 };
 

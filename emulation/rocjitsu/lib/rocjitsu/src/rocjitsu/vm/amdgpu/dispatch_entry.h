@@ -383,6 +383,7 @@ struct DispatchEntry {
   bool enable_wg_id_y = false;
   bool enable_wg_id_z = false;
   bool enable_wg_info = false;
+  /// Number of distinct compute IDs in the ring's GDS_COMPUTE_MAX_WAVE_ID range.
   bool enable_private_segment = false;
   uint8_t enable_vgpr_workitem_id = 0;
   uint16_t workgroup_size_x = 64;
