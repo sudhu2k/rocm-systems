@@ -7,9 +7,9 @@ Full documentation for ROCm Compute Profiler is available at [https://rocm.docs.
 
 ### Added
 
-* Added roofline and benchmark support for Navi48 (gfx1201) on Linux, including measured DRAM, Infinity Cache (MALL), L2, L1, L0 and LDS bandwidth roofs and VALU and WMMA compute roofs. Arithmetic intensity for device memory counts requests the Infinity Cache can serve; compare it with both the DRAM and MALL roofs. The analysis database stores this point in its `hbm_cache_data` column. Roofs are measured in the active performance state, so use `STABLE_STD` consistently. See the [Navi48 guide](docs/conceptual/rdna/navi48.rst).
+* Added roofline and benchmark support for Navi48 (gfx1201) on Linux, including measured DRAM, Infinity Cache (MALL), L2, L1, L0 and LDS bandwidth roofs and VALU and WMMA compute roofs. Arithmetic intensity for device memory counts requests the Infinity Cache can serve; compare it with both the DRAM and MALL roofs. The analysis database stores this point in its `hbm_cache_data` column. Roofs are measured in the active performance state, so use `STABLE_STD` consistently. See the [RDNA4 roofline](docs/conceptual/rdna/wgp.rst).
 
-* Added Linux GPU metrics and Memory Chart support for Navi48 (gfx1201), including Radeon RX 9070. Profiling requires the `STABLE_STD` performance level. Infinity Cache hit rate, physical GDDR6 bandwidth and wave-wait percentages are unavailable; see the [Navi48 guide](docs/conceptual/rdna/navi48.rst) for feature and counter limitations.
+* Added Linux GPU metrics and Memory Chart support for Navi48 (gfx1201), including Radeon RX 9070. Profiling requires the `STABLE_STD` performance level. Infinity Cache hit rate, physical GDDR6 bandwidth and wave-wait percentages are unavailable; see the [profile mode warning](docs/how-to/profile/mode.rst) for the `STABLE_STD` prerequisite and counter limitations.
 
 * Added a *Limited by* mode to the *AI axis* selector in the standalone roofline HTML. It shows each kernel at its limiting memory-level point, falling back to the leftmost point for compute-bound or unknown kernels.
 
