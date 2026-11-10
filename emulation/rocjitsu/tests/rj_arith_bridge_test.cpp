@@ -416,6 +416,89 @@ TEST(ArithBridgeTest, Gfx1250FloatingWmmaUsesLibraryPolicyAndInlineAccumulator) 
   }
 }
 
+// Compact SMFMAC selects a metadata set; CBSZ!=0 forces set zero.
+TEST(ArithBridgeTest, SparseFloatIndexSelection) {
+  for (bool cdna4 : {false, true}) {
+    const auto arch = cdna4 ? ROCJITSU_CODE_ARCH_CDNA4 : ROCJITSU_CODE_ARCH_CDNA3;
+    ScopedIsaExecutionBackend backend(cdna4 ? &rocjitsu::cdna4::execution_backend()
+                                            : &rocjitsu::cdna3::execution_backend());
+    ComputeUnitCore::Config config{};
+    config.arch = arch;
+    config.num_wf_slots = 1;
+    config.sgprs_per_wf = 104;
+    config.vgprs_per_wf = 256;
+    config.lds_size_kb = 64;
+    GpuMemory memory("sparse_index_memory");
+    L2Cache l2("sparse_index_l2");
+    auto cu = ComputeUnitCore::create("sparse_index", config, &memory, &l2);
+    auto *wave = cu->dispatch_wf(0, 0, 104, 256, 64);
+    ASSERT_NE(wave, nullptr);
+    const auto base = wave->vgpr_alloc().base;
+    auto decoder = Decoder::create(arch);
+    for (int kind = 0; kind < (cdna4 ? 7 : 3); ++kind) {
+      const bool wide = kind >= 3;
+      const bool large = kind >= 5;
+      const uint32_t output_regs = large ? 16 : 4;
+      const uint32_t value = kind == 2                               ? 0x403c3834U
+                             : (kind == 1 || kind == 4 || kind == 6) ? 0x40003f80U
+                                                                     : 0x40003c00U;
+      for (uint32_t lane = 0; lane < 64; ++lane)
+        for (uint32_t reg = 0; reg < 16; ++reg)
+          cu->write_vgpr(base + reg, lane, value);
+      for (uint8_t cbsz : {0, 1})
+        for (uint8_t abid : {0, 1, 2, 3}) {
+          uint32_t expected[16][64];
+          for (bool selected : {false, true}) {
+            const int shift = cbsz ? 0 : (kind == 2 || wide) ? 16 * (abid & 1) : 8 * abid;
+            for (uint32_t lane = 0; lane < 64; ++lane) {
+              cu->write_vgpr(base + 64, lane, selected ? 0xeca98444U : 0xeca98444U >> shift);
+              for (uint32_t reg = 32; reg < 32 + output_regs; ++reg)
+                cu->write_vgpr(base + reg, lane, 0);
+            }
+            const auto words =
+                cdna4 ? rocjitsu::cdna4::build_vop3p_mfma(
+                            kind == 3   ? rocjitsu::cdna4::kVSmfmacF3216x16x64F16Vop3pMfma
+                            : kind == 4 ? rocjitsu::cdna4::kVSmfmacF3216x16x64Bf16Vop3pMfma
+                            : kind == 5 ? rocjitsu::cdna4::kVSmfmacF3232x32x32F16Vop3pMfma
+                            : kind == 6 ? rocjitsu::cdna4::kVSmfmacF3232x32x32Bf16Vop3pMfma
+                            : kind == 0 ? rocjitsu::cdna4::kVSmfmacF3216x16x32F16Vop3pMfma
+                            : kind == 1 ? rocjitsu::cdna4::kVSmfmacF3216x16x32Bf16Vop3pMfma
+                                        : rocjitsu::cdna4::kVSmfmacF3216x16x64Fp8Fp8Vop3pMfma,
+                            {.vdst = 32,
+                             .cbsz = uint8_t(selected ? cbsz : 0),
+                             .abid = uint8_t(selected ? abid : 0),
+                             .acc_cd = 0,
+                             .src0 = 256,
+                             .src1 = 264,
+                             .src2 = 320})
+                      : rocjitsu::cdna3::build_vop3p_mfma(
+                            kind == 0   ? rocjitsu::cdna3::kVSmfmacF3216x16x32F16Vop3pMfma
+                            : kind == 1 ? rocjitsu::cdna3::kVSmfmacF3216x16x32Bf16Vop3pMfma
+                                        : rocjitsu::cdna3::kVSmfmacF3216x16x64Fp8Fp8Vop3pMfma,
+                            {.vdst = 32,
+                             .cbsz = uint8_t(selected ? cbsz : 0),
+                             .abid = uint8_t(selected ? abid : 0),
+                             .acc_cd = 0,
+                             .src0 = 256,
+                             .src1 = 264,
+                             .src2 = 320});
+            auto inst = decoder->decode_window(words);
+            ASSERT_TRUE(inst.succeeded());
+            ASSERT_TRUE(cu->execute_instruction(inst.value().get(), *wave).succeeded());
+            for (uint32_t reg = 0; reg < output_regs; ++reg)
+              for (uint32_t lane = 0; lane < 64; ++lane) {
+                const auto value = cu->read_vgpr(base + 32 + reg, lane);
+                if (selected)
+                  EXPECT_EQ(value, expected[reg][lane]);
+                else
+                  expected[reg][lane] = value;
+              }
+          }
+        }
+    }
+  }
+}
+
 // Inline -1 and a register with identical bits must name the same accumulator
 // value.
 TEST(ArithBridgeTest, CdnaMfmaInlineMinusOneIsNotDestination) {

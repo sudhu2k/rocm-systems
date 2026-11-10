@@ -13,6 +13,13 @@ template <int M, int Batch>
 void mfma_f64_x86_64_v4(uint64_t controls, uint32_t *const *d, const uint32_t *const *a,
                         const uint32_t *const *b, const uint32_t *const *c);
 
+template <int M, int K, bool Wmma>
+void sparse_matrix_i8_x86_64_v3(uint64_t controls, uint32_t *const *d, const uint32_t *const *a,
+                                const uint32_t *const *b, const uint32_t *const *index);
+template <int M, int K, bool Wmma>
+void sparse_matrix_i8_x86_64_v4(uint64_t controls, uint32_t *const *d, const uint32_t *const *a,
+                                const uint32_t *const *b, const uint32_t *const *index);
+
 template <int M, int K, int Batch, bool Wmma>
 void matrix_i8_x86_64_v3(uint64_t controls, uint32_t *const *d, const uint32_t *const *a,
                          const uint32_t *const *b, const uint32_t *const *c);
@@ -52,4 +59,10 @@ template <int M, int K>
 void mfma_scaled_x86_64_v4(uint64_t controls, uint32_t *const *d, const uint32_t *const *a,
                            const uint32_t *const *b, const uint32_t *const *c,
                            const uint32_t *scale_a, const uint32_t *scale_b);
+template <int M, int K, int Bits, bool BfA, bool BfB, bool Fnuz>
+void smfmac_float_x86_64_v3(uint32_t *const *d, const uint32_t *const *a, const uint32_t *const *b,
+                            const uint32_t *const *index);
+template <int M, int K, int Bits, bool BfA, bool BfB, bool Fnuz>
+void smfmac_float_x86_64_v4(uint32_t *const *d, const uint32_t *const *a, const uint32_t *const *b,
+                            const uint32_t *const *index);
 } // namespace rocjitsu::arith

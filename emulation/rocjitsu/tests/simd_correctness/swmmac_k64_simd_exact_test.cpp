@@ -345,9 +345,6 @@ void seed_bf16f32_contract_state(SwmmacFixture &fx, std::vector<uint32_t> &expec
 } // namespace
 
 TEST(SwmmacK64SimdExact, AllDecodedFormsMatchScalarForLegalMetadata) {
-  SKIP_IF_NO_SIMD();
-  if (util::native<float>::size() != 16)
-    GTEST_SKIP() << "the K=64 SWMMAC fast paths require 16-lane native SIMD";
 
   constexpr std::array MODES{Mode::RandomInt, Mode::Zeros, Mode::SignedZero, Mode::Cancel,
                              Mode::NaN,       Mode::Inf,   Mode::Denorm,     Mode::MaxFinite};
@@ -366,9 +363,6 @@ TEST(SwmmacK64SimdExact, AllDecodedFormsMatchScalarForLegalMetadata) {
 }
 
 TEST(SwmmacK64SimdExact, PackedF16SnapshotsAliasedInputsAndSupportsReuseHints) {
-  SKIP_IF_NO_SIMD();
-  if (util::native<float>::size() != 16)
-    GTEST_SKIP() << "the K=64 SWMMAC fast paths require 16-lane native SIMD";
 
   const auto &test = SWMMAC_CASES[2];
   constexpr std::array ALIASES{DstAlias::A, DstAlias::B, DstAlias::Index};
