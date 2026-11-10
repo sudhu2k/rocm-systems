@@ -117,6 +117,10 @@ struct rcclArchThresholds {
   int ddaVmmMinBlocks;
   int ddaVmmMaxBlocks;
 
+  // DDA LL128 two-shot Broadcast: threads per block (0 = use kDdaLL128BcDefaultThreads).
+  // The two-shot variant benefits from fewer threads (better occupancy at large messages).
+  unsigned ddaLL128BcTwoShotThreads;
+
   // Ring / Tree crossovers that replace the tuning model's ranges on single-node
   // comms (nNodes == 1). Sizes are per rank as rcclGetSizePerRank() reports them
   // (AllReduce: the whole message, hence nRanks x the entry). 0 = keep the
