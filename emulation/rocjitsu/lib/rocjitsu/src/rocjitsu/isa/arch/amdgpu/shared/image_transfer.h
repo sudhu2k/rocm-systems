@@ -107,8 +107,8 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   const bool packed_signed = transfer_mode == ImageTransferMode::PackedSigned ||
                              transfer_mode == ImageTransferMode::MipPackedSigned;
   if ((!gfx12 && arch != ROCJITSU_CODE_ARCH_RDNA3 && arch != ROCJITSU_CODE_ARCH_RDNA3_5) ||
-      (atomic && !controls.unorm) || (packed && d16) || (mask & ~15u) ||
-      (query && (d16 || (mask & ~3u))) || (gather && std::popcount(mask) != 1))
+      (atomic && !controls.unorm) || (packed && d16) || (mask & ~15u) || (query && d16) ||
+      (gather && std::popcount(mask) != 1))
     return unsupported();
   const uint32_t words = controls.r128 ? 4 : 8;
   const bool dropped = mask == 0;
@@ -194,14 +194,22 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       compute_filtered_image_feedback(
           arch, dim, type, r[1], RegisterAccess(wf).scalar_control_value(sampler + 2).value_or(0));
   if ((volume || compute_feedback) && sampler != ~0u && !query) {
-    if (modifiers.compare || modifiers.offset || modifiers.lod_clamp || modifiers.gather ||
-        sample_mode == GraphicsSampleMode::Bias || sample_mode == GraphicsSampleMode::Derivatives16)
+    if (modifiers.gather)
       return unsupported();
-    ImageFields fields{
-        .dmask = mask, .dim = dim, .a16 = a16, .d16 = d16, .da = true, .unorm = controls.unorm};
+    ImageFields fields{.dmask = mask,
+                       .dim = dim,
+                       .a16 = a16,
+                       .d16 = d16,
+                       .da = true,
+                       .unorm = controls.unorm,
+                       .gradient16 = sample_mode == GraphicsSampleMode::Derivatives16,
+                       .offset = modifiers.offset,
+                       .lod_bias = sample_mode == GraphicsSampleMode::Bias,
+                       .lod_clamp = modifiers.lod_clamp,
+                       .compare = modifiers.compare};
     const auto mode = sample_mode == GraphicsSampleMode::Zero       ? ImageSampleMode::Zero
                       : sample_mode == GraphicsSampleMode::Explicit ? ImageSampleMode::Explicit
-                      : sample_mode == GraphicsSampleMode::Derivatives
+                      : sample_mode == GraphicsSampleMode::Derivatives || fields.gradient16
                           ? ImageSampleMode::Derivatives
                           : ImageSampleMode::Implicit;
     d.dst_reg_base = wf.vgpr_alloc().base + data;
@@ -218,7 +226,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   // Non-sampling 2D-array instructions also address 3D resources: their third
   // coordinate is Z, with the resource's volume layout and depth bounds.
   if ((dim == 2 && !volume) ||
-      (volume && ((dim != 2 && dim != 5) || sampler != ~0u || (r[5] & 16))))
+      (volume && ((dim != 2 && dim != 5) || (!query && (sampler != ~0u || (r[5] & 16))))))
     return unsupported();
   const uint32_t swizzle = (r[3] >> 20) & 31;
   uint32_t width = ((r[1] >> 30) | ((r[2] & (gfx12 ? 0x3fff : 0xfff)) << 2)) + 1;
@@ -629,6 +637,22 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         lod = round_sample_fixed8(std::isnan(input) ? 0 : input) + lod_bias;
       } else if (sample_mode == GraphicsSampleMode::Zero) {
         lod = lod_bias;
+      } else if (query && volume) {
+        const ImageDerivativeQuad quad(lane);
+        std::array<double, 3> dx{}, dy{};
+        zero_footprint = true;
+        for (unsigned axis = 0; axis < dx.size(); ++axis) {
+          const double origin = read(coordinate_offset + axis, quad.origin);
+          dx[axis] = read(coordinate_offset + axis, quad.right()) - origin;
+          dy[axis] = read(coordinate_offset + axis, quad.bottom()) - origin;
+          zero_footprint &=
+              (dx[axis] == 0 || std::isnan(dx[axis])) && (dy[axis] == 0 || std::isnan(dy[axis]));
+        }
+        const std::array<uint32_t, 3> extents{width, height,
+                                              std::max(1u, resource_depth >> first_level)};
+        lod =
+            image_gradient_lod(dx, dy, normalized ? extents : std::array<uint32_t, 3>{1, 1, 1}, 3);
+        lod += lod_bias;
       } else if (needs_gradients) {
         double dxu, dxv, dyu, dyv;
         std::array<int, 4> gradient_rounding{};
@@ -750,7 +774,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         lod += lod_bias;
         if (sample_mode == GraphicsSampleMode::Bias) {
           const double bias = a16 ? util::f16_to_f32(static_cast<uint16_t>(
-                                        read_coordinate(0, bias_offset, false, lane)))
+                                        read_coordinate(bias_offset, 0, true, lane)))
                                   : read(bias_offset, lane);
           lod += round_sample_fixed8(bias);
         }
@@ -1085,6 +1109,26 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   } else if (!d.is_load)
     capture_buffer_format_store(wf, d, d.dst_reg_base, packed);
   return true;
+}
+
+/// Compute LODs before writing any lane: VDATA may alias quad coordinates,
+/// including coordinates supplied by lanes outside EXEC.
+inline void execute_image_lod(Wavefront &wf, uint32_t resource, uint32_t sampler, uint32_t data,
+                              ImageAddressRegisters coords, uint32_t dim, uint32_t mask, bool d16,
+                              ImageFields controls, bool a16) {
+  VectorMemState state(GLOBAL_MEM);
+  state.is_load = true;
+  ImageLodResults results{};
+  if (!prepare_image_transfer(wf, state, resource, data, coords, dim, mask, d16, controls, sampler,
+                              GraphicsSampleMode::Implicit, a16, &results))
+    return;
+  RegisterAccess regs(wf);
+  for (uint32_t lane = 0; lane < wf.wf_size(); ++lane) {
+    if (!(state.exec_mask & (uint64_t{1} << lane)))
+      continue;
+    write_image_lod(regs, wf.vgpr_alloc().base + data, lane, mask, results[lane][0],
+                    results[lane][1]);
+  }
 }
 
 } // namespace rocjitsu::amdgpu

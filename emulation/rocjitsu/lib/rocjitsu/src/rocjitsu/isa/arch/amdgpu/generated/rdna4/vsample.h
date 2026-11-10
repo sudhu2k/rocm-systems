@@ -341,6 +341,30 @@ class ImageGather4Vsample : public Vsample {
 public:
   ImageGather4Vsample(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
+  void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_sample_sources =
+        amdgpu::ImageSampleSources{uint16_t(inst_.samp),
+                                   inst_.dim,
+                                   amdgpu::GraphicsSampleMode::Implicit,
+                                   false,
+                                   bool(inst_.dmask && !inst_.r128 && !inst_.lwe && !inst_.tfe),
+                                   bool(inst_.unorm),
+                                   false,
+                                   false,
+                                   false,
+                                   true,
+                                   bool(inst_.lwe)};
+    modifiers.image_resource = &rsrc;
+    modifiers.image_reads_address = inst_.dmask || inst_.lwe;
+    modifiers.image_address = &vaddr;
+    modifiers.image_coordinates = amdgpu::gfx12_image_address_registers(inst_);
+    modifiers.image_a16 = inst_.a16;
+    modifiers.image_coordinate_count = amdgpu::image_coordinate_count(inst_.dim) + 0;
+  }
+  bool should_print_src_operand(uint8_t operand_index) const override;
+  void append_src_operand(std::string &out, uint8_t operand_index) const override;
+  void implicit_uses(RegisterSet &uses) const override;
+  bool tracks_explicit_source(uint8_t operand_index) const override;
   Operand vdata;
   Operand vaddr;
   Operand rsrc;
@@ -351,6 +375,30 @@ class ImageGather4LVsample : public Vsample {
 public:
   ImageGather4LVsample(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
+  void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_sample_sources =
+        amdgpu::ImageSampleSources{uint16_t(inst_.samp),
+                                   inst_.dim,
+                                   amdgpu::GraphicsSampleMode::Explicit,
+                                   false,
+                                   bool(inst_.dmask && !inst_.r128 && !inst_.lwe && !inst_.tfe),
+                                   bool(inst_.unorm),
+                                   false,
+                                   false,
+                                   false,
+                                   true,
+                                   bool(inst_.lwe)};
+    modifiers.image_resource = &rsrc;
+    modifiers.image_reads_address = inst_.dmask || inst_.lwe;
+    modifiers.image_address = &vaddr;
+    modifiers.image_coordinates = amdgpu::gfx12_image_address_registers(inst_);
+    modifiers.image_a16 = inst_.a16;
+    modifiers.image_coordinate_count = amdgpu::image_coordinate_count(inst_.dim) + 1;
+  }
+  bool should_print_src_operand(uint8_t operand_index) const override;
+  void append_src_operand(std::string &out, uint8_t operand_index) const override;
+  void implicit_uses(RegisterSet &uses) const override;
+  bool tracks_explicit_source(uint8_t operand_index) const override;
   Operand vdata;
   Operand vaddr;
   Operand rsrc;

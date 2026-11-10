@@ -895,7 +895,47 @@ ImageGather4Vsample::ImageGather4Vsample(const MachineInst *inst)
   num_src_ = 3;
   num_dst_ = 1;
   vaddr.apply_fieldless_caps(false, false, false);
+  if (mimg_has_status(&inst_, true))
+    flags_ |= CONDITIONAL_LAST_VGPR_DEF;
+  set_memory_issue_info({amdgpu::MemoryCounterObligation{amdgpu::WaitCounterType::SAMPLECNT,
+                                                         amdgpu::MemoryCompletionClass::VMEM}});
   flags_ |= MEMORY_WAIT_PRODUCER;
+}
+
+bool ImageGather4Vsample::should_print_src_operand(uint8_t operand_index) const {
+  return src_operands_[operand_index] == &vaddr || Vsample::should_print_src_operand(operand_index);
+}
+
+void ImageGather4Vsample::append_src_operand(std::string &out, uint8_t operand_index) const {
+  if (src_operands_[operand_index] != &vaddr) {
+    Vsample::append_src_operand(out, operand_index);
+    return;
+  }
+  const auto registers = amdgpu::gfx12_image_address_registers(inst_);
+  const uint32_t count = amdgpu::image_coordinate_register_count(inst_.dim, bool(inst_.a16));
+  if (count == 1) {
+    out += "v" + std::to_string(registers[0]);
+    return;
+  }
+  out += "[";
+  for (uint32_t index = 0; index < count; ++index) {
+    if (index != 0)
+      out += ", ";
+    out += "v" + std::to_string(registers[index]);
+  }
+  out += "]";
+}
+
+void ImageGather4Vsample::implicit_uses(RegisterSet &uses) const {
+  Vsample::implicit_uses(uses);
+  const auto registers = amdgpu::gfx12_image_address_registers(inst_);
+  const uint32_t count = amdgpu::image_coordinate_register_count(inst_.dim, bool(inst_.a16));
+  for (uint32_t index = 0; index < count; ++index)
+    uses.expand(RegisterRef{RegClass::VGPR, static_cast<uint16_t>(registers[index]), 1});
+}
+
+bool ImageGather4Vsample::tracks_explicit_source(uint8_t operand_index) const {
+  return !(src_operands_[operand_index] == &vaddr);
 }
 
 namespace detail {
@@ -924,7 +964,49 @@ ImageGather4LVsample::ImageGather4LVsample(const MachineInst *inst)
   num_src_ = 3;
   num_dst_ = 1;
   vaddr.apply_fieldless_caps(false, false, false);
+  if (mimg_has_status(&inst_, true))
+    flags_ |= CONDITIONAL_LAST_VGPR_DEF;
+  set_memory_issue_info({amdgpu::MemoryCounterObligation{amdgpu::WaitCounterType::SAMPLECNT,
+                                                         amdgpu::MemoryCompletionClass::VMEM}});
   flags_ |= MEMORY_WAIT_PRODUCER;
+}
+
+bool ImageGather4LVsample::should_print_src_operand(uint8_t operand_index) const {
+  return src_operands_[operand_index] == &vaddr || Vsample::should_print_src_operand(operand_index);
+}
+
+void ImageGather4LVsample::append_src_operand(std::string &out, uint8_t operand_index) const {
+  if (src_operands_[operand_index] != &vaddr) {
+    Vsample::append_src_operand(out, operand_index);
+    return;
+  }
+  const auto registers = amdgpu::gfx12_image_address_registers(inst_);
+  const uint32_t count = (0u + (inst_.a16 ? (amdgpu::image_coordinate_count(inst_.dim) + 1u + 1) / 2
+                                          : amdgpu::image_coordinate_count(inst_.dim) + 1u));
+  if (count == 1) {
+    out += "v" + std::to_string(registers[0]);
+    return;
+  }
+  out += "[";
+  for (uint32_t index = 0; index < count; ++index) {
+    if (index != 0)
+      out += ", ";
+    out += "v" + std::to_string(registers[index]);
+  }
+  out += "]";
+}
+
+void ImageGather4LVsample::implicit_uses(RegisterSet &uses) const {
+  Vsample::implicit_uses(uses);
+  const auto registers = amdgpu::gfx12_image_address_registers(inst_);
+  const uint32_t count = (0u + (inst_.a16 ? (amdgpu::image_coordinate_count(inst_.dim) + 1u + 1) / 2
+                                          : amdgpu::image_coordinate_count(inst_.dim) + 1u));
+  for (uint32_t index = 0; index < count; ++index)
+    uses.expand(RegisterRef{RegClass::VGPR, static_cast<uint16_t>(registers[index]), 1});
+}
+
+bool ImageGather4LVsample::tracks_explicit_source(uint8_t operand_index) const {
+  return !(src_operands_[operand_index] == &vaddr);
 }
 
 namespace detail {

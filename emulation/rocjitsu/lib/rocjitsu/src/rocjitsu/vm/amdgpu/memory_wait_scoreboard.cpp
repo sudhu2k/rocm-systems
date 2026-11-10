@@ -358,9 +358,7 @@ std::array<ImageSourceBytes, 12> image_sample_source_bytes(const RegisterModifie
   const auto arch = wf.cu().arch();
   const bool gfx11 = arch == ROCJITSU_CODE_ARCH_RDNA3 || arch == ROCJITSU_CODE_ARCH_RDNA3_5;
   const bool volume = (word3 >> 28) == kImage3d;
-  if (gfx11 && volume &&
-      (sample.query || sample.compare || sample.offset || sample.clamp || sample.gather ||
-       sample.mode == GraphicsSampleMode::Bias || sample.mode == GraphicsSampleMode::Derivatives16))
+  if (gfx11 && volume && sample.gather)
     return result;
   const bool native_texture =
       !sample.query && uses_native_2d_sampler(arch, resource, sample.sampler, sample.dim,
@@ -398,20 +396,20 @@ std::array<ImageSourceBytes, 12> image_sample_source_bytes(const RegisterModifie
   const bool bias = sample.mode == GraphicsSampleMode::Bias;
   const unsigned gradient_start =
       unsigned(sample.offset) + unsigned(bias) + unsigned(sample.compare);
+  const uint32_t gradient_components = sample.mode == GraphicsSampleMode::Derivatives16
+                                           ? image_derivative_component_count(sample.dim)
+                                           : 0;
+  const uint16_t low16_words =
+      image_prefix_low16_words(gradient_start, gradient_components, a16 && bias, sample.offset);
   const unsigned prefix = modifiers.image_prefix_words;
   for (unsigned word = 0; word < prefix; ++word) {
-    uint8_t bytes = image_prefix_word_bytes(word, modifiers.image_prefix_low16_words);
+    uint8_t bytes = image_prefix_word_bytes(word, low16_words);
     if (!linear && sample.offset && word == 0 && sample.dim == kImageDimCube)
       bytes = 0;
     if (bias && word == unsigned(sample.offset))
       bytes = linear || needs_gradients ? (a16 ? 0x3 : 0xf) : 0;
-    if (gradients && word >= gradient_start) {
-      if (!needs_gradients)
-        bytes = 0;
-      else if (sample.mode == GraphicsSampleMode::Derivatives16 &&
-               image_derivative_component_count(sample.dim) == 1)
-        bytes = 0x3; // dx and dy each start in the low half of a separate word.
-    }
+    if (gradients && word >= gradient_start && !needs_gradients)
+      bytes = 0;
     result[word].active = bytes;
   }
   // Cube unfolding also reads the face selector from each derivative source lane.
@@ -512,8 +510,10 @@ void MemoryWaitScoreboard::check_instruction_pending(const Instruction &inst, Wa
   const bool gfx12_sample = wf.cu().arch() == ROCJITSU_CODE_ARCH_RDNA4 &&
                             modifiers.image_sample_sources &&
                             !modifiers.image_sample_sources->query;
-  const bool check_image_result = (gfx11 && modifiers.image_address) || gfx12_image_atomic ||
-                                  gfx12_sample || modifiers.image_resource_info;
+  const bool check_image_result =
+      (has_gfx10_vmem_fifo(wf.cu().arch()) && name == "image_get_lod") ||
+      (gfx11 && modifiers.image_address) || gfx12_image_atomic || gfx12_sample ||
+      modifiers.image_resource_info;
   if (check_image_result) {
     for (int i = 0; i < inst.num_dst_operands(); ++i) {
       const auto &dst = *inst.dst_operand(i);

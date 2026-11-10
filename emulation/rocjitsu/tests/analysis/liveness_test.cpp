@@ -8702,8 +8702,10 @@ TEST(GeneratedInstDefUse, Gfx1150ImageLivenessFollowsVaddrSelectors) {
   // beyond the fifth continue from the last selector, not from VADDR.
   constexpr std::array<uint16_t, 12> scattered{23, 29, 30, 11, 60, 61, 62, 63, 64, 65, 66, 67};
   const Case cases[]{
-      {rdna3_5::kImageLoadPckMimg, 1, false, 2},
-      {rdna3_5::kImageAtomicAddMimg, 1, false, 2},
+      {rdna3_5::kImageSampleCMimg, 1, false, 3}, // comparison and 2D coordinates
+      {rdna3_5::kImageLoadPckMimg, 1, false, 2},       {rdna3_5::kImageAtomicAddMimg, 1, false, 2},
+      {rdna3_5::kImageSampleCDClOMimg, 2, false, 12}, // offset, comparison, 6 gradients, xyz, clamp
+      {rdna3_5::kImageSampleCDClOG16Mimg, 2, true, 8}, // 4 gradient words, packed coordinates
   };
   auto decoder = Decoder::create(ROCJITSU_CODE_ARCH_RDNA3_5);
   ASSERT_NE(decoder, nullptr);
@@ -8748,6 +8750,51 @@ TEST(GeneratedInstDefUse, Gfx1150ImageLivenessFollowsVaddrSelectors) {
   }
 }
 
+TEST(GeneratedInstDefUse, Gfx10GetLodTracksTheEncodedTupleAndUsesOnlyDerivativeAxesAtIssue) {
+  struct Dimension {
+    uint8_t dim, coordinates, derivative_axes;
+  };
+  // The sampler takes x[/y]/slice for arrays and x/y/face for cubes.
+  constexpr Dimension dims[] = {{0, 1, 1}, {1, 2, 2}, {2, 3, 3}, {3, 3, 2}, {4, 2, 1}, {5, 3, 2}};
+  constexpr std::array packed_text{", v2, ", ", v[2:3], ", ", v[2:4], "};
+  constexpr std::array nsa_text{", v2, ", ", [v2, v7], ", ", [v2, v7, v11], "};
+  for (const auto arch : {ROCJITSU_CODE_ARCH_RDNA1, ROCJITSU_CODE_ARCH_RDNA2}) {
+    auto decoder = Decoder::create(arch);
+    ASSERT_NE(decoder, nullptr);
+    for (const auto dim : dims) {
+      for (const bool a16 : {false, true}) {
+        const unsigned words = a16 ? (dim.coordinates + 1) / 2 : dim.coordinates;
+        for (const bool nsa : {false, true}) {
+          if (nsa && words == 1)
+            continue;
+          SCOPED_TRACE(testing::Message() << "arch=" << arch << " dim=" << +dim.dim
+                                          << " a16=" << a16 << " nsa=" << nsa);
+          const auto op = rdna1::build_mimg(
+              rdna1::kImageGetLodMimg,
+              {.nsa = nsa, .dim = dim.dim, .dmask = 3, .vaddr = 2, .ssamp = 2, .a16 = a16});
+          const std::array encoding{op[0], op[1], 0x0b07u};
+          const std::unique_ptr<Instruction> inst(decode_valid(*decoder, encoding.data()));
+          ASSERT_NE(inst, nullptr);
+          EXPECT_NE(inst->disassemble().find((nsa ? nsa_text : packed_text)[words - 1]),
+                    std::string::npos)
+              << inst->disassemble();
+          const InstDefUse def_use(*inst, 32);
+          for (uint16_t reg = 2; reg <= 11; ++reg) {
+            const bool used =
+                nsa ? reg == 2 || reg == 7 || (words == 3 && reg == 11) : reg < 2 + words;
+            EXPECT_EQ(def_use.uses.contains({RegClass::VGPR, reg, 1}), used) << reg;
+          }
+          amdgpu::RegisterModifiers issue{};
+          inst->amdgpu_register_modifiers(issue);
+          EXPECT_TRUE(issue.image_implicit_gradients);
+          EXPECT_EQ(issue.image_a16, a16);
+          EXPECT_EQ(issue.image_coordinate_count, dim.derivative_axes);
+        }
+      }
+    }
+  }
+}
+
 TEST(GeneratedInstDefUse, Gfx1150D16SampleKeepsPackedDataHalfLive) {
   auto decoder = Decoder::create(ROCJITSU_CODE_ARCH_RDNA3_5);
   ASSERT_NE(decoder, nullptr);
@@ -8755,18 +8802,18 @@ TEST(GeneratedInstDefUse, Gfx1150D16SampleKeepsPackedDataHalfLive) {
     for (unsigned flags = 0; flags < 4; ++flags) {
       const bool tfe = flags & 1, lwe = flags & 2;
       SCOPED_TRACE(testing::Message() << "dmask=" << unsigned{dmask} << " flags=" << flags);
-      // image_sample v[100:102], [v23, v29], s[0:7], s[8:11]
+      // image_sample_o v[100:102], [v23, v29, v30], s[0:7], s[8:11]
       // dmask:0x7 dim:SQ_RSRC_IMG_2D tfe d16 packs XY in v100, Z in v101.lo,
       // and writes its optional full-width feedback to v102.
-      const auto words = rdna3_5::build_mimg(rdna3_5::kImageSampleMimg, {.nsa = 1,
-                                                                         .dim = 1,
-                                                                         .dmask = dmask,
-                                                                         .d16 = 1,
-                                                                         .vaddr = 23,
-                                                                         .vdata = 100,
-                                                                         .tfe = tfe,
-                                                                         .lwe = lwe,
-                                                                         .ssamp = 2});
+      const auto words = rdna3_5::build_mimg(rdna3_5::kImageSampleOMimg, {.nsa = 1,
+                                                                          .dim = 1,
+                                                                          .dmask = dmask,
+                                                                          .d16 = 1,
+                                                                          .vaddr = 23,
+                                                                          .vdata = 100,
+                                                                          .tfe = tfe,
+                                                                          .lwe = lwe,
+                                                                          .ssamp = 2});
       TestCodeObject co(
           {words[0], words[1], 0x1e1d, rdna3_5::build_sopp(rdna3_5::kSEndpgmSopp)[0]});
       auto blocks = build_valid_blocks(co, *decoder, ROCJITSU_CODE_ARCH_RDNA3_5);
@@ -8808,7 +8855,7 @@ TEST(GeneratedInstDefUse, Gfx1150ImageFeedbackIsConditionalAtFullExec) {
       {rdna3_5::kImageSampleLzOMimg, 0, 1, true, true, true},
       {rdna3_5::kImageSampleLzOMimg, 3, 2, false, false, false},
       {rdna3_5::kImageGather4Mimg, 1, 4, false, true, true},
-      {rdna3_5::kImageGetLodMimg, 3, 2, false, true, true},
+      {rdna3_5::kImageGetLodMimg, 3, 2, false, true, false},
       {rdna3_5::kImageGetResinfoMimg, 1, 1, false, false, false},
       {rdna3_5::kImageAtomicAddMimg, 1, 1, true, false, true, true, true},
       {rdna3_5::kImageAtomicAddMimg, 1, 1, false, false, false, true, true},

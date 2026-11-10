@@ -1033,7 +1033,10 @@ void RaceDetectorPlugin::onAmdgpuBeforeExecuteInstruction(uint64_t pc, const Ins
   const auto name = inst.mnemonic();
   // Inline queries reserve their issue slot before accessing mip/coordinate
   // operands. A successful execution publishes the captured destination lanes.
-  if (inst.is_memory_wait_producer() && !inst.is_memory_op() && name == "image_get_resinfo") {
+  const bool legacy_lod = name == "image_get_lod" &&
+                          (amdgpu::has_gfx10_vmem_fifo(arch) || amdgpu::has_gfx11_vmem_fifos(arch));
+  if (inst.is_memory_wait_producer() && !inst.is_memory_op() &&
+      (name == "image_get_resinfo" || legacy_lod)) {
     const auto counter = arch == ROCJITSU_CODE_ARCH_RDNA4 ? amdgpu::WaitCounterType::LOADCNT
                                                           : amdgpu::WaitCounterType::VMCNT;
     s->race_state->prepareForCounterIncrement(counter);

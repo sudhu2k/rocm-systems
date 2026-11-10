@@ -369,8 +369,10 @@ ordinary VMEM loads and image samples advance VMCNT in issue order, so a
 partial wait counts younger loads of either kind. Their register writes can
 complete out of order across the two kinds. The detector checks overlapping
 destinations separately when deciding whether to report an overwrite.
-The inline GFX10 query `IMAGE_GET_RESINFO` occupies VMCNT. The detector tracks
-the VGPRs and lanes it writes in ordinary load writeback order.
+The inline GFX10 queries `IMAGE_GET_LOD` and `IMAGE_GET_RESINFO` also occupy
+VMCNT. The detector tracks the VGPRs and lanes written by each successful
+query. GET_LOD uses sample writeback order and GET_RESINFO uses ordinary load
+writeback order.
 
 The plugin keeps track, for all registers and LDS memory bytes, of which memory
 operations are in flight. When an instruction in the emulator accesses an LDS

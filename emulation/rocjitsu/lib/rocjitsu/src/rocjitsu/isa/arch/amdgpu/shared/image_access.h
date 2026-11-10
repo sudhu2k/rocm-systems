@@ -62,6 +62,19 @@ struct ImageFields {
   bool sign_extend = false;
 };
 
+/// GET_LOD packs selected channels into consecutive registers. A dropped query returns zero.
+inline void write_image_lod(RegisterAccess &regs, uint32_t dst, uint32_t lane, uint32_t mask,
+                            float clamped, float raw) {
+  if (!mask) {
+    regs.write_vgpr(dst, lane, 0);
+    return;
+  }
+  const std::array<float, 4> result{clamped, raw, 0, 0};
+  for (uint32_t component = 0; component < result.size(); ++component)
+    if (mask & (1u << component))
+      regs.write_vgpr(dst++, lane, std::bit_cast<uint32_t>(result[component]));
+}
+
 /// Resolve the consumed coordinate words, including the individual VGPR0 substitutions on GFX11.5.
 inline bool resolve_image_coordinates(const Wavefront &wf, ImageAddressRegisters &addresses,
                                       uint32_t count) {

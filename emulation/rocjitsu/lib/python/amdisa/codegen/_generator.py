@@ -490,13 +490,23 @@ class CodeGenerator:
 
     @staticmethod
     def _image_sample_mode(name: str) -> str | None:
+        """Share sampler-family recognition between execution and issue metadata."""
+        parts = name.split('_')
+        if parts[:2] not in (
+            ['IMAGE', 'SAMPLE'],
+            ['IMAGE', 'GATHER4'],
+            ['IMAGE', 'GATHER4H'],
+        ):
+            return None
+        mode = '_'.join(part for part in parts[2:] if part not in ('C', 'O', 'CL'))
         return {
-            'IMAGE_SAMPLE': 'Implicit',
-            'IMAGE_SAMPLE_D': 'Derivatives',
-            'IMAGE_SAMPLE_L': 'Explicit',
-            'IMAGE_SAMPLE_LZ': 'Zero',
-            'IMAGE_GATHER4_LZ': 'Zero',
-        }.get(name)
+            '': 'Implicit',
+            'LZ': 'Zero',
+            'L': 'Explicit',
+            'B': 'Bias',
+            'D': 'Derivatives',
+            'D_G16': 'Derivatives16',
+        }.get(mode)
 
     # Memory-pipeline and addressed cache-maintenance semantics recognized by
     # code generation. This table is also the source of truth for the MEMORY_OP
@@ -582,6 +592,8 @@ class CodeGenerator:
         'IMAGE_LOAD_MIP_PCK_SGN': _ImageInstructionForm(mip=True),
         'IMAGE_STORE_PCK': _ImageInstructionForm(),
         'IMAGE_STORE_MIP_PCK': _ImageInstructionForm(mip=True),
+        'IMAGE_GATHER4': _ImageInstructionForm(gather=True),
+        'IMAGE_GATHER4_L': _ImageInstructionForm(mip=True, gather=True),
     }
 
     # Shared scalar execution uses these encoding values without including one
@@ -671,7 +683,10 @@ class CodeGenerator:
                 return (
                     name.removeprefix('IMAGE_ATOMIC_').lower() in self._ATOMIC_OP_ENUM
                 )
-            if self._gfx10_pixel_transfer(name):
+            if (
+                self._gfx10_pixel_transfer(name)
+                or self._gfx10_sample_form(name) is not None
+            ):
                 return True
         if self.isa_spec.arch_name == 'rdna4' and (
             name.upper() in self._RDNA4_IMAGE_FORMS
@@ -713,6 +728,38 @@ class CodeGenerator:
             )
         return 'amdgpu::gfx12_image_address_registers(inst_)'
 
+    @staticmethod
+    def _gfx10_sample_form(name: str) -> _ImageInstructionForm | None:
+        parts = name.split('_')
+        if name in ('IMAGE_GATHER4H_PCK', 'IMAGE_GATHER8H_PCK'):
+            return _ImageInstructionForm(
+                gather=True,
+                horizontal=True,
+                packed_texels=4 if parts[1] == 'GATHER4H' else 8,
+            )
+        if parts == ['IMAGE', 'GATHER4H']:
+            return _ImageInstructionForm(gather=True, horizontal=True)
+        if (
+            len(parts) < 2
+            or parts[0] != 'IMAGE'
+            or parts[1] not in ('SAMPLE', 'GATHER4')
+        ):
+            return None
+        options = set(parts[2:])
+        if options - {'L', 'LZ', 'D', 'CD', 'C', 'B', 'CL', 'O', 'G16'}:
+            return None
+        return _ImageInstructionForm(
+            mip='L' in options,
+            derivatives=bool(options & {'D', 'CD'}),
+            gather=parts[1] == 'GATHER4',
+            zero_lod='LZ' in options,
+            gradient16='G16' in options,
+            offset='O' in options,
+            lod_bias='B' in options,
+            lod_clamp='CL' in options,
+            compare='C' in options,
+        )
+
     def _image_instruction_form(self, name: str) -> _ImageInstructionForm:
         if self.isa_spec.arch_name == 'rdna2' and name == 'IMAGE_MSAA_LOAD':
             return _ImageInstructionForm()
@@ -721,6 +768,9 @@ class CodeGenerator:
                 return _ImageInstructionForm()
             if self._gfx10_pixel_transfer(name):
                 return _ImageInstructionForm(mip='_MIP_' in name)
+            form = self._gfx10_sample_form(name)
+            if form is not None:
+                return form
         if self.isa_spec.arch_name == 'cdna2' and name in self._CDNA2_PACKED_IMAGES:
             return _ImageInstructionForm(mip='_MIP_' in name)
         if name.startswith('IMAGE_ATOMIC_'):
@@ -5100,7 +5150,7 @@ class CodeGenerator:
                             cgen.Line(
                                 'void append_dst_operand(std::string &out, uint8_t index) const override {\n'
                                 '  const auto *operand = dst_operands_[index];\n'
-                                '  const bool status = flags_ & CONDITIONAL_LAST_VGPR_DEF;\n'
+                                '  const bool status = flags_ & (CONDITIONAL_LAST_VGPR_DEF | UNWRITTEN_LAST_VGPR);\n'
                                 '  if (operand->is_vgpr() && !omits_gfx11_mimg_dim_dmask() && status != bool(inst_.tfe))\n'
                                 '    out += image_vdata_name(operand->size_bits() + 32 * (int(inst_.tfe) - int(status)));\n'
                                 '  else Instruction::append_dst_operand(out, index);\n'
@@ -9656,6 +9706,8 @@ class CodeGenerator:
                         else 'Zero' if form.zero_lod else 'Implicit'
                     )
                 )
+                if 'CD' in inst.name.split('_'):
+                    mode = 'CoarseDerivatives'
                 prepare = (
                     f'prepare_image_sample(wf, *d, {resource}, {sampler}, '
                     f'{coordinates}, {controls}, amdgpu::ImageSampleMode::{mode}{result_in_range})'
@@ -9735,15 +9787,21 @@ class CodeGenerator:
         if (
             self.isa_spec.profile.has_gfx11_image_address_extension or gfx12_sample
         ) and (
-            image_name in self._IMAGE_TRANSFER_MODES
+            image_name in (*self._IMAGE_TRANSFER_MODES, 'IMAGE_GET_LOD')
             or self._image_sample_mode(image_name) is not None
         ):
             transfer_mode = self._IMAGE_TRANSFER_MODES.get(image_name, 'Default')
-            sample = self._image_sample_mode(image_name) is not None
+            query = image_name == 'IMAGE_GET_LOD'
+            sample = query or self._image_sample_mode(image_name) is not None
             load = not image_name.startswith('IMAGE_STORE')
             resource = 'inst_.rsrc' if gfx12_sample else 'inst_.srsrc * 4'
             sampler = 'inst_.samp' if gfx12_sample else 'inst_.ssamp * 4'
             coords = self._image_coordinates()
+            if query:
+                return (
+                    f'  amdgpu::execute_image_lod(wf, {resource}, {sampler}, inst_.vdata, '
+                    f'{coords}, inst_.dim, inst_.dmask, inst_.d16, {image_controls}, inst_.a16);'
+                )
             counter = self._wait_counter_type(
                 'image_sample'
                 if gfx12_sample
@@ -9757,10 +9815,22 @@ class CodeGenerator:
                 if transfer_mode != 'Default'
                 else ''
             )
-            if image_name == 'IMAGE_GATHER4_LZ':
-                transfer_args = (
-                    ', nullptr, amdgpu::ImageTransferMode::Default, {.gather = true}'
-                )
+            if sample and not query:
+                suffixes = image_name.split('_')[2:]
+                flags = [
+                    ('offset', 'O' in suffixes),
+                    ('compare', 'C' in suffixes),
+                    ('lod_clamp', 'CL' in suffixes),
+                    ('gather', image_name.startswith('IMAGE_GATHER')),
+                    ('horizontal', image_name == 'IMAGE_GATHER4H'),
+                ]
+                enabled = ', '.join(f'.{name} = true' for name, value in flags if value)
+                if enabled:
+                    transfer_args = (
+                        ', nullptr, amdgpu::ImageTransferMode::Default, {'
+                        + enabled
+                        + '}'
+                    )
             return linear_body + '\n'.join(
                 [
                     '  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);',
@@ -9787,6 +9857,16 @@ class CodeGenerator:
                 'amdgpu::InstructionExecutionError::UnimplementedInstruction);'
             )
             return '\n'.join(L)
+
+        if inst.name == 'IMAGE_GET_LOD' and self.isa_spec.arch_name in (
+            'rdna1',
+            'rdna2',
+        ):
+            return (
+                '  amdgpu::execute_gfx10_image_get_lod(wf, inst_.srsrc * 4, inst_.ssamp * 4, '
+                f"{self._image_coordinates()}, {self._vgpr_base_expr('vdata')}, "
+                'inst_.dim, inst_.dmask, inst_.a16, inst_.unorm, inst_.r128);'
+            )
 
         if cls == 'image_query' and inst.name.upper() == 'IMAGE_GET_RESINFO':
             vimage_encoding = self.isa_spec.arch_name == 'rdna4'
@@ -12850,6 +12930,7 @@ class CodeGenerator:
                             inst.name in self._IMAGE_TRANSFER_MODES
                             or self._image_sample_mode(inst.name) is not None
                             or self._is_supported_image_atomic(inst_sem)
+                            or inst.name == 'IMAGE_GET_LOD'
                         )
                     )
                     if extended_image_addresses:
@@ -12857,8 +12938,13 @@ class CodeGenerator:
                         image_words = 'vaddr.size_bits() / 32u'
                     rdna_image = self.isa_spec.arch_name.startswith('rdna')
                     resource_info = rdna_image and inst.name == 'IMAGE_GET_RESINFO'
+                    gfx10_get_lod = (
+                        inst.name == 'IMAGE_GET_LOD'
+                        and self.isa_spec.arch_name in ('rdna1', 'rdna2')
+                    )
                     _image_address_metadata = bool(inst_sem) and (
                         resource_info
+                        or gfx10_get_lod
                         or bvh_addresses
                         or extended_image_addresses
                         or self._issues_image_memory(inst.name)
@@ -13612,11 +13698,15 @@ class CodeGenerator:
                         if rdna_image and (
                             self._issues_image_memory(inst.name)
                             or extended_image_addresses
+                            or gfx10_get_lod
                         ):
                             gfx12 = self.isa_spec.arch_name == 'rdna4'
                             resource_member = 'rsrc' if gfx12 else 'srsrc'
-                            sampled = inst_sem.semantic_class == 'image_sample'
-                            if sampled:
+                            query = inst.name == 'IMAGE_GET_LOD'
+                            sampled = inst_sem.semantic_class == 'image_sample' or query
+                            # GET_LOD on GFX10 computes its derivative from the first
+                            # three lanes in each live quad, regardless of the channel mask.
+                            if sampled and not gfx10_get_lod:
                                 mode = self._image_sample_mode(inst.name) or 'Implicit'
                                 if self._issues_image_memory(inst.name):
                                     form = self._image_instruction_form(inst.name)
@@ -13649,13 +13739,14 @@ class CodeGenerator:
                                 feedback_filter = (
                                     ', bool(inst_.dmask && !inst_.r128 && (inst_.tfe || inst_.lwe))'
                                     if linear != 'false'
+                                    and not query
                                     and not inst.name.startswith('IMAGE_GATHER')
                                     else ''
                                 )
                                 access_conditions += [
                                     'modifiers.image_sample_sources = amdgpu::ImageSampleSources{'
                                     f'uint16_t({sampler}), inst_.dim, amdgpu::GraphicsSampleMode::{mode}, '
-                                    f'false, {linear}, bool(inst_.unorm), {controls}, bool(inst_.lwe){feedback_filter}}};'
+                                    f'{str(query).lower()}, {linear}, bool(inst_.unorm), {controls}, bool(inst_.lwe){feedback_filter}}};'
                                 ]
                             if (
                                 not sampled
@@ -13672,7 +13763,9 @@ class CodeGenerator:
                                     f'{condition}modifiers.image_transfer_dim = inst_.dim;'
                                 )
                             address_enabled = (
-                                'inst_.dmask || inst_.lwe' if sampled else 'inst_.dmask'
+                                'inst_.dmask || inst_.lwe'
+                                if sampled and not gfx10_get_lod
+                                else 'inst_.dmask'
                             )
                             access_conditions += [
                                 f'modifiers.image_resource = &{resource_member};',
@@ -13686,12 +13779,17 @@ class CodeGenerator:
                                 'modifiers.bvh_resource = uint16_t(inst_.srsrc * 4);',
                                 f'modifiers.bvh_pointer_words = 1 + {wide};',
                             ]
-                        if self._issues_image_memory(inst.name):
+                        if gfx10_get_lod or self._issues_image_memory(inst.name):
                             access_conditions += [
                                 'modifiers.image_address = &vaddr;',
                                 f'modifiers.image_coordinates = {self._image_coordinates()};',
                                 'modifiers.image_a16 = inst_.a16;',
                             ]
+                            if gfx10_get_lod:
+                                access_conditions += [
+                                    'modifiers.image_coordinate_count = amdgpu::image_derivative_component_count(inst_.dim);',
+                                    'modifiers.image_implicit_gradients = true;',
+                                ]
                         if self._issues_image_memory(inst.name):
                             form = self._image_instruction_form(inst.name)
                             if self.isa_spec.profile.image_dimensions_in_resource:
@@ -15684,21 +15782,28 @@ class CodeGenerator:
                         ctor_body_parts.append(
                             f"if (inst_.tfe && {self._atomic_return_expr('inst_.glc')}) flags_ |= CONDITIONAL_LAST_VGPR_DEF;"
                         )
+                    if inst.name == 'IMAGE_GET_LOD' and self.isa_spec.arch_name in (
+                        'rdna1',
+                        'rdna2',
+                        'rdna3',
+                        'rdna3_5',
+                    ):
+                        ctor_body_parts.append(
+                            'if (mimg_has_status(&inst_, true)) flags_ |= UNWRITTEN_LAST_VGPR;'
+                        )
+                        if self.isa_spec.profile.has_gfx11_image_address_extension:
+                            ctor_body_parts.append(
+                                'else if (inst_.tfe) flags_ |= RESERVES_UNWRITTEN_VGPR;'
+                            )
                     if (
                         self.isa_spec.profile.has_gfx11_image_address_extension
                         and inst_sem
                     ):
                         sem_class = inst_sem.semantic_class
                         feedback = None
-                        image_result = (
-                            sem_class in ('image_load', 'image_sample')
-                            or inst.name == 'IMAGE_GET_LOD'
-                        )
+                        image_result = sem_class in ('image_load', 'image_sample')
                         if image_result:
-                            sampler = (
-                                sem_class == 'image_sample'
-                                or inst.name == 'IMAGE_GET_LOD'
-                            )
+                            sampler = sem_class == 'image_sample'
                             feedback = (
                                 f'mimg_has_status(&inst_, {str(sampler).lower()})'
                             )
@@ -17158,7 +17263,13 @@ class CodeGenerator:
                             else (
                                 '1u'
                                 if resource_info
-                                else self._image_coordinate_register_count(inst.name)
+                                else (
+                                    'amdgpu::image_coordinate_register_count(inst_.dim, bool(inst_.a16))'
+                                    if gfx10_get_lod
+                                    else self._image_coordinate_register_count(
+                                        inst.name
+                                    )
+                                )
                             )
                         )
                         image_d16_preservation = (
@@ -17235,7 +17346,11 @@ class CodeGenerator:
                                     '}'
                                 )
                             )
-                        query_inputs = 'inst_.dmask' if resource_info else None
+                        query_inputs = None
+                        if resource_info or gfx10_get_lod:
+                            query_inputs = 'inst_.dmask'
+                        elif extended_image_addresses and inst.name == 'IMAGE_GET_LOD':
+                            query_inputs = 'inst_.dmask || inst_.lwe'
                         static_coordinate_count = (
                             f'({query_inputs}) ? ({coordinate_count}) : 0u'
                             if query_inputs
