@@ -81,6 +81,27 @@ enum class WaitcntModel { LegacyNoVscnt, LegacyVscnt, SplitGfx12 };
   return arch == ROCJITSU_CODE_ARCH_RDNA4 || arch == ROCJITSU_CODE_ARCH_CDNA5;
 }
 
+// GFX10 retires VMCNT reads in issue order across these VGPR writeback types.
+[[nodiscard]] constexpr bool has_gfx10_vmem_fifo(rj_code_arch_t arch) {
+  return arch == ROCJITSU_CODE_ARCH_RDNA1 || arch == ROCJITSU_CODE_ARCH_RDNA2;
+}
+
+/// GFX11 VMCNT tracks independently ordered ordinary, sampled and BVH loads.
+[[nodiscard]] constexpr bool has_gfx11_vmem_fifos(rj_code_arch_t arch) {
+  return arch == ROCJITSU_CODE_ARCH_RDNA3 || arch == ROCJITSU_CODE_ARCH_RDNA3_5;
+}
+
+enum class VmemWriteback : uint8_t { Ordinary, Sample, Bvh, GenericFlat };
+
+[[nodiscard]] constexpr VmemWriteback vmem_read_type(std::string_view mnemonic) {
+  if (mnemonic == "image_msaa_load" || mnemonic == "image_get_lod" ||
+      mnemonic.starts_with("image_sample") || mnemonic.starts_with("image_gather"))
+    return VmemWriteback::Sample;
+  if (mnemonic.starts_with("image_bvh"))
+    return VmemWriteback::Bvh;
+  return VmemWriteback::Ordinary;
+}
+
 // VMEM loads of the same type write their VGPR results in issue order. CDNA1-4
 // section 4.4. RDNA1/2 section 4.4 and RDNA3/3.5 section 5.6 say VGPR data can
 // be written out of order, but we follow LLVM's vmem-write-vgpr-in-order
@@ -184,6 +205,8 @@ struct LegacyWaitcnt {
     return smem_wait_counter(model);
   case WaitCounterType::EXPCNT:
     return WaitCounterKind::Exp;
+  case WaitCounterType::BVHCNT:
+    return WaitCounterKind::Bvh;
   case WaitCounterType::SAMPLECNT:
     return WaitCounterKind::Sample;
   case WaitCounterType::ASYNCCNT:
@@ -217,6 +240,10 @@ memory_wait_counter_type(WaitCounterKind counter, WaitcntModel model) {
   case WaitCounterKind::Async:
     if (model == WaitcntModel::SplitGfx12)
       return WaitCounterType::ASYNCCNT;
+    return std::nullopt;
+  case WaitCounterKind::Bvh:
+    if (model == WaitcntModel::SplitGfx12)
+      return WaitCounterType::BVHCNT;
     return std::nullopt;
   case WaitCounterKind::Sample:
     if (model == WaitcntModel::SplitGfx12)

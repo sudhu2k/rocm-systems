@@ -21,6 +21,7 @@
 #include "rocjitsu/vm/amdgpu/lds_stack.h"
 #include "rocjitsu/vm/amdgpu/mem_state.h"
 #include "rocjitsu/vm/amdgpu/texel_byte_range.h"
+#include "rocjitsu/vm/plugins/execution_plugin_group.h"
 #include "rocjitsu/vm/plugins/memory_access_observation.h"
 #include "util/log.h"
 
@@ -429,7 +430,7 @@ MemoryAccessCompletion vector_complete(VectorMemState &d, Wavefront &wf, Compute
     const uint64_t warnings = status.lod_warnings & ~status.failures;
     if (warnings)
       wf.set_mode_raw(wf.mode_raw() | (1u << 10)); // MODE.LOD_CLAMPED is sticky.
-    uint64_t lanes = warnings | (status.report_failure ? status.failures : 0);
+    uint64_t lanes = status.written_lanes();
     while (lanes) {
       const auto lane = std::countr_zero(lanes);
       lanes &= lanes - 1;
@@ -1399,6 +1400,14 @@ VmAccessOutcome GlobalMemPipeline::initiate_access(Instruction &inst, Wavefront 
     return VmAccessOutcome::Faulted;
   const uint64_t shared_lanes = d.flat_local_lane_mask & request_lanes;
   const VmAccessOutcome outcome = initiate_global_access(d, wf, request_lanes & ~shared_lanes);
+  if (outcome == VmAccessOutcome::Complete && d.has_feedback_result()) {
+    if (d.feedback_wait) {
+      wf.ensure_memory_wait_scoreboard().complete_deferred_write(*d.feedback_wait,
+                                                                 d.feedback_write_lanes());
+      d.feedback_wait.reset();
+    }
+    wf.raw_cu().plugin_group().onAmdgpuImageFeedbackQualified(inst, wf);
+  }
   if (outcome != VmAccessOutcome::Complete || shared_lanes == 0)
     return outcome;
 
@@ -1408,8 +1417,55 @@ VmAccessOutcome GlobalMemPipeline::initiate_access(Instruction &inst, Wavefront 
   return VmAccessOutcome::Complete;
 }
 
+VmAccessOutcome qualify_image_feedback(VectorMemState &d, const GpuVmAccess &vm) {
+  auto &status = *d.image_status;
+  if (status.checked)
+    return VmAccessOutcome::Complete;
+  if (!vm.is_current())
+    return VmAccessOutcome::Revoked;
+  if (!vm.info().ready)
+    return VmAccessOutcome::Unavailable;
+  const auto ranges = vm.nonresident_prt_ranges();
+  if (ranges && !ranges->empty()) {
+    const auto qualify = [&](const auto &addresses, uint64_t active) {
+      const uint64_t holes = nonresident_texel_lanes(d, addresses, active, ranges.get());
+      status.misses |= holes;
+      return holes;
+    };
+    if (!visit_image_sample_taps(d, [&](auto &tap) {
+          const uint64_t holes = qualify(tap.addresses, tap.lane_mask);
+          if constexpr (requires { tap.missing_lanes; })
+            tap.missing_lanes |= holes;
+          else
+            tap.translated.nonresident_lanes = image_tap_misses(tap) | holes;
+        }))
+      qualify(d.per_lane_addr, d.lane_mask);
+  }
+  // All other texels retain the ordinary translation, permission and fault behavior.
+  status.checked = true;
+  return VmAccessOutcome::Complete;
+}
+
 VmAccessOutcome GlobalMemPipeline::initiate_global_access(VectorMemState &d, Wavefront &wf,
                                                           uint64_t request_lanes) {
+  if (d.image_status && wf.address_space() &&
+      (!d.translated.initialized || (d.translated.access && !d.translated.access->info().ready))) {
+    d.translated.access = wf.snapshot_vm_access();
+    if (!d.translated.access)
+      return VmAccessOutcome::Faulted;
+    d.translated.initialized = true;
+  }
+  if (d.image_status && d.translated.access) {
+    const auto outcome = qualify_image_feedback(d, *d.translated.access);
+    if (outcome != VmAccessOutcome::Complete)
+      return outcome;
+  }
+  if (d.image_status) {
+    // Route observers see the nominal footprint. Suppress sparse lanes when issuing the fetch.
+    if (!visit_image_sample_taps(d, [](auto &tap) { tap.lane_mask &= ~image_tap_misses(tap); }))
+      d.lane_mask &= ~d.image_status->misses;
+    request_lanes &= d.lane_mask;
+  }
   if (!d.image_sample)
     return initiate_texel_access(d, wf, request_lanes);
   auto &sample = *d.image_sample;
@@ -1436,14 +1492,16 @@ VmAccessOutcome GlobalMemPipeline::initiate_global_access(VectorMemState &d, Wav
     // Each tap retains its own request cursor, while all share one VM snapshot.
     // Restore the issue-time parent state before returning, including on retry.
     std::swap(d.per_lane_addr, tap.addresses);
-    std::swap(d.response_data, tap.response);
+    auto &payload = d.is_load ? d.response_data : d.store_data;
+    std::swap(payload, tap.response);
     std::swap(d.translated, tap.translated);
     const auto outcome = initiate_texel_access(d, wf, tap.lane_mask & request_lanes);
     std::swap(d.translated, tap.translated);
-    std::swap(d.response_data, tap.response);
+    std::swap(payload, tap.response);
     std::swap(d.per_lane_addr, tap.addresses);
     if (outcome != VmAccessOutcome::Complete)
       return outcome;
+    tap.lane_mask &= ~tap.translated.nonresident_lanes.value_or(0);
     ++sample.next_tap;
   }
   return VmAccessOutcome::Complete;
@@ -1499,6 +1557,37 @@ VmAccessOutcome GlobalMemPipeline::initiate_texel_access(VectorMemState &d, Wave
       d.buffer_residency_checked = true;
     }
     request_lanes &= d.lane_mask;
+  }
+  if (d.image_metadata)
+    return initiate_image_metadata_access(d, wf);
+  if (d.graphics_sample) {
+    const auto &sample = *d.graphics_sample;
+    const uint32_t tap_bytes = d.wf_size * d.elem_size;
+    if (translated_address_space) {
+      if (d.translated.requests.empty() && d.translated.request_index == 0) {
+        d.response_data.assign(sample.tap_count * tap_bytes, 0);
+        for (uint32_t tap = 0; tap < sample.tap_count; ++tap) {
+          const auto &request = sample.taps[tap];
+          for (uint32_t lane = 0; lane < d.wf_size; ++lane)
+            if (request.lane_mask & (uint64_t{1} << lane))
+              d.translated.requests.push_back({.address = request.addresses[lane],
+                                               .data_offset = tap * tap_bytes + lane * d.elem_size,
+                                               .size = d.elem_size});
+        }
+      }
+      return execute_translated_transfer(d);
+    }
+    d.response_data.assign(sample.tap_count * tap_bytes, 0);
+    for (uint32_t tap = 0; tap < sample.tap_count; ++tap) {
+      const auto &request = sample.taps[tap];
+      const auto outcome =
+          l1_->load(request.addresses.data(), request.lane_mask, d.elem_size, 1,
+                    d.response_data.data() + tap * tap_bytes, d.mtype, d.non_temporal,
+                    d.request_force_l1_bypass, d.wf_size, wf.process_id());
+      if (outcome != VmAccessOutcome::Complete)
+        return outcome;
+    }
+    return VmAccessOutcome::Complete;
   }
   if (d.atomic_op != AtomicOp::NONE) {
     if (translated_address_space)

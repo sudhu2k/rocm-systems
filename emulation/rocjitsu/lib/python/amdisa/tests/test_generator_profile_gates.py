@@ -5532,11 +5532,11 @@ def test_gfx11_graphics_sources_use_vgpr_selectors():
         assert profile.mimg_nsa_dword_count_expr == '1u'
 
 
-def test_rdna3_5_disassembly_overrides_do_not_change_rdna3():
+def test_gfx11_profiles_share_image_operand_layout():
     rdna3 = Rdna3Profile()
     rdna3_5 = Rdna3_5Profile()
 
-    assert not rdna3.renders_gfx11_image_syntax
+    assert rdna3.renders_gfx11_image_syntax
     assert not rdna3.split_ds_2addr_offsets
     assert not rdna3.vop3p_absolute_source_instructions
     assert not rdna3.sendmsg_return_symbolic
@@ -5677,7 +5677,7 @@ def test_generated_image_forms_agree_on_address_tuple(
     assert bool(re.search(r'\+\s*1u\b', width)) == bool(mip)
     assert f'amdgpu::image_coordinate_count(inst_.dim) + {mip};' in metadata
     assert ('modifiers.image_prefix_words' in metadata) == derivatives
-    assert ('modifiers.memory_result_last_bytes' in metadata) != gather
+    assert ('modifiers.set_packed_image_result' in metadata) != gather
     assert f'ImageSampleMode::{mode}' in body
     assert f'.gather = {str(gather).lower()}' in body
 
@@ -5747,8 +5747,10 @@ def test_generated_rdna_image_load_tracks_d16_destination_preservation(
     modifiers = _generated_inline_method_body(
         header, f'ImageLoad{suffix}', 'void amdgpu_register_modifiers'
     )
-    assert 'std::popcount(uint32_t{inst_.dmask}) & 1u' in modifiers
-    assert 'modifiers.memory_result_last_bytes = 0x3' in modifiers
+    assert (
+        'modifiers.set_packed_image_result(std::max(1, std::popcount(uint32_t{inst_.dmask})));'
+        in ' '.join(modifiers.split())
+    )
 
 
 @pytest.mark.parametrize(

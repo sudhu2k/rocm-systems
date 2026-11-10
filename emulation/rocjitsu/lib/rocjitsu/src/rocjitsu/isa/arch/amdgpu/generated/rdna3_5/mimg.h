@@ -20,13 +20,17 @@ public:
   ImageLoadMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
   void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    if (inst_.dmask && !inst_.r128 && !inst_.tfe && !inst_.lwe)
+      modifiers.image_transfer_dim = inst_.dim;
+    modifiers.image_resource = &srsrc;
+    modifiers.image_reads_address = inst_.dmask;
     modifiers.image_address = &vaddr;
     modifiers.image_coordinates =
         amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding());
     modifiers.image_a16 = inst_.a16;
     modifiers.image_coordinate_count = amdgpu::image_coordinate_count(inst_.dim) + 0;
-    if (inst_.d16 && (std::popcount(uint32_t{inst_.dmask}) & 1u))
-      modifiers.memory_result_last_bytes = 0x3;
+    if (inst_.d16)
+      modifiers.set_packed_image_result(std::max(1, std::popcount(uint32_t{inst_.dmask})));
   }
   void implicit_uses(RegisterSet &uses) const override;
   bool implicit_preservation_uses(RegisterSet &uses) const override;
@@ -41,13 +45,15 @@ public:
   ImageLoadMipMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
   void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_resource = &srsrc;
+    modifiers.image_reads_address = inst_.dmask;
     modifiers.image_address = &vaddr;
     modifiers.image_coordinates =
         amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding());
     modifiers.image_a16 = inst_.a16;
     modifiers.image_coordinate_count = amdgpu::image_coordinate_count(inst_.dim) + 1;
-    if (inst_.d16 && (std::popcount(uint32_t{inst_.dmask}) & 1u))
-      modifiers.memory_result_last_bytes = 0x3;
+    if (inst_.d16)
+      modifiers.set_packed_image_result(std::max(1, std::popcount(uint32_t{inst_.dmask})));
   }
   void implicit_uses(RegisterSet &uses) const override;
   bool implicit_preservation_uses(RegisterSet &uses) const override;
@@ -98,6 +104,11 @@ public:
   ImageStoreMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
   void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_store_data = &vdata;
+    if (inst_.dmask && !inst_.r128 && !inst_.tfe && !inst_.lwe)
+      modifiers.image_transfer_dim = inst_.dim;
+    modifiers.image_resource = &srsrc;
+    modifiers.image_reads_address = inst_.dmask;
     modifiers.image_address = &vaddr;
     modifiers.image_coordinates =
         amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding());
@@ -116,6 +127,9 @@ public:
   ImageStoreMipMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
   void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_store_data = &vdata;
+    modifiers.image_resource = &srsrc;
+    modifiers.image_reads_address = inst_.dmask;
     modifiers.image_address = &vaddr;
     modifiers.image_coordinates =
         amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding());
@@ -133,6 +147,9 @@ class ImageStorePckMimg : public Mimg {
 public:
   ImageStorePckMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
+  void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_store_data = &vdata;
+  }
   Operand vdata;
   Operand vaddr;
   Operand srsrc;
@@ -142,6 +159,9 @@ class ImageStoreMipPckMimg : public Mimg {
 public:
   ImageStoreMipPckMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
+  void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_store_data = &vdata;
+  }
   Operand vdata;
   Operand vaddr;
   Operand srsrc;
@@ -307,6 +327,15 @@ class ImageGetResinfoMimg : public Mimg {
 public:
   ImageGetResinfoMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
+  void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_resource_info = true;
+    modifiers.image_address = &vaddr;
+    modifiers.image_coordinates[0] = inst_.vaddr;
+    modifiers.image_coordinate_count = inst_.dmask != 0;
+    modifiers.image_a16 = inst_.a16;
+  }
+  void implicit_uses(RegisterSet &uses) const override;
+  bool tracks_explicit_source(uint8_t operand_index) const override;
   Operand vdata;
   Operand vaddr;
   Operand srsrc;
@@ -344,13 +373,28 @@ public:
   ImageSampleMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
   void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_sample_sources =
+        amdgpu::ImageSampleSources{uint16_t(inst_.ssamp * 4),
+                                   inst_.dim,
+                                   amdgpu::GraphicsSampleMode::Implicit,
+                                   false,
+                                   bool(inst_.dmask && !inst_.r128 && !inst_.lwe && !inst_.tfe),
+                                   bool(inst_.unorm),
+                                   false,
+                                   false,
+                                   false,
+                                   false,
+                                   bool(inst_.lwe),
+                                   bool(inst_.dmask && !inst_.r128 && (inst_.tfe || inst_.lwe))};
+    modifiers.image_resource = &srsrc;
+    modifiers.image_reads_address = inst_.dmask || inst_.lwe;
     modifiers.image_address = &vaddr;
     modifiers.image_coordinates =
         amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding());
     modifiers.image_a16 = inst_.a16;
     modifiers.image_coordinate_count = amdgpu::image_coordinate_count(inst_.dim) + 0;
-    if (inst_.d16 && (std::popcount(uint32_t{inst_.dmask}) & 1u))
-      modifiers.memory_result_last_bytes = 0x3;
+    if (inst_.d16)
+      modifiers.set_packed_image_result(std::max(1, std::popcount(uint32_t{inst_.dmask})));
   }
   void implicit_uses(RegisterSet &uses) const override;
   bool implicit_preservation_uses(RegisterSet &uses) const override;
@@ -366,14 +410,29 @@ public:
   ImageSampleDMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
   void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_sample_sources =
+        amdgpu::ImageSampleSources{uint16_t(inst_.ssamp * 4),
+                                   inst_.dim,
+                                   amdgpu::GraphicsSampleMode::Derivatives,
+                                   false,
+                                   bool(inst_.dmask && !inst_.r128 && !inst_.lwe && !inst_.tfe),
+                                   bool(inst_.unorm),
+                                   false,
+                                   false,
+                                   false,
+                                   false,
+                                   bool(inst_.lwe),
+                                   bool(inst_.dmask && !inst_.r128 && (inst_.tfe || inst_.lwe))};
+    modifiers.image_resource = &srsrc;
+    modifiers.image_reads_address = inst_.dmask || inst_.lwe;
     modifiers.image_address = &vaddr;
     modifiers.image_coordinates =
         amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding());
     modifiers.image_a16 = inst_.a16;
     modifiers.image_coordinate_count = amdgpu::image_coordinate_count(inst_.dim) + 0;
-    modifiers.image_prefix_words = 2 * amdgpu::image_derivative_component_count(inst_.dim);
-    if (inst_.d16 && (std::popcount(uint32_t{inst_.dmask}) & 1u))
-      modifiers.memory_result_last_bytes = 0x3;
+    modifiers.image_prefix_words = 0 + 2 * amdgpu::image_derivative_component_count(inst_.dim);
+    if (inst_.d16)
+      modifiers.set_packed_image_result(std::max(1, std::popcount(uint32_t{inst_.dmask})));
   }
   void implicit_uses(RegisterSet &uses) const override;
   bool implicit_preservation_uses(RegisterSet &uses) const override;
@@ -389,13 +448,28 @@ public:
   ImageSampleLMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
   void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_sample_sources =
+        amdgpu::ImageSampleSources{uint16_t(inst_.ssamp * 4),
+                                   inst_.dim,
+                                   amdgpu::GraphicsSampleMode::Explicit,
+                                   false,
+                                   bool(inst_.dmask && !inst_.r128 && !inst_.lwe && !inst_.tfe),
+                                   bool(inst_.unorm),
+                                   false,
+                                   false,
+                                   false,
+                                   false,
+                                   bool(inst_.lwe),
+                                   bool(inst_.dmask && !inst_.r128 && (inst_.tfe || inst_.lwe))};
+    modifiers.image_resource = &srsrc;
+    modifiers.image_reads_address = inst_.dmask || inst_.lwe;
     modifiers.image_address = &vaddr;
     modifiers.image_coordinates =
         amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding());
     modifiers.image_a16 = inst_.a16;
     modifiers.image_coordinate_count = amdgpu::image_coordinate_count(inst_.dim) + 1;
-    if (inst_.d16 && (std::popcount(uint32_t{inst_.dmask}) & 1u))
-      modifiers.memory_result_last_bytes = 0x3;
+    if (inst_.d16)
+      modifiers.set_packed_image_result(std::max(1, std::popcount(uint32_t{inst_.dmask})));
   }
   void implicit_uses(RegisterSet &uses) const override;
   bool implicit_preservation_uses(RegisterSet &uses) const override;
@@ -421,13 +495,28 @@ public:
   ImageSampleLzMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
   void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_sample_sources =
+        amdgpu::ImageSampleSources{uint16_t(inst_.ssamp * 4),
+                                   inst_.dim,
+                                   amdgpu::GraphicsSampleMode::Zero,
+                                   false,
+                                   bool(inst_.dmask && !inst_.r128 && !inst_.lwe && !inst_.tfe),
+                                   bool(inst_.unorm),
+                                   false,
+                                   false,
+                                   false,
+                                   false,
+                                   bool(inst_.lwe),
+                                   bool(inst_.dmask && !inst_.r128 && (inst_.tfe || inst_.lwe))};
+    modifiers.image_resource = &srsrc;
+    modifiers.image_reads_address = inst_.dmask || inst_.lwe;
     modifiers.image_address = &vaddr;
     modifiers.image_coordinates =
         amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding());
     modifiers.image_a16 = inst_.a16;
     modifiers.image_coordinate_count = amdgpu::image_coordinate_count(inst_.dim) + 0;
-    if (inst_.d16 && (std::popcount(uint32_t{inst_.dmask}) & 1u))
-      modifiers.memory_result_last_bytes = 0x3;
+    if (inst_.d16)
+      modifiers.set_packed_image_result(std::max(1, std::popcount(uint32_t{inst_.dmask})));
   }
   void implicit_uses(RegisterSet &uses) const override;
   bool implicit_preservation_uses(RegisterSet &uses) const override;
@@ -623,6 +712,20 @@ public:
   ImageGather4LzMimg(const MachineInst *inst);
   void execute_impl(amdgpu::Wavefront &wf);
   void amdgpu_register_modifiers(amdgpu::RegisterModifiers &modifiers) const override {
+    modifiers.image_sample_sources =
+        amdgpu::ImageSampleSources{uint16_t(inst_.ssamp * 4),
+                                   inst_.dim,
+                                   amdgpu::GraphicsSampleMode::Zero,
+                                   false,
+                                   bool(inst_.dmask && !inst_.r128 && !inst_.lwe && !inst_.tfe),
+                                   bool(inst_.unorm),
+                                   false,
+                                   false,
+                                   false,
+                                   true,
+                                   bool(inst_.lwe)};
+    modifiers.image_resource = &srsrc;
+    modifiers.image_reads_address = inst_.dmask || inst_.lwe;
     modifiers.image_address = &vaddr;
     modifiers.image_coordinates =
         amdgpu::mimg_nsa_image_address_registers(inst_.nsa, inst_.vaddr, raw_encoding());

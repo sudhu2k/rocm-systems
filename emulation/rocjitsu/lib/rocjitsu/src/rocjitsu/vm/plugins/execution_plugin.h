@@ -28,6 +28,13 @@
 
 namespace rocjitsu {
 
+/// Observes conditional image returns after translation succeeds, before shader execution resumes.
+class AmdgpuImageFeedbackObserver {
+public:
+  virtual ~AmdgpuImageFeedbackObserver() = default;
+  virtual void onAmdgpuImageFeedbackQualified(const Instruction &inst, amdgpu::Wavefront &wf) = 0;
+};
+
 /// Optional observation of a VALU lane sourcing bytes directly from LDS.
 class AmdgpuLdsDirectReadObserver {
 public:

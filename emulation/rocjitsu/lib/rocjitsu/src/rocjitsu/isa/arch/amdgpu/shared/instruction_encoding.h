@@ -186,6 +186,11 @@ constexpr uint64_t valu_swap_write_lanes(uint64_t exec, unsigned wave_size, unsi
   return exec & wave & (upper ? lower << stride : lower);
 }
 
+constexpr bool has_gfx11_image_operands(rj_code_arch_t arch) {
+  return arch == ROCJITSU_CODE_ARCH_RDNA3 || arch == ROCJITSU_CODE_ARCH_RDNA3_5 ||
+         arch == ROCJITSU_CODE_ARCH_RDNA4;
+}
+
 /// VMEM and EXP substitute v0 independently for each missing source DWORD.
 constexpr uint16_t gfx115_source_vgpr(uint32_t selector, uint32_t allocation) {
   return selector < allocation ? static_cast<uint16_t>(selector) : 0;
@@ -214,12 +219,21 @@ struct RegisterModifiers {
 
   /// VADDR operand enabling coordinate tracking.
   const Operand *image_address = nullptr;
+  const Operand *image_atomic_data = nullptr;
+  const Operand *image_resource = nullptr;
+  bool image_resource_info = false;
+  std::optional<uint8_t> image_transfer_dim;
+  bool image_reads_address = true;
+  std::optional<ImageSampleSources> image_sample_sources;
+  const Operand *image_store_data = nullptr;
   /// Coordinate VGPR selectors, including NSA selectors.
   ImageAddressRegisters image_coordinates{};
   /// Number of tracked coordinate components.
   uint8_t image_coordinate_count = 0;
   /// Coordinates occupy packed 16-bit halves.
   bool image_a16 = false;
+  /// Implicit derivatives use quad lanes 0, 1, and 2 for each active quad.
+  bool image_implicit_gradients = false;
   /// VGPR words occupied by derivative inputs.
   uint8_t image_prefix_words = 0;
   /// GFX9 derives its actual tuple from the descriptor. The sentinel
@@ -235,6 +249,8 @@ struct RegisterModifiers {
   } gfx9_image_tuple;
   uint8_t scalar_buffer_words = 0; // Zero selects a complete vector descriptor.
   bool src2_is_wave_mask = false;
+  /// Prefix words in which only the low half carries an input.
+  uint16_t image_prefix_low16_words = 0;
   const Operand *wordwise_source0 = nullptr;
   const Operand *wordwise_source1 = nullptr;
   /// Block load destination or store data, selected per DWORD by issue-time M0.

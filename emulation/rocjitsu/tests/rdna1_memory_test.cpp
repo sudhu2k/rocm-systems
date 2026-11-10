@@ -124,6 +124,25 @@ TEST_F(Rdna1Memory, RawBuffersRespectUnboundResourcesAlignmentAndLdsExtent) {
   EXPECT_EQ(wf_->lds().read32(1024), 0xccccccccu);
 }
 
+class SparseTranslator final : public amdgpu::AddressSpaceTranslator {
+public:
+  amdgpu::VmTranslationResult translate(uint64_t address, size_t size,
+                                        amdgpu::VmAccessKind access) const override {
+    return identity.translate(address, size, access);
+  }
+  std::shared_ptr<const amdgpu::PrtRanges> nonresident_prt_ranges() const override {
+    auto snapshot = holes;
+    if (next_holes)
+      holes = *next_holes;
+    return snapshot;
+  }
+
+  amdgpu::IdentityAddressSpaceTranslator identity;
+  std::optional<std::shared_ptr<const amdgpu::PrtRanges>> next_holes;
+  mutable std::shared_ptr<const amdgpu::PrtRanges> holes =
+      std::make_shared<const amdgpu::PrtRanges>(amdgpu::PrtRanges{{0x5000, 0x6000}});
+};
+
 class Gfx10MemoryAllocation : public Rdna1Memory,
                               public testing::WithParamInterface<rj_code_arch_t> {
 protected:
@@ -223,6 +242,37 @@ TEST_P(Gfx10MemoryAllocation, UnallocatedLastWordSuppressesWholeLdsTuple) {
   EXPECT_EQ(vector(15, 0), 41u);
 }
 
+TEST_P(Gfx10MemoryAllocation, UnallocatedBufferTupleSuppressesFaultingReadsIncludingLastWord) {
+  amdgpu::GpuVm vm;
+  auto backing = std::make_shared<test::CountingGpuMemory>(memory_);
+  auto handle = vm.register_address_space(5, std::make_shared<SparseTranslator>(), backing);
+  cu_->set_gpu_vm(&vm);
+  wf_->set_address_space(handle);
+  wf_->set_process_id(5);
+  scalar(0, 0x4000);
+  scalar(1, 0);
+  scalar(2, 256);
+  scalar(3, (3u << 28) | (20u << 12));
+  vector(15, 0, 0x1515);
+  vector(16, 0, 0x1616);
+  backing->fault_reads = true;
+  const auto load = [](uint8_t dst) {
+    return rdna1::build_mubuf(rdna1::kBufferLoadDwordx2, {.vdata = dst, .soffset = 128});
+  };
+  ASSERT_NO_FATAL_FAILURE(issue(load(15)));
+  ASSERT_NO_FATAL_FAILURE(issue(rdna1::build_mtbuf(rdna1::kTbufferLoadFormatXy,
+                                                   {.format = 20, .vdata = 15, .soffset = 128})));
+  EXPECT_EQ(backing->reads, 0u);
+  EXPECT_EQ(vector(15, 0), 0x1515u);
+  EXPECT_EQ(vector(16, 0), 0x1616u);
+  ASSERT_NO_FATAL_FAILURE(execute(load(14)));
+  amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
+  EXPECT_EQ(pipeline.issue(inst_.release(), *wf_), amdgpu::VmAccessOutcome::Faulted);
+  EXPECT_EQ(backing->reads, 1u);
+  wf_->set_address_space({});
+  cu_->set_gpu_vm(nullptr);
+}
+
 TEST_P(Gfx10MemoryAllocation, ConditionalAtomicResultsAndLdsRedirectUseActualDestination) {
   constexpr uint32_t address = 0x4000;
   memory_.write32(address, 9);
@@ -270,6 +320,123 @@ TEST_P(Gfx10MemoryAllocation, ConditionalAtomicResultsAndLdsRedirectUseActualDes
   amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
   EXPECT_EQ(pipeline.issue(inst_.release(), *wf_), amdgpu::VmAccessOutcome::Complete);
   EXPECT_EQ(vector(16, 0), 0x1616u);
+}
+
+TEST_P(Gfx10MemoryAllocation, InlineImageResultHonorsMaskWidth) {
+  scalar(0, 0x4000 >> 8);
+  scalar(1, (20u << 20) | (1u << 29));
+  scalar(2, 0);
+  scalar(3, 9u << 28);
+  for (unsigned i = 4; i < 8; ++i)
+    scalar(i, 0);
+  vector(0, 0, 0);
+  vector(15, 0, 0x1515);
+  vector(16, 0, 0x1616);
+  // With two components, the whole tuple v[15:16] must be suppressed.
+  const auto query = [](uint8_t dmask) {
+    return rdna1::build_mimg(rdna1::kImageGetResinfo, {.dim = 1, .dmask = dmask, .vdata = 15});
+  };
+  ASSERT_NO_FATAL_FAILURE(execute(query(3)));
+  EXPECT_EQ(vector(15, 0), 0x1515u);
+  EXPECT_EQ(vector(16, 0), 0x1616u);
+  ASSERT_NO_FATAL_FAILURE(execute(query(1)));
+  EXPECT_EQ(vector(15, 0), 1u);
+  EXPECT_EQ(vector(16, 0), 0x1616u);
+}
+
+TEST_F(Rdna1Memory, BufferTfeReportsOnlyExplicitSparseHoles) {
+  amdgpu::GpuVm vm;
+  auto backing = std::make_shared<test::CountingGpuMemory>(memory_);
+  uint32_t faults = 0;
+  auto handle = vm.register_address_space(5, std::make_shared<SparseTranslator>(), backing,
+                                          [&](uint64_t, amdgpu::VmAccessKind) { ++faults; });
+  cu_->set_gpu_vm(&vm);
+  wf_->set_address_space(handle);
+  wf_->set_process_id(5);
+  wf_->set_exec(3);
+  scalar(0, 0x4000);
+  scalar(1, 0);
+  scalar(2, 0x3000);
+  scalar(3, (3u << 28) | (20u << 12));
+  vector(0, 0, 0);
+  vector(0, 1, 0x1000);
+  vector(9, 0, 0xdeadbeef);
+  vector(9, 1, 0);
+  memory_.write32(0x4000, 0xaabbccdd);
+  const auto load = rdna1::build_mubuf(rdna1::kBufferLoadDword,
+                                       {.offen = 1, .vdata = 8, .tfe = 1, .soffset = 128});
+  ASSERT_NO_FATAL_FAILURE(issue(load));
+  EXPECT_EQ(vector(8, 0), 0xaabbccddu);
+  EXPECT_EQ(vector(8, 1), 0u);
+  EXPECT_EQ(vector(9, 0), 0xdeadbeefu);
+  EXPECT_EQ(vector(9, 1), 1u);
+  EXPECT_EQ(faults, 0u);
+  EXPECT_EQ(backing->reads, 1u);
+
+  // V15 is allocated but the required V16 status is outside this wave.
+  const auto out_of_range = rdna1::build_mubuf(rdna1::kBufferLoadDword,
+                                               {.offen = 1, .vdata = 15, .tfe = 1, .soffset = 128});
+  vector(15, 0, 1234);
+  vector(16, 1, 0x76543210); // The CU slot has storage beyond the wave allocation.
+  ASSERT_NO_FATAL_FAILURE(issue(out_of_range));
+  EXPECT_EQ(vector(15, 0), 1234u);
+  EXPECT_EQ(vector(16, 1), 0x76543210u);
+  EXPECT_EQ(backing->reads, 1u);
+
+  backing->fault_reads = true;
+  ASSERT_NO_FATAL_FAILURE(execute(load));
+  amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
+  EXPECT_EQ(pipeline.issue(inst_.release(), *wf_), amdgpu::VmAccessOutcome::Faulted);
+  EXPECT_EQ(vector(9, 0), 0xdeadbeefu);
+  wf_->set_address_space({});
+  cu_->set_gpu_vm(nullptr);
+}
+
+TEST_F(Rdna1Memory, ImageTfeTakesPrecedenceOverLodWarningAndPreservesResidentStatus) {
+  amdgpu::GpuVm vm;
+  auto backing = std::make_shared<test::CountingGpuMemory>(memory_);
+  auto handle = vm.register_address_space(5, std::make_shared<SparseTranslator>(), backing);
+  cu_->set_gpu_vm(&vm);
+  wf_->set_address_space(handle);
+  wf_->set_process_id(5);
+  for (unsigned i = 0; i < 12; ++i)
+    scalar(i, 0);
+  scalar(0, 0x4000 >> 8);
+  scalar(1, (20u << 20) | (1u << 29)); // 1x1 linear R32_UINT resource.
+  scalar(3, (9u << 28) | 4);
+  scalar(5, 256u << 8); // T#.MIN_LOD_WARN = 1.0.
+  vector(0, 0, 0);
+  vector(1, 0, 0);
+  vector(9, 0, 0xdeadbeef);
+  memory_.write32(0x4000, 12345);
+  const auto load =
+      rdna1::build_mimg(rdna1::kImageLoadMimg, {.dim = 1, .dmask = 1, .tfe = 1, .vdata = 8});
+  ASSERT_NO_FATAL_FAILURE(issue(load));
+  EXPECT_EQ(vector(8, 0), 12345u);
+  EXPECT_EQ(vector(9, 0), 0xdeadbeefu);
+  const auto sample =
+      rdna1::build_mimg(rdna1::kImageSampleLzMimg,
+                        {.dim = 1, .dmask = 1, .tfe = 1, .lwe = 1, .vdata = 8, .ssamp = 2});
+  const auto expect_hwreg_bit = [&](uint16_t reg, uint32_t expected) {
+    const auto get = rdna1::build_sopk(
+        rdna1::kSGetregB32, {.simm16 = static_cast<uint16_t>(reg | (10u << 6)), .sdst = 12});
+    ASSERT_NO_FATAL_FAILURE(execute({get[0], 0}));
+    EXPECT_EQ(cu_->read_sgpr(wf_->sgpr_alloc().base + 12), expected);
+  };
+  ASSERT_NO_FATAL_FAILURE(expect_hwreg_bit(1, 0));
+  ASSERT_NO_FATAL_FAILURE(issue(sample));
+  EXPECT_EQ(vector(8, 0), 12345u);
+  EXPECT_EQ(vector(9, 0), 2u);
+  ASSERT_NO_FATAL_FAILURE(expect_hwreg_bit(1, 1)); // MODE.LOD_CLAMPED
+  scalar(0, 0x5000 >> 8);
+  const auto prior_reads = backing->reads;
+  ASSERT_NO_FATAL_FAILURE(issue(sample));
+  EXPECT_EQ(vector(8, 0), 0u);
+  EXPECT_EQ(vector(9, 0), 1u);
+  EXPECT_EQ(backing->reads, prior_reads);
+  ASSERT_NO_FATAL_FAILURE(expect_hwreg_bit(1, 1)); // Sticky across the NACK.
+  wf_->set_address_space({});
+  cu_->set_gpu_vm(nullptr);
 }
 
 TEST_F(Rdna1Memory, DualDsHonorsIndependentBoundsAndAliasing) {
