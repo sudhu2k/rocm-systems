@@ -56,23 +56,18 @@ __host__ void SdmaImpl::sdmaHostInit(int pe, int num_pes, int rank) {
 
   LOG_INFO("SDMA init with threshold=%zu, channels=%d, local_size=%d",
            sdmaThreshold, numChannels, shm_size);
-  // Note: shm_size is the number of local PEs (ranks on this node).
-  // num_devices (set below) is the number of actual GPU devices.
 
   // Initialize the Anvil library
   sdma_anvil::anvil.init();
 
-  // Get current device and total number of local GPU devices
+  // Get current device
   int deviceId;
   CHECK_HIP(hipGetDevice(&deviceId));
-  int numDevices;
-  CHECK_HIP(hipGetDeviceCount(&numDevices));
-  num_devices = numDevices;
 
-  // Create SDMA connections to all local GPU devices including self. A failed connect aborts rather than
+  // Create SDMA connections to all local PEs including self. A failed connect aborts rather than
   // clearing sdmaEnabled on this rank alone: sdmaEnabled also selects the alltoall algorithm, and
   // ranks that disagree on it run incompatible synchronization and hang.
-  for (int i = 0; i < numDevices; i++) {
+  for (int i = 0; i < shm_size; i++) {
     if (i != deviceId) {
       sdma_anvil::EnablePeerAccess(deviceId, i);
     }
@@ -83,9 +78,9 @@ __host__ void SdmaImpl::sdmaHostInit(int pe, int num_pes, int rank) {
     }
   }
 
-  // Total number of handles: numDevices * numChannels
+  // Total number of handles: shm_size * numChannels
   // Indexed as: deviceHandles_d[local_pe * numChannels + channel_idx]
-  int total_handles = numDevices * numChannels;
+  int total_handles = shm_size * numChannels;
 
   // Allocate device-side array to hold SDMA queue device handles
   CHECK_HIP(hipMalloc(&deviceHandles_d,
@@ -94,7 +89,7 @@ __host__ void SdmaImpl::sdmaHostInit(int pe, int num_pes, int rank) {
   // Copy device handles to device memory
   sdma_anvil::SdmaQueueDeviceHandle** handles_h =
       new sdma_anvil::SdmaQueueDeviceHandle*[total_handles];
-  for (int i = 0; i < numDevices; i++) {
+  for (int i = 0; i < shm_size; i++) {
     for (int ch = 0; ch < numChannels; ch++) {
       int idx = i * numChannels + ch;
       sdma_anvil::SdmaQueue* queue = sdma_anvil::anvil.getSdmaQueue(deviceId, i, ch);
@@ -117,7 +112,7 @@ __host__ void SdmaImpl::sdmaHostStop() {
   // Release only the peers sdmaHostInit wired: the channel map is process-global, so disconnect()
   // would also destroy queues another user still holds. A disabled init wired none.
   if (sdmaEnabled) {
-    for (int i = 0; i < num_devices; i++) sdma_anvil::anvil.disconnectDevice(i);
+    for (int i = 0; i < shm_size; i++) sdma_anvil::anvil.disconnectDevice(i);
   }
 }
 
