@@ -71,6 +71,30 @@ VmAccessOutcome L1ScalarCache::ensure_line(uint64_t addr, uint32_t vmid, bool fe
   return VmAccessOutcome::Complete;
 }
 
+void L1ScalarCache::prefetch_resident(uint64_t addr, uint32_t vmid) {
+  synchronize_epoch();
+  if (!l2_)
+    return;
+  const uint64_t line = CacheStore::line_address(addr);
+  RequestMtypeResolver mtypes(gpu_vm_, vmid, mtype_cache_, Mtype::RW);
+  const Mtype policy = mtypes.at(line);
+  if (policy == Mtype::UC || policy == Mtype::CC ||
+      !l2_->can_fetch_range(line, CacheStore::LINE_SIZE, vmid))
+    return;
+  const auto *resident = cache_.peek(line, vmid);
+  if (resident && CacheStore::bytes_valid(*resident, 0, CacheStore::LINE_SIZE))
+    return;
+  std::array<uint8_t, CacheStore::LINE_SIZE> bytes;
+  if (!l2_->copy_resident_line(line, bytes, vmid))
+    return;
+  if (resident)
+    cache_.fill_missing_bytes(line, bytes.data(), vmid);
+  else {
+    cache_.allocate(line, vmid);
+    cache_.fill_line(line, bytes.data(), vmid);
+  }
+}
+
 void L1ScalarCache::cache_partial_bytes(uint64_t addr, const uint8_t *src, uint32_t size,
                                         uint32_t vmid) {
   simdojo::CacheTag *tag = nullptr;
@@ -139,6 +163,21 @@ VmAccessOutcome L1ScalarCache::store(uint64_t addr, uint32_t num_dwords, const u
     }
   }
   return VmAccessOutcome::Complete;
+}
+
+void L1ScalarCache::prefetch(uint64_t address, uint32_t vmid) {
+  synchronize_epoch();
+  const uint64_t line = CacheStore::line_address(address);
+  RequestMtypeResolver mtypes(gpu_vm_, vmid, mtype_cache_);
+  const Mtype mtype = mtypes.at(line);
+  if (mtype != Mtype::RW && mtype != Mtype::WB)
+    return;
+  simdojo::CacheTag *tag = nullptr;
+  if (cache_.lookup(line, &tag, vmid) && CacheStore::bytes_valid(*tag, 0, CacheStore::LINE_SIZE))
+    return;
+  uint8_t bytes[CacheStore::LINE_SIZE];
+  if (l2_->try_prefetch_line(line, bytes, vmid))
+    cache_partial_bytes(line, bytes, CacheStore::LINE_SIZE, vmid);
 }
 
 void L1ScalarCache::writeback_all(uint32_t vmid) {

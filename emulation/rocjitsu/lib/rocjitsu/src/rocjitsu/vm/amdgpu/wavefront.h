@@ -39,11 +39,23 @@ struct Gfx10CheckpointScheduler;
 namespace amdgpu {
 
 struct Pm4FailureState;
+struct ShaderExportOperands;
+enum class ShaderExportIssue : uint8_t { Skip, WaitForReady, Accept };
 
 // Forward declaration - wavefront accesses registers through its CU.
 class ComputeUnitCore;
 class Lds;
 enum class VmAccessOutcome : uint8_t;
+
+/// One functional export-buffer row produced by a wave.
+struct ShaderExportRow {
+  uint8_t target;
+  uint8_t row;
+  uint8_t components;
+  bool done;
+  uint64_t valid_lanes;
+  std::array<std::array<uint32_t, 4>, 64> values{};
+};
 
 /// @brief Wavefront execution state.
 enum class WfState : uint8_t {
@@ -54,6 +66,8 @@ enum class WfState : uint8_t {
   BARRIER,     ///< Stalled at a barrier.
   GWS_WAIT,    ///< Parked at a Global Wave Sync rendezvous (device-global).
   ENDING,      ///< s_endpgm executed but outstanding memory ops are draining.
+  EXPORT_WAIT, ///< Waiting for export-buffer allocation.
+  PARAM_WAIT,  ///< Waiting for pixel parameters to arrive in LDS.
   MEMORY_TRAP, ///< An enabled address violation completed; trap before the next issue.
 };
 
@@ -185,7 +199,10 @@ public:
   }
 
   uint32_t ib_sts2_gfx11() const { return ib_sts2_gfx11_ | (uint32_t(wf_size() == 64) << 11); }
-  void set_ib_sts2_gfx11(uint32_t value) { ib_sts2_gfx11_ = value; }
+  void set_ib_sts2_gfx11(uint32_t value) {
+    ib_sts2_gfx11_ = value;
+    set_instruction_prefetch(value);
+  }
 
   /// @brief Read the raw MODE register value.
   uint32_t mode_raw() const { return mode_raw_; }
@@ -490,6 +507,7 @@ public:
 
   /// Active lanes for memory planning, including GFX10 destination suppression.
   uint64_t memory_exec(const Instruction &inst) const;
+  void observe_cancelled_memory_issue(const Instruction &inst);
   void observe_lds_direct_read(uint32_t address, uint32_t bytes, uint32_t lane) const;
 
   /// Resolve one RDNA2 DS input word against the logical VGPR allocation.
@@ -613,6 +631,8 @@ public:
 
   /// STATUS.HALT. Bit 13 on every modelled architecture -- see StatusReg::HALT
   /// in each arch's isa.h, which all spell it member<13, 13>.
+  static constexpr uint32_t kStatusExportReadyMask = 1u << 8;
+  static constexpr uint32_t kStatusParamReadyMask = 1u << 25;
   static constexpr uint32_t kStatusInTgMask = 1u << 11;
   static constexpr uint32_t kStatusPrivMask = 1u << 5;
   static constexpr uint32_t kStatusFatalHaltMask = 1u << 23;
@@ -839,6 +859,21 @@ public:
     set_status_raw(val ? (s | kStatusHaltMask) : (s & ~kStatusHaltMask));
   }
 
+  bool parameters_ready() const { return (status_raw() & kStatusParamReadyMask) != 0; }
+  bool export_ready() const { return (status_raw() & kStatusExportReadyMask) != 0; }
+  bool waits_for_export_grant(uint32_t control) const {
+    const bool wait =
+        cu().arch() == ROCJITSU_CODE_ARCH_RDNA4 ? (control & 2u) != 0 : (control & 1u) == 0;
+    return wait && !export_ready();
+  }
+  /// Completed functional exports, keyed by hardware target and row.
+  std::span<const ShaderExportRow> shader_exports() const { return shader_exports_; }
+  void restore_shader_exports(std::vector<ShaderExportRow> rows) {
+    shader_exports_ = std::move(rows);
+  }
+  ShaderExportIssue shader_export_issue(const ShaderExportOperands &operands) const;
+  bool export_shader_data(const ShaderExportOperands &operands);
+
   /// @brief Return the current execution state.
   /// @returns Current WfState.
   WfState state() const { return state_; }
@@ -937,6 +972,17 @@ public:
   void delay_nop_issue(uint32_t extra_cycles) {
     nop_ready_cycle_ = shader_cycles() + extra_cycles + 1;
   }
+  void begin_instruction_clause(uint32_t control) {
+    clause_remaining_ = (control & 63u) + 1;
+    clause_interval_ = (control >> 8) & 15u;
+    clause_run_ = 0;
+    clause_kind_ = 0;
+  }
+  void set_instruction_prefetch(uint32_t lines) {
+    ib_sts2_gfx11_ = (ib_sts2_gfx11_ & ~3u) | (lines & 3u);
+    prefetch_lines_ = lines & 3u;
+    last_prefetch_line_ = ~uint64_t{0};
+  }
   uint32_t sleep_cycles() const { return sleep_cycles_; }
   void set_sleep_cycles(uint32_t cycles) { sleep_cycles_ = cycles; }
   static constexpr bool supports_sleep_wakeup_credit(rj_code_arch_t arch) {
@@ -945,6 +991,10 @@ public:
   bool supports_sleep_wakeup_credit() const { return supports_sleep_wakeup_credit(cu().arch()); }
   bool sleep_wakeup() const { return sleep_wakeup_; }
   void set_sleep_wakeup(bool credit) { sleep_wakeup_ = credit; }
+  void receive_wakeup_with_credit() {
+    sleep_wakeup_ = sleep_cycles_ == 0;
+    sleep_cycles_ = 0;
+  }
   void issue_sleep_with_credit(uint32_t delay) {
     // A failed S_SLEEP_VAR operand read must leave its one-shot credit intact.
     if (instruction_execution_failed())
@@ -959,6 +1009,27 @@ public:
   }
   bool shader_can_write_ttmp() const {
     return in_trap_handler() || (status_raw() & kStatusPrivMask);
+  }
+  void set_shader_halt(uint16_t control) {
+    const bool halt = (control & 1u) != 0;
+    const bool fatal = (control & 4u) != 0;
+    if (fatal) {
+      if (uses_separate_trap_ctrl() && !in_trap_handler())
+        return;
+      constexpr uint32_t fatal_halt = 1u << 23;
+      set_status_raw(halt ? status_raw() | fatal_halt : status_raw() & ~fatal_halt);
+    } else {
+      set_status_halt(halt);
+    }
+    if (halt && (fatal || !in_trap_handler()) && cu().arch() != ROCJITSU_CODE_ARCH_RDNA2 &&
+        cu().arch() != ROCJITSU_CODE_ARCH_CDNA2) {
+      set_self_halted(true);
+      set_debug_halted(true);
+    } else if (!halt && self_halted() && !(status_raw() & kStatusFatalHaltMask) &&
+               (!status_halt() || in_trap_handler())) {
+      set_self_halted(false);
+      set_debug_halted(false);
+    }
   }
 
   /// @brief Whether the wave is currently fetching from its configured TBA.
@@ -1058,6 +1129,8 @@ public:
   void set_debug_halted(bool v) {
     const bool was_runnable = !is_halted() && !debug_paused();
     debug_halted_ = v;
+    if (v)
+      clause_remaining_ = 0;
     if (was_runnable != (!is_halted() && !debug_paused()))
       update_activity_counts(!is_halted(), was_runnable);
   }
@@ -1317,6 +1390,9 @@ public:
     wait_target_ = {};
     ready_cycle_ = 0;
     nop_ready_cycle_ = 0;
+    set_instruction_prefetch(0);
+    clause_remaining_ = 0;
+    clause_kind_ = 0;
     set_state(WfState::HALTED);
     for (auto &t : ttmp_)
       t = 0;
@@ -1330,6 +1406,7 @@ public:
     sleep_cycles_ = 0;
     sleep_wakeup_ = false;
     in_trap_handler_ = false;
+    shader_exports_.clear();
 
     ib_sts2_gfx11_ = 0;
     trap_interrupt_sent_ = false;
@@ -1487,6 +1564,7 @@ private:
   uint32_t sleep_cycles_ = 0;       ///< Cycles left on an in-flight S_SLEEP.
   bool pending_memory_trap_ = false;
   bool sleep_wakeup_ = false;
+  std::vector<ShaderExportRow> shader_exports_;
   bool in_trap_handler_ = false;               ///< Executing the configured trap-handler shader.
   bool trap_resume_exec_edited_ = false;       ///< Debugger supplied a new application EXEC.
   bool trap_interrupt_sent_ = false;           ///< Handler issued MSG_INTERRUPT for this entry.
@@ -1543,6 +1621,12 @@ private:
   mutable bool observing_lds_direct_read_ = false;
   uint64_t ready_cycle_ = 0;
   uint64_t nop_ready_cycle_ = 0;
+  uint64_t last_prefetch_line_ = ~uint64_t{0};
+  uint8_t prefetch_lines_ = 0;
+  uint8_t clause_remaining_ = 0;
+  uint8_t clause_kind_ = 0;
+  uint8_t clause_interval_ = 0;
+  uint8_t clause_run_ = 0;
   EndReason end_reason_ = EndReason::None;
   WaitTarget wait_target_;                  ///< Current s_waitcnt thresholds.
   mutable LdsSourceRead lds_source_read_{}; ///< Valid for one instruction when bytes is nonzero.

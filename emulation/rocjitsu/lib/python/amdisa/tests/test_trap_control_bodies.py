@@ -55,7 +55,7 @@ class TestSRfeBody:
         """GFX1250 spells it S_RFE_I64 (SOP1 opcode 74). Omitting a spelling
         leaves that ISA's generated execute_impl() an empty no-op, so its trap
         handlers can never return."""
-        for name in ('S_RFE', 'S_RFE_B64', 'S_RFE_I64'):
+        for name in ('S_RFE', 'S_RFE_B64', 'S_RFE_I64', 'S_RFE_RESTORE_B64'):
             body = _body(name)
             assert 'kPcAddressMask' in body, f'{name} has no trap-return body'
             assert 'wf.set_in_trap_handler(false);' in body, name

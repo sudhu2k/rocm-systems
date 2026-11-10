@@ -531,6 +531,15 @@ void WaveRaceState::applyWaitCounter(amdgpu::WaitCounterType type, int threshold
   applyCounterConstraint(type, threshold, /*includeUnordered=*/false);
 }
 
+void WaveRaceState::cancelRoutedLdsRead(EventId eventId) {
+  // This source-only event has no register dependencies. Remove its counter positions
+  // and its byte intervals together, preserving earlier requests at the same PC.
+  const bool pending = std::erase(waveMemoryEvents, eventId) != 0;
+  const bool awaitingBarrier = std::erase(barrierPendingEvents, eventId) != 0;
+  if (pending || awaitingBarrier)
+    detector->retireEvent(eventId);
+}
+
 void WaveRaceState::recordLdsOperandRead(InstructionSnapshot instruction, uint32_t address,
                                          uint32_t bytes, uint32_t lane) {
   if (!detector->validLdsRange(address, bytes))
@@ -602,13 +611,16 @@ void WaveRaceState::checkVgprWrite(int reg, uint64_t execMask, uint8_t byteMask,
     const MemoryEventType pendingType = detector->events().type(eventId);
     // Same-class writeback can resolve a pending destination WAW. An export
     // still owns its source bytes until its independent EXPCNT event retires.
-    if (!isToVgpr(pendingType) ||
+    const bool lockedSource = pendingType == MemoryEventType::GDS_ORDERED_COUNT_SOURCE;
+    if ((!lockedSource && !isToVgpr(pendingType)) ||
         (detector->events().registerByteMask(eventId, reg) & byteMask) == 0) {
       continue;
     }
 
     uint64_t overlappingLanes = detector->events().registerLanes(eventId, reg) & execMask;
-    overlappingLanes = detector->events().conflictingWriteLanes(eventId, writeOrder, overlappingLanes);
+    if (!lockedSource)
+      overlappingLanes =
+          detector->events().conflictingWriteLanes(eventId, writeOrder, overlappingLanes);
     if (overlappingLanes == 0)
       continue;
 

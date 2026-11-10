@@ -196,6 +196,25 @@ constexpr uint16_t gfx115_source_vgpr(uint32_t selector, uint32_t allocation) {
   return selector < allocation ? static_cast<uint16_t>(selector) : 0;
 }
 
+struct Gfx10ShaderExportOperands {
+  uint8_t target, enabled;
+  bool compressed;
+  std::array<uint8_t, 4> sources;
+
+  bool valid() const {
+    return (target <= 9 || (target >= 12 && target <= 16) || target == 20 || target >= 32) &&
+           (!compressed || !((enabled ^ (enabled >> 1)) & 5u));
+  }
+
+  template <typename Visit> void for_each_source(uint32_t allocation, Visit visit) const {
+    if (target == 9)
+      return;
+    for (unsigned c = 0; c < 4; c += compressed ? 2 : 1)
+      if (enabled & (1u << c))
+        visit(c, gfx115_source_vgpr(sources[compressed ? c / 2 : c], allocation));
+  }
+};
+
 struct ShaderExportOperands {
   uint8_t target;
   uint8_t components;
@@ -263,6 +282,7 @@ struct RegisterModifiers {
   std::optional<ImageSampleSources> image_sample_sources;
   const Operand *image_store_data = nullptr;
   std::optional<ShaderExportOperands> shader_export;
+  std::optional<Gfx10ShaderExportOperands> gfx10_export;
   /// Coordinate VGPR selectors, including NSA selectors.
   ImageAddressRegisters image_coordinates{};
   /// Number of tracked coordinate components.

@@ -307,6 +307,19 @@ public:
     });
   }
 
+  void onAmdgpuMemoryIssueCancelled(const Instruction &inst, amdgpu::Wavefront &wf) {
+    dispatch_wave_hot_hook(&wf, [&](bool cached) {
+      for (size_t index = 0; index != plugins_.size(); ++index) {
+        auto &entry = plugins_[index];
+        if (entry.observes_memory_routing && plugin_observes_hot_hooks(index, &wf, cached)) {
+          if (auto *observer =
+                  dynamic_cast<AmdgpuMemoryIssueCancellationObserver *>(entry.plugin.get()))
+            observer->onAmdgpuMemoryIssueCancelled(inst, wf);
+        }
+      }
+    });
+  }
+
   void onAmdgpuImageFeedbackQualified(const Instruction &inst, amdgpu::Wavefront &wf) {
     if (!observes_memory_routing_)
       return;

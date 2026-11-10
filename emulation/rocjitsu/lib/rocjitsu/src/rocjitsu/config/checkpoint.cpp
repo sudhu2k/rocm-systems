@@ -25,6 +25,7 @@
 #include <fstream>
 #include <limits>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -37,6 +38,54 @@ namespace {
 bool checkpoint_cu_owned_lds(rj_code_arch_t arch) {
   return arch != ROCJITSU_CODE_ARCH_RDNA1 && arch != ROCJITSU_CODE_ARCH_RDNA2 &&
          arch != ROCJITSU_CODE_ARCH_RV32I && arch != ROCJITSU_CODE_ARCH_RV64I;
+}
+
+flatbuffers::Optional<fb::GraphicsWait> graphics_wait(const amdgpu::Wavefront &wave) {
+  if (!amdgpu::has_typed_export_waits(wave.cu().arch()))
+    return flatbuffers::nullopt;
+  if (wave.state() == amdgpu::WfState::EXPORT_WAIT)
+    return fb::GraphicsWait_Export;
+  if (wave.state() == amdgpu::WfState::PARAM_WAIT)
+    return fb::GraphicsWait_Parameters;
+  return fb::GraphicsWait_None;
+}
+
+util::Result restore_graphics_status(amdgpu::Wavefront &wave, const fb::WavefrontState &saved,
+                                     bool predates_grants, util::DiagnosticEmitter emit_error) {
+  uint32_t status = saved.status();
+  const auto arch = wave.cu().arch();
+  const auto waiting = saved.graphics_wait();
+  bool use_launch_grants = !waiting && predates_grants;
+  if (waiting) {
+    if (!amdgpu::has_typed_export_waits(arch))
+      return emit_error.emit() << "Graphics wait on an incompatible checkpoint architecture";
+    switch (*waiting) {
+    case fb::GraphicsWait_None:
+      break;
+    case fb::GraphicsWait_LaunchDefaults:
+      use_launch_grants = true;
+      break;
+    case fb::GraphicsWait_Export:
+    case fb::GraphicsWait_Parameters:
+      if (wave.state() != amdgpu::WfState::RUNNING)
+        return emit_error.emit() << "Inconsistent wave state for a checkpoint graphics wait";
+      wave.set_state(*waiting == fb::GraphicsWait_Export ? amdgpu::WfState::EXPORT_WAIT
+                                                         : amdgpu::WfState::PARAM_WAIT);
+      break;
+    default:
+      return emit_error.emit() << "Invalid checkpoint graphics wait";
+    }
+  }
+  if (use_launch_grants && amdgpu::has_typed_export_waits(arch)) {
+    // Standalone waves started with both frontend grants. GFX11.5 also supported
+    // independent grants, so keep a partial grant from a legacy frontend.
+    constexpr uint32_t grants =
+        amdgpu::Wavefront::kStatusExportReadyMask | amdgpu::Wavefront::kStatusParamReadyMask;
+    if (arch != ROCJITSU_CODE_ARCH_RDNA3_5 || (status & grants) == 0)
+      status |= wave.status_raw() & grants;
+  }
+  wave.set_status_raw(status);
+  return util::Result::success();
 }
 
 const char *checkpoint_group_target(rj_code_arch_t arch) {
@@ -409,6 +458,10 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
     for (auto *se : xcd->shader_engines()) {
       for (uint32_t ci = 0; ci < se->num_compute_units(); ++ci) {
         auto *cu = se->compute_unit(ci);
+        if (cu->gws_device().has_gds_checkpoint_state())
+          return emit_error.emit()
+                 << "Cannot checkpoint GDS memory or ordered-count state: indexed GDS data and "
+                    "outstanding process reservations require a live owner";
         if (cu->gws_device().tracked_process_count() != 0)
           return emit_error.emit() << "Cannot checkpoint GWS resource state: the shared table "
                                       "is not part of the checkpoint format";
@@ -474,7 +527,8 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
           if (cu_owned_lds && w->state() != amdgpu::WfState::RUNNING) {
             const bool recorded_barrier = gfx12 && w->state() == amdgpu::WfState::BARRIER &&
                                           w->checkpoint_waiting_barrier() != 0;
-            if (!recorded_barrier)
+            const auto parked = graphics_wait(*w);
+            if (!recorded_barrier && (!parked || *parked == fb::GraphicsWait_None))
               return emit_error.emit()
                      << "Cannot checkpoint AMDGPU state without its scheduler record on "
                      << cu->name();
@@ -567,6 +621,17 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
               gfx10 ? std::nullopt : std::optional{w->num_vgprs()};
           const fb::WaveExceptionRegisters exceptions(
               w->trapsts(), w->gfx12_excp_flag_user_extra_raw(), w->gfx12_trap_ctrl_raw());
+          std::vector<flatbuffers::Offset<fb::ShaderExportRow>> export_rows;
+          for (const auto &row : w->shader_exports()) {
+            std::vector<uint32_t> values;
+            values.reserve(w->wf_size() * 4);
+            for (unsigned lane = 0; lane < w->wf_size(); ++lane)
+              values.insert(values.end(), row.values[lane].begin(), row.values[lane].end());
+            export_rows.push_back(
+                fb::CreateShaderExportRow(builder, row.target, row.row, row.components, row.done,
+                                          row.valid_lanes, builder.CreateVector(values)));
+          }
+          const auto exports = export_rows.empty() ? 0 : builder.CreateVector(export_rows);
           auto wfs = fb::CreateWavefrontState(
               builder, w->wf_id(), w->wg_id(), w->pc, w->exec_raw(), w->vcc(), w->m0(),
               w->is_halted(), w->status_raw(), sgprs_vec, vgprs_vec.value(), w->mode_raw(),
@@ -585,11 +650,11 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
               cu_owned_lds ? std::optional{w->scratch_base()} : std::nullopt,
               cu_owned_lds ? &lds_window : nullptr, num_vgprs,
               (cdna4 || cu->arch() == ROCJITSU_CODE_ARCH_CDNA2) ? w->accum_vgpr_base() : 0,
-              num_sgprs, flatbuffers::nullopt,
+              num_sgprs, graphics_wait(*w),
               (cu->arch() == ROCJITSU_CODE_ARCH_RDNA3 || cu->arch() == ROCJITSU_CODE_ARCH_RDNA3_5)
                   ? w->ib_sts2_gfx11() & ~(1u << 11)
                   : 0,
-              &exceptions, rdna2 ? std::nullopt : std::optional{internal});
+              &exceptions, rdna2 ? std::nullopt : std::optional{internal}, exports);
           wf_offsets.push_back(wfs);
         }
 
@@ -1049,10 +1114,32 @@ util::FailureOr<LoadedConfig> restore_checkpoint(const std::string &path,
             wf->restore_rdna4_checkpoint_barriers(wf_state->barrier_complete_mask(),
                                                   wf_state->waiting_barrier());
           }
-          if (const auto wait = wf_state->graphics_wait();
-              wait && *wait != fb::GraphicsWait_None && *wait != fb::GraphicsWait_LaunchDefaults)
-            return emit_error.emit() << "Unsupported checkpoint graphics wait";
-          wf->set_status_raw(wf_state->status());
+          // The resource-only writer saved both CU LDS and dispatch cursors before it
+          // modeled grants. Older frontend-aware files have only dispatch cursors.
+          const auto *cp_state = checkpoint->command_processor();
+          const bool predates_grants =
+              cursor.has_value() || !cp_state || !cp_state->next_dispatch_ids();
+          if (restore_graphics_status(*wf, *wf_state, predates_grants, emit_error).failed())
+            return util::Result::failure();
+          if (const auto *saved = wf_state->shader_exports()) {
+            std::vector<amdgpu::ShaderExportRow> rows;
+            std::set<std::pair<uint8_t, uint8_t>> seen;
+            for (const auto *entry : *saved) {
+              if (!amdgpu::has_typed_export_waits(cu->arch()) || entry->target() >= 64 ||
+                  entry->components() > 15 ||
+                  (wf->wf_size() < 64 && (entry->valid_lanes() >> wf->wf_size())) ||
+                  entry->values()->size() != wf->wf_size() * 4 ||
+                  !seen.emplace(entry->target(), entry->row()).second)
+                return emit_error.emit() << "Invalid wave shader export row in checkpoint";
+              auto &row = rows.emplace_back(
+                  amdgpu::ShaderExportRow{entry->target(), entry->row(), entry->components(),
+                                          entry->done(), entry->valid_lanes()});
+              for (unsigned lane = 0; lane < wf->wf_size(); ++lane)
+                for (unsigned c = 0; c < 4; ++c)
+                  row.values[lane][c] = entry->values()->Get(4 * lane + c);
+            }
+            wf->restore_shader_exports(std::move(rows));
+          }
           wf->set_sleep_cycles(wf_state->sleep_cycles());
           if (wf->supports_sleep_wakeup_credit())
             wf->set_sleep_wakeup(wf_state->sleep_wakeup());

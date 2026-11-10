@@ -135,6 +135,7 @@ public:
   ScalarMemState() { tag_ = SCALAR_MEM; }
   uint64_t addr = 0;
   bool request_force_l1_bypass = false;
+  bool translation_probe = false; ///< Nonfaulting ATC probe, with no register writeback.
   bool memviol = false;           ///< Invalid scalar-buffer offset faults before memory access.
   /// Architectural destination resolved and range-checked at issue time.
   ScalarRegisterRange dst_register;
@@ -261,6 +262,10 @@ public:
   // mixed FLAT requests. CDNA5 DDS has no backing implementation and faults before
   // either pipeline accesses memory. Original aperture addresses live only in
   // the routed observation's callback snapshot.
+  // Indexed RDNA2 GDS snapshots M0 before a deferred memory operation. Its
+  // upper half is the byte base, and its lower half is the window size.
+
+  uint32_t ds_base(uint32_t lds_base) const { return gds_m0 ? *gds_m0 >> 16 : lds_base; }
   uint64_t flat_local_lane_mask = 0;
   uint64_t flat_dds_lane_mask = 0;
   // GFX10 checks the complete lane transfer. RDNA4 checks the first element
@@ -277,7 +282,18 @@ public:
   int32_t flat_aperture_offset = 0;
   std::optional<uint64_t> flat_local_allocation_end;
   std::optional<LdsAllocationRange> lds_allocation;
+  bool gds = false;
   bool ds_memviol = false;
+  struct GdsRegisterAccess {
+    uint32_t operand;
+    uint16_t logical_wave;
+    uint8_t index;
+    uint8_t flags;
+    uint8_t crawler_increment;
+    bool ordered;
+    bool subtract;
+  };
+  std::optional<GdsRegisterAccess> gds_register;
   uint64_t buffer_missing_lanes = 0;
   bool buffer_residency_checked = false;
   bool buffer_tfe = false; ///< Include the extra PRT status VGPR when validating a buffer load.
@@ -404,10 +420,22 @@ public:
   // LDS stack inputs are snapshotted in store_data; the second-result slot returns
   // the stack pointer. Flags: bit 0 = RDNA4, bit 1 = triangle pairs, bit 2 = primitive ranges.
   uint8_t lds_stack_inputs = 0, lds_stack_size = 0, lds_stack_flags = 0;
+  /// M0 captured by indexed GDS instructions. The high half supplies the byte
+  /// base and the low half bounds accesses to the process's GDS allocation.
+  std::optional<uint32_t> gds_m0;
+  struct OrderedCount {
+    uint64_t result_lanes; ///< The allocated destination broadcasts independently of EXEC.
+    uint32_t address;
+    uint32_t value;
+    bool exchange;
+    bool release;
+  };
+  std::optional<OrderedCount> ordered_count;
 
+  bool ds_src2 = false; ///< Atomic operand read from ds2_per_lane_addr at issue.
   bool ds2_active = false;
   std::array<uint64_t, 64> ds2_per_lane_addr = {};
-  // Equal GFX10 DS offsets issue one LDS access, even when a READ2 or
+  // Equal GFX10 DS offsets issue one LDS/GDS access, even when a READ2 or
   // a returning exchange still has two logical VGPR destinations.
   [[nodiscard]] bool has_second_ds_access(rj_code_arch_t arch) const {
     return ds2_active && ((arch != ROCJITSU_CODE_ARCH_RDNA1 && arch != ROCJITSU_CODE_ARCH_RDNA2) ||
@@ -418,7 +446,7 @@ public:
   std::vector<uint8_t> ds2_store_data;
   std::vector<uint8_t> ds2_response_data;
   TranslatedMemoryProgress translated;
-  /// RDNA2 FLAT or SCRATCH lanes reporting MEM_VIOL on completion.
+  /// RDNA2 FLAT, SCRATCH or indexed GDS lanes reporting MEM_VIOL on completion.
   uint64_t address_range_violation_lanes = 0;
 
   /// Visit each transferred physical span in swizzled lanes, with its lane payload offset.
@@ -562,6 +590,8 @@ inline void prepare_lds_destination(VectorMemState &state, uint32_t allocation_b
   state.lds_base = allocation_base;
   state.lds_per_lane_addr = true;
   const auto allocation = LdsAllocationRange::from_size(allocation_base, allocation_size);
+  if (!state.is_load && !state.lds_dst)
+    state.lds_allocation = allocation; // LDS-to-buffer source, captured with its payload.
   state.per_lane_lds_addr.fill(kInvalidLdsAddress);
   for (uint32_t lane = 0; lane < state.wf_size; ++lane) {
     if (!(state.exec_mask & (uint64_t{1} << lane)))

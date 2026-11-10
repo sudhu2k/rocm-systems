@@ -41,9 +41,34 @@ enum class VmAccessOutcome : uint8_t;
 /// and a decrement before testing. Barrier arrivals use the participants-minus-one
 /// convention. GFX11 semaphore release-all preserves previously banked credits
 /// (Table 63); older modeled families assign the queued-wave count instead.
+/// RDNA 3.5 also shares a 4 KiB GDS allocation and streamout registers across CUs.
 class GwsDevice {
 public:
   static constexpr uint32_t kResourceCount = 64;
+  /// Execute one instruction against the process's device-wide 64 KiB GDS.
+  /// The same lock serializes RMW operations from independently scheduled CUs.
+  template <typename Access> void access_gds(uint32_t process_id, Access &&access) {
+    std::lock_guard lock(mutex_);
+    access(gds_.try_emplace(process_id, 64).first->second);
+  }
+
+  // GFX10 GDS_COMPUTE_MAX_WAVE_ID and the CS ordered-append SGPR term are 12 bits.
+  static constexpr uint32_t kComputeWaveIdMask = 0xfff;
+  /// Allocate SGPR launch terms in order on this compute ring.
+  uint32_t reserve_ordered_ids(uint32_t process_id, uint32_t queue_id, uint32_t count,
+                               uint32_t id_count = kComputeWaveIdMask + 1);
+  /// Return no value until the ring's logical wave is eligible.
+  std::optional<uint32_t> ordered_count(uint32_t process_id, uint32_t queue_id,
+                                        uint32_t logical_wave, uint32_t address, uint32_t value,
+                                        bool exchange, bool release);
+  /// Reset both ring counters. GDS memory survives queue teardown and an IB wave-ID reset.
+  void reset_ordered_ids(uint32_t process_id, uint32_t queue_id);
+
+  static constexpr uint32_t kGdsBytes = 4096;
+  static bool prepare_register_access(Wavefront &wf, VectorMemState &d, uint8_t offset0,
+                                      uint8_t offset1, uint32_t src, uint32_t dst, bool ordered,
+                                      bool subtract);
+  VmAccessOutcome execute_gds(VectorMemState &d, Wavefront &wf);
   void init(Wavefront &wf, uint32_t rid, uint32_t count);
   /// Returns false for a barrier on a resource that has not been initialized.
   bool barrier_arrive(ComputeUnitCore &cu, Wavefront &wf, uint32_t rid, uint32_t count);
@@ -60,9 +85,26 @@ public:
   bool any_parked() const { return parked_total_.load(std::memory_order_acquire) != 0; }
   /// Called only after the process's waves and queues have drained.
   void release_process(uint32_t process_id);
+  void retire_ordered_dispatch(uint32_t process_id, uint32_t queue_id, uint32_t dispatch_id);
   size_t tracked_process_count();
+  /// The checkpoint format omits GDS backing and the ordered-count wave walkers.
+  bool has_gds_checkpoint_state();
+
+  /// Whether an indexed GDS write materialized any process backing.
+  bool has_gds_data();
+
+  static constexpr uint32_t kGdsSizeKiB = 64;
+
+  /// RDNA2 indexed GDS shares the device and process lifetime of the GWS
+  /// resources. Serialize complete RMW operations across participating CUs.
 
 private:
+  struct DataShare {
+    Lds memory{kGdsBytes / 1024};
+    std::array<uint64_t, 16> streamout{};
+    std::unordered_map<uint64_t, uint16_t> ordered_walkers;
+  };
+  std::unordered_map<uint32_t, DataShare> data_shares_;
   struct Resource {
     uint32_t counter = 0; ///< Shared barrier remaining-count and semaphore credits.
     bool armed = false;
@@ -75,6 +117,13 @@ private:
   uint32_t poll_local_waiters(ComputeUnitCore &cu);
 
   std::mutex mutex_;
+  std::unordered_map<uint32_t, Lds> gds_;
+  struct OrderedRing {
+    uint32_t id_count = kComputeWaveIdMask + 1;
+    uint32_t next_launch = 0;
+    uint32_t oldest = 0;
+  };
+  std::unordered_map<uint32_t, std::unordered_map<uint32_t, OrderedRing>> ordered_rings_;
 
   std::unordered_map<uint32_t, std::array<Resource, kResourceCount>> resources_;
   std::unordered_map<uint32_t, uint32_t> parked_;

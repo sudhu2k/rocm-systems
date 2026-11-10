@@ -429,6 +429,10 @@ public:
   /// @brief Register the CP wakeup used when a pool-driven CU becomes runnable.
   void set_on_pool_ready(std::function<void()> cb) { on_pool_ready_ = std::move(cb); }
 
+  /// Wake resident waves sleeping in the issuer's workgroup.
+  void wake_sleeping_workgroup(const Wavefront &issuer,
+                               std::optional<int32_t> named_barrier = std::nullopt);
+
   struct TrapHandlerConfig {
     uint64_t tba = 0;
     uint64_t tma = 0;
@@ -455,9 +459,20 @@ public:
   }
 
   /// @brief Deliver a scalar message with its issuing wave and live M0/EXEC payload.
+  /// Bind a functional graphics export destination. Completion is synchronous.
+  using ShaderExportHandler = std::function<void(const Wavefront &, const ShaderExport &)>;
+  void set_shader_export_handler(ShaderExportHandler handler) {
+    shader_export_handler_ = std::move(handler);
+  }
   [[nodiscard]] std::optional<TrapHandlerConfig> trap_handler_config(const Wavefront &wf) const {
     return trap_handler_resolver_ ? trap_handler_resolver_(wf) : std::nullopt;
   }
+
+  using ThreadTraceDataHandler = std::function<void(const Wavefront &, uint32_t)>;
+  void set_thread_trace_data_handler(ThreadTraceDataHandler handler) {
+    shader_trace_handler_ = std::move(handler);
+  }
+  const std::array<uint32_t, 16> &performance_levels() const { return shader_perf_levels_; }
 
   using DoorbellResolver = std::function<std::optional<uint32_t>(const Wavefront &)>;
   void set_doorbell_resolver(DoorbellResolver resolver) {
@@ -472,6 +487,12 @@ public:
   bool handle_sendmsg(Wavefront &wf, uint32_t message) {
     return sendmsg_handler_ && sendmsg_handler_(wf, message);
   }
+
+  using ShaderTraceHandler = std::function<void(const Wavefront &, uint32_t)>;
+  void set_shader_trace_handler(ShaderTraceHandler handler) {
+    shader_trace_handler_ = std::move(handler);
+  }
+  uint32_t shader_perf_level(uint32_t id) const { return shader_perf_levels_.at(id); }
 
   using QueueExceptionHandler = std::function<bool(
       uint32_t queue_id, uint32_t process_id, uint64_t status, bool retain_failure_for_debugger,
@@ -1820,6 +1841,13 @@ protected:
   bool external_trap_resolver_ = false;
   bool external_trap_updater_ = false;
   bool external_sendmsg_handler_ = false;
+  ShaderTraceHandler shader_trace_handler_;
+  std::array<uint32_t, 16> shader_perf_levels_{};
+  // A GFX10 clause reserves only its own issue type while another wave can
+  // continue issuing instructions of every other type.
+  std::array<Wavefront *, 6> clause_owners_{};
+  bool can_issue_clause_member(Wavefront &wave, const Instruction &inst, uint32_t encoding);
+  ShaderExportHandler shader_export_handler_;
   QueueExceptionHandler queue_exception_handler_;
   TrapCompletionHandler trap_completion_handler_;
   SingleStepHandler single_step_handler_;
@@ -2081,6 +2109,11 @@ inline uint64_t InstructionComputeUnitView::shader_cycles() const {
 
 inline bool InstructionComputeUnitView::handle_sendmsg(Wavefront &wf, uint32_t message) {
   return raw_cu().handle_sendmsg(wf, message);
+}
+inline void
+InstructionComputeUnitView::wake_sleeping_workgroup(const Wavefront &issuer,
+                                                    std::optional<int32_t> named_barrier) {
+  raw_cu().wake_sleeping_workgroup(issuer, named_barrier);
 }
 
 inline void InstructionComputeUnitView::notify_trap_complete(Wavefront &wf) {

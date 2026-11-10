@@ -101,6 +101,9 @@ public:
                      MemoryOrderClass currentMemoryOrder = MemoryOrderClass::LDS,
                      uint8_t atomicBytes = 0) const;
 
+  /// SRC2 reads a second LDS operand and updates its first address atomically.
+  /// Both ranges share the issuing instruction's wait and barrier lifetime.
+  void attachSrc2Source(EventId id, IntervalSet sourceReads);
 
   /// True only when the complete access lies in the CU's logical LDS backing.
   bool validLdsRange(uint64_t address, uint64_t bytes) const {
@@ -162,6 +165,11 @@ private:
                                       const std::vector<LdsChunkCounts> &counts, WaveId wave,
                                       MemoryOrderClass currentMemoryOrder);
 
+  struct Src2Event {
+    EventId id;
+    IntervalSet sourceReads;
+  };
+  std::vector<Src2Event> src2Events;
 
   /// Active LDS write events (for scanning during read validation).
   std::vector<EventId> ldsWriteEvents;

@@ -139,6 +139,8 @@ enum InstFlags : uint64_t {
   /// @brief The memory result requires one additional allocated VGPR which it never writes.
   /// A dropped texture fetch with TFE and no LWE checks this slot at issue.
   RESERVES_UNWRITTEN_VGPR = (1ULL << 39),
+  /// Ordinary indexed GFX11 GDS reads inputs and writes results in the first active lane.
+  FIRST_ACTIVE_MEMORY_LANE = (1ULL << 40),
   /// Global transpose addresses come from lanes 0-31. Each wave64 lane gets half the encoded width.
   COMPACT_WAVE64_MEMORY_RESULT = (1ULL << 41),
   /// Global load-transpose instructions acquire no register operands when EXEC is zero.

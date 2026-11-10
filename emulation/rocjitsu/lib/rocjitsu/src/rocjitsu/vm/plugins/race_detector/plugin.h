@@ -73,6 +73,8 @@ struct RaceWavefrontState : WavefrontState {
   /// a copy of its encoding, so reports can disassemble it after the code is
   /// rewritten or unmapped.
   RingBuffer<InstructionSnapshot, 256> trace;
+  // A retry stalls the wave, so a cancelled routed issue precedes its next instruction.
+  EventId routed_lds_source_event;
   WaveRaceState *race_state = nullptr;
   struct LdsOperandRead {
     uint32_t address;
@@ -97,7 +99,8 @@ class RaceDetectorPlugin : public ExecutionPlugin,
                            public AmdgpuImageFeedbackObserver,
                            public AmdgpuTrapEntryObserver,
                            public AmdgpuImplicitMemoryWaitObserver,
-                           public AmdgpuLdsDirectReadObserver {
+                           public AmdgpuLdsDirectReadObserver,
+                           public AmdgpuMemoryIssueCancellationObserver {
 public:
   /// @param config_json Plugin configuration object as a JSON string (unused;
   ///        this plugin takes no configuration). May be null.
@@ -127,6 +130,8 @@ public:
   void onAmdgpuImageFeedbackQualified(const Instruction &inst, amdgpu::Wavefront &wf) override;
   void onAmdgpuMemoryAccessRouted(const amdgpu::MemoryAccessObservation &access,
                                   const Instruction &inst, amdgpu::Wavefront &wf) override;
+
+  void onAmdgpuMemoryIssueCancelled(const Instruction &inst, amdgpu::Wavefront &wf) override;
 
   void onAmdgpuLdsDirectRead(const amdgpu::Wavefront &wf, uint32_t address, uint32_t bytes,
                              uint32_t lane) override;

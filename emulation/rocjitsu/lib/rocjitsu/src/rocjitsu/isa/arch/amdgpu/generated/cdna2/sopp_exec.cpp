@@ -27,7 +27,7 @@ void SBranchSopp::execute_impl(amdgpu::Wavefront &wf) {
   wf.pc = wf.pc + 4 + static_cast<int64_t>(offset) * 4 - size_;
 }
 
-void SWakeupSopp::execute_impl(amdgpu::Wavefront &wf) { amdgpu::execute_s_wakeup_sopp(*this, wf); }
+void SWakeupSopp::execute_impl(amdgpu::Wavefront &wf) { wf.cu().wake_sleeping_workgroup(wf); }
 
 void SCbranchScc0Sopp::execute_impl(amdgpu::Wavefront &wf) {
   if (!wf.read_scc()) {
@@ -90,7 +90,7 @@ void SWaitcntSopp::execute_impl(amdgpu::Wavefront &wf) {
 }
 
 void SSethaltSopp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_s_sethalt_sopp(*this, wf);
+  wf.set_shader_halt(simm16.encoding_value_);
 }
 
 void SSleepSopp::execute_impl(amdgpu::Wavefront &wf) {
@@ -101,7 +101,7 @@ void SSleepSopp::execute_impl(amdgpu::Wavefront &wf) {
 }
 
 void SSetprioSopp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_s_setprio_sopp(*this, wf);
+  wf.set_user_priority(simm16.encoding_value_);
 }
 
 void SSendmsgSopp::execute_impl(amdgpu::Wavefront &wf) {
@@ -136,32 +136,38 @@ void SIcacheInvSopp::execute_impl(amdgpu::Wavefront &wf) {
   amdgpu::execute_s_icache_inv_sopp(*this, wf);
 }
 
-void SIncperflevelSopp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_s_incperflevel_sopp(*this, wf);
-}
+void SIncperflevelSopp::execute_impl(amdgpu::Wavefront &wf) { (void)wf; }
 
-void SDecperflevelSopp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_s_decperflevel_sopp(*this, wf);
-}
+void SDecperflevelSopp::execute_impl(amdgpu::Wavefront &wf) { (void)wf; }
 
-void STtracedataSopp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_s_ttracedata_sopp(*this, wf);
-}
+void STtracedataSopp::execute_impl(amdgpu::Wavefront &wf) { (void)wf; }
 
 void SCbranchCdbgsysSopp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_s_cbranch_cdbgsys_sopp(*this, wf);
+  if ((wf.status_raw() & (1u << 21)) != 0) {
+    int16_t offset = static_cast<int16_t>(simm16.encoding_value_);
+    wf.pc = wf.pc + 4 + static_cast<int64_t>(offset) * 4 - size_;
+  }
 }
 
 void SCbranchCdbguserSopp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_s_cbranch_cdbguser_sopp(*this, wf);
+  if ((wf.status_raw() & (1u << 20)) != 0) {
+    int16_t offset = static_cast<int16_t>(simm16.encoding_value_);
+    wf.pc = wf.pc + 4 + static_cast<int64_t>(offset) * 4 - size_;
+  }
 }
 
 void SCbranchCdbgsysOrUserSopp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_s_cbranch_cdbgsys_or_user_sopp(*this, wf);
+  if ((wf.status_raw() & (3u << 20)) != 0) {
+    int16_t offset = static_cast<int16_t>(simm16.encoding_value_);
+    wf.pc = wf.pc + 4 + static_cast<int64_t>(offset) * 4 - size_;
+  }
 }
 
 void SCbranchCdbgsysAndUserSopp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_s_cbranch_cdbgsys_and_user_sopp(*this, wf);
+  if ((wf.status_raw() & (3u << 20)) == (3u << 20)) {
+    int16_t offset = static_cast<int16_t>(simm16.encoding_value_);
+    wf.pc = wf.pc + 4 + static_cast<int64_t>(offset) * 4 - size_;
+  }
 }
 
 void SEndpgmSavedSopp::execute_impl(amdgpu::Wavefront &wf) { wf.end(); }

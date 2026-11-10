@@ -98,6 +98,16 @@ struct WaveExceptionRegisters {
   gfx12_trap_ctrl: uint32;
 }
 
+/// One graphics export buffer row and its four component values per wave lane.
+table ShaderExportRow {
+  target: ubyte;
+  row: ubyte;
+  components: ubyte;
+  done: bool;
+  valid_lanes: uint64;
+  values: [uint32] (required);
+}
+
 table WavefrontState {
   wf_id: uint32;
   wg_id: uint32;
@@ -175,6 +185,7 @@ table WavefrontState {
   // Non-RDNA2 waves distinguish direct memory from the standalone VM's identity mapping.
   // Older records with process-owned GFX12 work cannot establish which mapping was used.
   uses_internal_address_space: bool = null;
+  shader_exports: [ShaderExportRow];
 }
 
 /// A formerly multiwave group retains its barriers even with one live member.

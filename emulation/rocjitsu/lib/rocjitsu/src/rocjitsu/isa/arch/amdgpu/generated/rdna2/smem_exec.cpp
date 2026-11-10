@@ -230,5 +230,21 @@ void SMemrealtimeSmem::execute_impl(amdgpu::Wavefront &wf) {
   amdgpu::write_scalar_selector(wf, dst_sel + 1, static_cast<uint32_t>(counter >> 32));
 }
 
+void SAtcProbeSmem::execute_impl(amdgpu::Wavefront &wf) {
+  amdgpu::ScalarMemState request;
+  request.num_dwords = 1;
+  auto address = smem_calculate_address(inst_, wf, &request);
+  if (address && request.load_dword_mask)
+    wf.cu().l1_scalar().prefetch(*address, wf.process_id());
+}
+
+void SAtcProbeBufferSmem::execute_impl(amdgpu::Wavefront &wf) {
+  amdgpu::ScalarMemState request;
+  request.num_dwords = 1;
+  auto address = smem_calculate_address(inst_, wf, &request);
+  if (address && request.load_dword_mask)
+    wf.cu().l1_scalar().prefetch(*address, wf.process_id());
+}
+
 } // namespace rdna2
 } // namespace rocjitsu

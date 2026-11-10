@@ -77,6 +77,10 @@ protected:
   }
   void scalar(unsigned reg, uint32_t value) { cu->write_sgpr(wf->sgpr_alloc().base + reg, value); }
 
+  static constexpr uint32_t gds(uint32_t opcode, uint16_t offsets = 0) {
+    return 0xd8020000u | (opcode << 18) | offsets;
+  }
+
   std::shared_ptr<GwsDevice> device = std::make_shared<GwsDevice>();
   GpuMemory memory{"rdna35_memory"};
   L2Cache l2{"rdna35_l2"};
@@ -310,6 +314,8 @@ TEST_F(Rdna35MemoryTest, BufferTfePreservesResidentDwordsAndReportsMissingPages)
   EXPECT_EQ(result(0, 1), 17u);
   EXPECT_EQ(result(1, 1), 0u);
   EXPECT_EQ(result(2, 1), 1u);
+  scalar(0, 0x50000);
+  issue(0xf4880000, 0x0a000000); // Unmapped ATC probe drops without a VM fault.
   EXPECT_EQ(faults, 0u);
   wf->set_address_space({});
   cu->set_gpu_vm(nullptr);
@@ -340,5 +346,294 @@ TEST_F(Rdna35MemoryTest, FlatIgnoresOffsetBitTwelve) {
   issue(0xdc501000, 0x007c0002); // flat_load_b32 v0, v[2:3], raw offset 0x1000
   EXPECT_EQ(result(), 41u);
 }
+TEST_F(Rdna35MemoryTest, AtcProbesWarmResidentScalarLinesWithoutReadingBackingOnMiss) {
+  constexpr uint64_t address = 0x80040;
+  uint32_t a = 17;
+  memory.write32(address, a);
+  std::array<uint8_t, 64> line{};
+  ASSERT_EQ(l2.read(address, line.data(), line.size(), Mtype::RW), VmAccessOutcome::Complete);
+  const uint64_t reads = l2.backing_read_transactions();
+  scalar(0, address - 64);
+  scalar(1, 0);
+  scalar(2, 128);
+  scalar(5, 64);
+  issue(0xf4880000, 0x0a000000); // s_atc_probe 0, s[0:1], s5
+  EXPECT_EQ(l2.backing_read_transactions(), reads);
+  a = 29;
+  ASSERT_EQ(l2.write(address, reinterpret_cast<uint8_t *>(&a), sizeof(a), Mtype::RW),
+            VmAccessOutcome::Complete);
+  issue(0xf4000100, 0x0a000000); // s_load_b32 s4, s[0:1], s5
+  EXPECT_EQ(cu->read_sgpr(wf->sgpr_alloc().base + 4), 17u);
+
+  cu->l1_scalar().invalidate_all();
+  issue(0xf48c0000, 0x0a000000); // s_atc_probe_buffer 0, s[0:3], s5
+  a = 43;
+  ASSERT_EQ(l2.write(address, reinterpret_cast<uint8_t *>(&a), sizeof(a), Mtype::RW),
+            VmAccessOutcome::Complete);
+  issue(0xf4000100, 0x0a000000);
+  EXPECT_EQ(cu->read_sgpr(wf->sgpr_alloc().base + 4), 29u);
+
+  scalar(5, 0x40000);
+  const uint64_t before = l2.backing_read_transactions();
+  issue(0xf4880000, 0x0a000000);
+  issue(0xf48c0000, 0x0a000000);
+  EXPECT_EQ(l2.backing_read_transactions(), before);
+}
+
+TEST_F(Rdna35MemoryTest, GdsSharesBytesAcrossCusAndUsesFirstLaneExceptAppend) {
+  std::unique_ptr<ComputeUnitCore> peer_cu;
+  ASSERT_NO_FATAL_FAILURE(make_cu(peer_cu));
+  auto *peer = peer_cu->dispatch_wf(1, 0, 106, 32, 32);
+  ASSERT_NE(peer, nullptr);
+  wf->set_exec(0xa);
+  wf->set_m0((64u << 16) | 8);
+  peer->set_m0(wf->m0());
+  peer->set_exec(1);
+  vector(2, 0, 1);
+  vector(2, 4, 3);
+  vector(3, 41, 1);
+  vector(3, 99, 3);
+  wf->lds().write32(64, 17);
+  issue(gds(13), 0x302);                 // ds_store_b32 v2, v3 gds
+  issue_on(*peer_cu, *peer, gds(54), 2); // ds_load_b32 v0, v2 gds
+  EXPECT_EQ(peer_cu->read_vgpr(peer->vgpr_alloc().base, 0), 41u);
+  EXPECT_EQ(wf->lds().read32(64), 17u);
+  peer_cu->write_vgpr(peer->vgpr_alloc().base + 2, 0, 4);
+  issue_on(*peer_cu, *peer, gds(54), 2);
+  EXPECT_EQ(peer_cu->read_vgpr(peer->vgpr_alloc().base, 0), 0u);
+
+  vector(0, 0xdeadbeef, 3);
+  issue(gds(54), 2);
+  EXPECT_EQ(result(0, 1), 41u);
+  EXPECT_EQ(result(0, 3), 0xdeadbeefu); // Ordinary GDS writes only its first enabled lane.
+  issue(gds(62), 0); // ds_append v0 gds, counts both EXEC bits and broadcasts old value.
+  EXPECT_EQ(result(0, 1), 41u);
+  EXPECT_EQ(result(0, 3), 41u);
+  vector(3, 1, 1);
+  issue(gds(32), 0x302); // ds_add_rtn_u32 v0,v2,v3 gds
+  EXPECT_EQ(result(0, 1), 43u);
+  wf->set_m0((64u << 16) | 3);
+  issue(gds(54), 2);
+  EXPECT_EQ(result(0, 1), 0u); // Only three bytes in the M0 allocation.
+  wf->set_m0((64u << 16) | 8);
+  vector(2, 1, 1);
+  issue(gds(32), 0x302, VmAccessOutcome::Faulted);
+
+  peer->set_process_id(wf->process_id() + 1);
+  peer_cu->write_vgpr(peer->vgpr_alloc().base + 2, 0, 0);
+  issue_on(*peer_cu, *peer, gds(54), 2);
+  EXPECT_EQ(peer_cu->read_vgpr(peer->vgpr_alloc().base, 0), 0u);
+  peer->halt();
+}
+
+TEST_F(Rdna35MemoryTest, StreamoutRegistersPreserveIssueLanesWithoutReportingGdsBytes) {
+  using test::execution_plugin::MemoryObservationPlugin;
+  auto group = std::make_shared<ExecutionPluginGroup>(PluginSinkConfig{});
+  auto plugin = std::make_unique<MemoryObservationPlugin>(true);
+  auto *observer = plugin.get();
+  ASSERT_TRUE(group->add(std::move(plugin)));
+  cu->set_plugin_group(group);
+  wf->set_exec(0xa);
+  vector(3, 7, 1);
+  for (auto [opcode, offset] : {std::pair{122u, 4u}, {123u, 32u}}) {
+    observer->accesses.clear();
+    ASSERT_NO_FATAL_FAILURE(issue(gds(opcode, offset), 0x08000300));
+    ASSERT_EQ(observer->accesses.size(), 1u);
+    const auto &access = observer->accesses.front();
+    EXPECT_EQ(access.decoded_space, DecodedMemorySpace::GDS);
+    EXPECT_EQ(access.active_lane_mask, 2u);
+    EXPECT_EQ(access.architectural_exec_lane_mask, 0xau);
+    EXPECT_EQ(access.wait_counter, WaitCounterType::DSCNT);
+    EXPECT_EQ(access.valid_lane_mask, 0u);
+    EXPECT_EQ(access.request_lane_mask, 0u);
+    EXPECT_EQ(access.element_size_bytes, 0u);
+    EXPECT_TRUE(access.addresses.empty());
+  }
+  observer->accesses.clear();
+  wf->set_m0(32);
+  vector(2, 16, 1);
+  ASSERT_NO_FATAL_FAILURE(issue(gds(54), 0x08000002)); // ds_read_b32 gds
+  ASSERT_EQ(observer->accesses.size(), 1u);
+  const auto &byte_access = observer->accesses.front();
+  EXPECT_EQ(byte_access.request_lane_mask, 2u);
+  ASSERT_GT(byte_access.addresses.size(), 1u);
+  EXPECT_EQ(byte_access.addresses[1], 16u);
+}
+
+TEST_F(Rdna35MemoryTest, StreamoutRegisterAtomicsUseUnsignedSourcesAndSelectedWidth) {
+  vector(3, UINT32_MAX);
+  issue(gds(122, 32), 0x300); // ds_add_gs_reg_rtn v[0:1], v3, register 8
+  EXPECT_EQ(result(), 0u);
+  EXPECT_EQ(result(1), 0u);
+  vector(3, 2);
+  issue(gds(122, 32), 0x300);
+  EXPECT_EQ(result(), UINT32_MAX);
+  issue(gds(123, 32), 0x300);
+  EXPECT_EQ(result(), 1u);
+  EXPECT_EQ(result(1), 1u);
+  vector(1, 0xdeadbeef);
+  issue(gds(123, 16), 0x300); // Lower bank returns a single VGPR.
+  EXPECT_EQ(result(), 0u);
+  EXPECT_EQ(result(1), 0xdeadbeefu);
+  vector(3, 0);
+  issue(gds(122, 16), 0x300);
+  EXPECT_EQ(result(), UINT32_MAX - 1);
+  vector(3, 9);
+  issue(gds(122, 32), 0x1f000300); // v[31:32] is outside this wave.
+  issue(gds(122, 32), 0x300);
+  EXPECT_EQ(result(), UINT32_MAX);
+  EXPECT_EQ(result(1), 0u);
+}
+
+TEST_F(Rdna35MemoryTest, EmptyOrderedCountKeepsCounterAndAdvancesWalker) {
+  unsigned id = 0;
+  const auto ordered = [&](uint16_t opcode, uint64_t exec, uint32_t value) {
+    wf->set_m0(id++);
+    wf->set_exec(exec);
+    vector(2, value);
+    issue(gds(63, 0x310 | (opcode << 12)), 2);
+    EXPECT_EQ(wf->state(), WfState::RUNNING);
+  };
+  ASSERT_NO_FATAL_FAILURE(ordered(0, 1, 17));
+  for (const auto opcode : {0u, 1u, 3u}) {
+    ASSERT_NO_FATAL_FAILURE(ordered(opcode, 0, 91));
+    ASSERT_NO_FATAL_FAILURE(ordered(0, 1, 0));
+    EXPECT_EQ(result(), 17u);
+  }
+  ASSERT_NO_FATAL_FAILURE(ordered(1, 1, 9));
+  EXPECT_EQ(result(), 17u);
+  ASSERT_NO_FATAL_FAILURE(ordered(0, 1, 0));
+  EXPECT_EQ(result(), 9u);
+  wf->set_m0(id);
+  wf->set_exec(1);
+  const std::array wrap{gds(63, 0x3310), 2u};
+  auto decoded = decoder->decode_window(wrap);
+  ASSERT_TRUE(decoded.succeeded());
+  EXPECT_TRUE(cu->execute_instruction(decoded.value().get(), *wf).failed());
+  EXPECT_EQ(wf->instruction_execution_error(), InstructionExecutionError::UnsupportedOperandValue);
+  ASSERT_NO_FATAL_FAILURE(ordered(0, 1, 0));
+  EXPECT_EQ(result(), 9u);
+}
+
+TEST_F(Rdna35MemoryTest, DebuggerTreatsAtcProbesAsNonfaultingHints) {
+  constexpr uint32_t kernel = 0x1000, readable = 0x40000, hole = 0x50000;
+  class ReadOnlyData final : public AddressSpaceTranslator {
+    IdentityAddressSpaceTranslator identity;
+    VmTranslationResult translate(uint64_t address, size_t size,
+                                  VmAccessKind access) const override {
+      if (address >= 0x50000 || (address >= 0x40000 && access == VmAccessKind::Write))
+        return {.outcome = VmAccessOutcome::Faulted, .translation = {}};
+      return identity.translate(address, size, access);
+    }
+  };
+  GpuVm vm;
+  const auto handle = vm.register_address_space(1, std::make_shared<ReadOnlyData>(),
+                                                std::make_shared<GpuMemoryPhysicalAccess>(memory));
+  ASSERT_TRUE(handle);
+  cu->set_gpu_vm(&vm);
+  wf->set_address_space(handle);
+  const auto snapshot = wf->snapshot_vm_access();
+  ASSERT_TRUE(snapshot);
+  EXPECT_EQ(snapshot->query_access(readable, 4, VmAccessKind::Write), VmAccessOutcome::Faulted);
+  scalar(1, 0);
+  scalar(2, 64);
+  scalar(3, 0);
+  scalar(5, 0);
+  memory.write32(readable, 42);
+  const std::array code{0xf4880000u, 0x0a000000u,  // s_atc_probe
+                        0xf48c0000u, 0x0a000000u,  // s_atc_probe_buffer
+                        0xf4000100u, 0x0a000000u}; // s_load_b32 s4
+  memory.load_image(reinterpret_cast<const uint8_t *>(code.data()), sizeof(code), kernel);
+  std::vector<std::pair<uint64_t, bool>> faults;
+  std::vector<uint64_t> watches;
+  cu->set_debug_active(true);
+  cu->set_memory_violation_handler([&](Wavefront &, uint64_t addr, bool write, uint64_t) {
+    faults.emplace_back(addr, write);
+    return true;
+  });
+  cu->set_watchpoint_handler([&](Wavefront &, uint64_t addr, uint32_t, bool, bool) {
+    watches.push_back(addr);
+    return false;
+  });
+  for (const uint32_t address : {readable, hole}) {
+    scalar(0, address);
+    for (size_t i = 0; i < code.size(); i += 2) {
+      SCOPED_TRACE(testing::Message() << address << "/" << i);
+      faults.clear();
+      watches.clear();
+      wf->pc = kernel + 4 * i;
+      ASSERT_TRUE(cu->step());
+      const bool load = i == 4;
+      EXPECT_EQ(faults.size(), load && address == hole ? 1u : 0u);
+      if (!faults.empty()) {
+        EXPECT_EQ(faults.front(), std::make_pair(uint64_t{address}, false));
+      }
+      EXPECT_EQ(watches.size(), load && address == readable ? 1u : 0u);
+      if (!watches.empty()) {
+        EXPECT_EQ(watches.front(), address);
+      }
+      if (load && address == readable) {
+        EXPECT_EQ(cu->read_sgpr(wf->sgpr_alloc().base + 4), 42u);
+      }
+    }
+  }
+  cu->set_debug_active(false);
+  wf->set_address_space({});
+  cu->set_gpu_vm(nullptr);
+}
+
+TEST_F(Rdna35MemoryTest, OrderedCountDefersYoungerWaveAndCommitsOnce) {
+  std::unique_ptr<ComputeUnitCore> peer_cu;
+  ASSERT_NO_FATAL_FAILURE(make_cu(peer_cu));
+  auto *older = peer_cu->dispatch_wf(1, 0, 106, 32, 32);
+  ASSERT_NE(older, nullptr);
+  older->set_exec(0);
+  older->set_m0(0);
+  wf->set_m0(1); // Logical wave 1 arrives before logical wave 0.
+  vector(2, 7);
+  vector(0, 0xdeadbeef);
+  wf->set_exec(0xf);
+  vector(2, 99, 1);
+  vector(0, 0xcafefeed, 1);
+  issue(gds(63, 0xc310), 2); // GFX11 ignores the old GFX10 DWORD-count bits.
+  EXPECT_EQ(wf->state(), WfState::VM_RETRY);
+  EXPECT_EQ(result(), 0xdeadbeefu);
+  peer_cu->write_vgpr(older->vgpr_alloc().base + 2, 0, 99);
+  issue_on(*peer_cu, *older, gds(63, 0x310), 2); // Empty EXEC adds zero and advances.
+  test::ComputeUnitTestAccess::tick_memory_pipelines(*cu);
+  EXPECT_EQ(wf->state(), WfState::RUNNING);
+  EXPECT_EQ(result(), 0u);
+  EXPECT_EQ(result(0, 1), 0xcafefeedu);
+  vector(3, 0);
+  issue(gds(122, 16), 0x300);
+  EXPECT_EQ(result(), 7u);
+
+  wf->set_m0(3); // Wave 2 never arrives: cancel 3 while its write is pending.
+  issue(gds(63, 0x310), 2);
+  EXPECT_EQ(wf->state(), WfState::VM_RETRY);
+  const uint32_t pid = wf->process_id();
+  const uint32_t qid = wf->queue_id();
+  const uint32_t dispatch = wf->dispatch_id();
+  cu->abort_dispatch(dispatch);
+  wf = nullptr;
+  device->retire_ordered_dispatch(pid, qid, dispatch);
+  test::ComputeUnitTestAccess::tick_memory_pipelines(*cu);
+  older->set_exec(1);
+  older->set_m0(0);
+  peer_cu->write_vgpr(older->vgpr_alloc().base + 2, 0, 9);
+  issue_on(*peer_cu, *older, gds(63, 0x1310), 2); // Exchange after counter-walker reset.
+  EXPECT_EQ(older->state(), WfState::RUNNING);
+  EXPECT_EQ(peer_cu->read_vgpr(older->vgpr_alloc().base, 0), 7u);
+  older->halt();
+  device->release_process(pid);
+  auto *replacement = peer_cu->dispatch_wf(1, 0, 106, 32, 32);
+  ASSERT_NE(replacement, nullptr);
+  replacement->set_exec(1);
+  peer_cu->write_vgpr(replacement->vgpr_alloc().base + 3, 0, 0);
+  issue_on(*peer_cu, *replacement, gds(122, 16), 0x300);
+  EXPECT_EQ(peer_cu->read_vgpr(replacement->vgpr_alloc().base, 0), 0u);
+  replacement->halt();
+}
+
 } // namespace
 } // namespace rocjitsu

@@ -2171,7 +2171,39 @@ class Cdna2Profile(CdnaProfile):
     def semantic_overrides(self) -> dict[str, tuple[str, ...]]:
         return {
             **super().semantic_overrides,
+            'BUFFER_STORE_LDS_DWORD': ('buffer_store_from_lds', '', ''),
+            'BUFFER_INVL2': ('gl2_inv', '', ''),
+            'S_RFE_RESTORE_B64': ('trap_return', '', ''),
+            'S_SETHALT': ('sethalt', '', ''),
+            'S_SETPRIO': ('setprio', '', ''),
+            'S_WAKEUP': ('wakeup', '', ''),
         }
+
+    # MI200 adds row broadcasts to its double-precision ALU. LLVM's gfx90a
+    # assembler also exposes the five unary forms omitted by the base XML.
+    def dpp_opcode_rule(
+        self, enc_name: str, inst_name: str, *, src0_size_bits: int | None = None
+    ) -> DppOpcodeRule:
+        if enc_name == 'ENC_VOP1' and _opcode_uses_64bit_data(inst_name):
+            return DppOpcodeRule.ROW_SELECT_ONLY
+        return super().dpp_opcode_rule(
+            enc_name, inst_name, src0_size_bits=src0_size_bits
+        )
+
+    def supports_dpp_opcode(
+        self, enc_name: str, inst_name: str, *, has_modifier_encoding: bool
+    ) -> bool:
+        if enc_name == 'ENC_VOP1' and inst_name in {
+            'V_CVT_F64_F32',
+            'V_RNDNE_F64',
+            'V_RCP_F64',
+            'V_RSQ_F64',
+            'V_SQRT_F64',
+        }:
+            return True
+        return super().supports_dpp_opcode(
+            enc_name, inst_name, has_modifier_encoding=has_modifier_encoding
+        )
 
     legacy_flat_lds = True
     scratch_has_vaddr_expr = 'inst_.saddr == 0x7F'
@@ -2259,6 +2291,9 @@ class Rdna1Profile(_AmdgpuProfileBase):
     """
 
     semantic_class_overrides = {
+        'DS_ORDERED_COUNT': 'ds_ordered_count',
+        'S_ATC_PROBE': 'smem_atc_probe',
+        'S_ATC_PROBE_BUFFER': 'smem_atc_probe',
     }
 
     @property
@@ -2282,6 +2317,10 @@ class Rdna1Profile(_AmdgpuProfileBase):
     ) -> bool:
         # The XML spells the unmodified VOP3 relative-move form as a
         # conjunction of negative modifier conditions rather than "default".
+        if enc_name == 'ENC_VOP3' and enc_cond == (
+            'Nothas_dpp16_Nothas_dpp8_Nothas_lit_0_Nothas_lit_1_Nothas_lit_2'
+        ):
+            return False
         return super().skip_inst_encoding(
             enc_name, enc_cond, unique_segment_opcode=unique_segment_opcode
         )
@@ -2422,6 +2461,10 @@ class Rdna2Profile(Rdna1Profile):
         self, enc_name: str, enc_cond: str, *, unique_segment_opcode: bool = False
     ) -> bool:
         # The three relative-source moves use this spelling for their plain VOP3 form.
+        if enc_name == 'ENC_VOP3' and enc_cond == (
+            'Nothas_dpp16_Nothas_dpp8_Nothas_lit_0_Nothas_lit_1_Nothas_lit_2'
+        ):
+            return False
         return super().skip_inst_encoding(
             enc_name, enc_cond, unique_segment_opcode=unique_segment_opcode
         )
@@ -2751,6 +2794,11 @@ class Rdna3_5Profile(Rdna3Profile):
     def semantic_class_overrides(self) -> dict[str, str]:
         return {
             **super().semantic_class_overrides,
+            'DS_ADD_GS_REG_RTN': 'ds_gs_reg',
+            'DS_SUB_GS_REG_RTN': 'ds_gs_reg',
+            'DS_ORDERED_COUNT': 'ds_ordered_count',
+            'S_ATC_PROBE': 'atc_probe',
+            'S_ATC_PROBE_BUFFER': 'atc_probe',
         }
 
     @property
@@ -2800,15 +2848,6 @@ class Rdna4Profile(_AmdgpuProfileBase):
     - VOPDXY dual-opcode format: same parser issue as RDNA3, handled by
       ``gen_vopd`` after normal instruction generation skips it.
     """
-
-    @property
-    def semantic_overrides(self) -> dict[str, tuple[str, ...]]:
-        return {
-            **super().semantic_overrides,
-            'S_BARRIER_SIGNAL': ('true_nop', '', ''),
-            'S_BARRIER_SIGNAL_ISFIRST': ('true_nop', '', ''),
-            'S_BARRIER_WAIT': ('barrier', '', ''),
-        }
 
     _SKIP_DPP_SDWA = True
     _SKIP = frozenset({'VOPDXY', 'VOPDXY_INST_LITERAL'})
@@ -3141,17 +3180,6 @@ class Cdna5Profile(Rdna4Profile):
     logical target used by parser/codegen rules while generated and handwritten
     C++ lives under ``amdgpu/cdna5`` in the ``cdna5`` namespace.
     """
-
-    @property
-    def semantic_overrides(self) -> dict[str, tuple[str, ...]]:
-        overrides = dict(super().semantic_overrides)
-        for mnemonic in (
-            'S_BARRIER_SIGNAL',
-            'S_BARRIER_SIGNAL_ISFIRST',
-            'S_BARRIER_WAIT',
-        ):
-            overrides.pop(mnemonic, None)
-        return overrides
 
     flat_saddr_null_aliases = ()
 

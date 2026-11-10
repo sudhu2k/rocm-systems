@@ -28,6 +28,13 @@
 
 namespace rocjitsu {
 
+/// Optional notification that an already routed memory issue was withdrawn before wave resumption.
+class AmdgpuMemoryIssueCancellationObserver {
+public:
+  virtual ~AmdgpuMemoryIssueCancellationObserver() = default;
+  virtual void onAmdgpuMemoryIssueCancelled(const Instruction &inst, amdgpu::Wavefront &wf) = 0;
+};
+
 /// Observes conditional image returns after translation succeeds, before shader execution resumes.
 class AmdgpuImageFeedbackObserver {
 public:

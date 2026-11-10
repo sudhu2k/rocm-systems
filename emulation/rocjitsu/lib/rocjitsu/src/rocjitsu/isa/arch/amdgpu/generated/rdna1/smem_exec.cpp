@@ -287,13 +287,24 @@ void SMemrealtimeSmem::execute_impl(amdgpu::Wavefront &wf) {
   amdgpu::write_scalar_selector(wf, dst_sel + 1, static_cast<uint32_t>(counter >> 32));
 }
 
-void SAtcProbeSmem::execute_impl(amdgpu::Wavefront &wf) { (void)wf; }
+void SAtcProbeSmem::execute_impl(amdgpu::Wavefront &wf) {
+  amdgpu::ScalarMemState request;
+  request.num_dwords = 1;
+  auto address = smem_calculate_address(inst_, wf, &request);
+  if (address && request.load_dword_mask)
+    wf.cu().l1_scalar().prefetch(*address, wf.process_id());
+}
 
-void SAtcProbeBufferSmem::execute_impl(amdgpu::Wavefront &wf) { (void)wf; }
+void SAtcProbeBufferSmem::execute_impl(amdgpu::Wavefront &wf) {
+  amdgpu::ScalarMemState request;
+  request.num_dwords = 1;
+  auto address = smem_calculate_address(inst_, wf, &request);
+  if (address && request.load_dword_mask)
+    wf.cu().l1_scalar().prefetch(*address, wf.process_id());
+}
 
 void SGetWaveidInWorkgroupSmem::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  amdgpu::write_scalar_selector(wf, inst_.sdata, wf.wave_in_group());
 }
 
 } // namespace rdna1

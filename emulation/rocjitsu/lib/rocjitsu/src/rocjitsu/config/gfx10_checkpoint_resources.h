@@ -22,7 +22,8 @@ struct Gfx10CheckpointResources {
     // Restore builds a standalone machine. The default KFD handlers resolve by
     // process ID, and save_wave verifies ownership of resident waves. Custom controls,
     // exports and trace sinks can affect standalone waves and have no saved owner.
-    if (cu.external_trap_resolver_ || cu.external_trap_updater_ || cu.external_sendmsg_handler_)
+    if (cu.shader_export_handler_ || cu.shader_trace_handler_ || cu.external_trap_resolver_ ||
+        cu.external_trap_updater_ || cu.external_sendmsg_handler_)
       return emit_error.emit() << "Cannot checkpoint GFX10 frontend callbacks on " << cu.name();
     if (cu.lds_allocation_pinned())
       return emit_error.emit() << "Cannot checkpoint shared LDS reservations on " << cu.name();

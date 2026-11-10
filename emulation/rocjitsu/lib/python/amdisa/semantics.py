@@ -415,6 +415,10 @@ _CBRANCH_COND = {
     'S_CBRANCH_VCCNZ': 'vccnz',
     'S_CBRANCH_EXECZ': 'execz',
     'S_CBRANCH_EXECNZ': 'execnz',
+    'S_CBRANCH_CDBGUSER': 'debug_user',
+    'S_CBRANCH_CDBGSYS': 'debug_sys',
+    'S_CBRANCH_CDBGSYS_OR_USER': 'debug_either',
+    'S_CBRANCH_CDBGSYS_AND_USER': 'debug_both',
 }
 
 _NAMED_WAITCNT_COUNTERS = {
@@ -543,7 +547,7 @@ _SOP1_SPECIAL = {
     'S_GET_BARRIER_STATE': ('scalar_barrier_state', None, 'b32'),
     'S_BARRIER_INIT': ('scalar_barrier_init', None),
     'S_BARRIER_JOIN': ('scalar_barrier_join', None),
-    'S_WAKEUP_BARRIER': ('true_nop', None),
+    'S_WAKEUP_BARRIER': ('scalar_barrier_wakeup', None),
     'S_ALLOC_VGPR': ('true_nop', None),
     'S_SLEEP_VAR': ('true_nop', None),
     'S_CEIL': ('scalar_unary', 'ceil'),
@@ -698,6 +702,8 @@ _SOP2_OP_MAP = {
 
 def _derive_sop2(name: str) -> InstructionSemantics | None:
     """Derive semantics for an SOP2 (Scalar ALU Two-operand) instruction."""
+    if name == 'S_RFE_RESTORE_B64':
+        return InstructionSemantics(name, 'trap_return')
     if name == 'S_CBRANCH_G_FORK':
         return InstructionSemantics(name, 'cbranch_fork', operation='indirect')
 
@@ -807,6 +813,10 @@ def _derive_sopk(name: str) -> InstructionSemantics | None:
     if name in _NAMED_WAITCNT_COUNTERS:
         return InstructionSemantics(
             name, 'wait_counter', operation=_NAMED_WAITCNT_COUNTERS[name]
+        )
+    if name in ('S_SUBVECTOR_LOOP_BEGIN', 'S_SUBVECTOR_LOOP_END'):
+        return InstructionSemantics(
+            name, 'subvector_loop', operation=name.rsplit('_', 1)[1].lower()
         )
     if name == 'S_VERSION':
         return InstructionSemantics(name, 'true_nop')
@@ -1921,6 +1931,8 @@ def _derive_smem(name: str) -> InstructionSemantics | None:
         return InstructionSemantics(name, 'dcache_wb')
     if upper == 'S_GL1_INV':
         return InstructionSemantics(name, 'gl1_inv')
+    if upper == 'S_GET_WAVEID_IN_WORKGROUP':
+        return InstructionSemantics(name, 'smem_wave_in_group')
     if upper in ('S_MEMTIME', 'S_MEMREALTIME'):
         return InstructionSemantics(name, 'smem_time')
     # Remaining scalar cache / special instructions.
@@ -2149,7 +2161,15 @@ def _derive_flat(name: str) -> InstructionSemantics | None:
     upper = name.upper()
     if upper.startswith('GLOBAL_LOAD_LDS_'):
         suffix = upper.removeprefix('GLOBAL_LOAD_LDS_')
-        if suffix in ('DWORDX3', 'DWORDX4'):
+        if suffix in (
+            'UBYTE',
+            'SBYTE',
+            'USHORT',
+            'SSHORT',
+            'DWORD',
+            'DWORDX3',
+            'DWORDX4',
+        ):
             size, count, signed = _FLAT_DATA_MAP[suffix]
             return InstructionSemantics(
                 name,
@@ -2454,6 +2474,17 @@ def _derive_ds(name: str) -> InstructionSemantics | None:
         return InstructionSemantics(
             name, 'ds_stack', elem_size=4, num_elems=2 if 'POP2' in upper else 1
         )
+    if '_SRC2_' in upper:
+        # Same atomic operation as the VGPR-data form, with both inputs in LDS.
+        if upper.startswith('DS_WRITE_SRC2_'):
+            return InstructionSemantics(
+                name,
+                'ds_atomic',
+                operation='swap',
+                elem_size=8 if upper.endswith('64') else 4,
+                num_elems=1,
+            )
+        upper = upper.replace('_SRC2_', '_')
     is_write2 = '_WRITE2' in upper or 'DS_STORE_2ADDR' in upper
     is_read2 = '_READ2' in upper or 'DS_LOAD_2ADDR' in upper
     is_write = ('_WRITE_' in upper or 'DS_STORE_' in upper) and not is_write2
@@ -2886,6 +2917,8 @@ def derive_semantics(
     if derive_fn is None:
         return None
     sem = derive_fn(name)
+    if name == 'S_RFE_RESTORE_B64':
+        return InstructionSemantics(name, 'trap_return')
 
     # VOP3 (and VOP3_SDST_ENC) can re-encode VOP1/VOP2/VOPC instructions.
     if sem is None and base_enc.startswith('VOP3'):
