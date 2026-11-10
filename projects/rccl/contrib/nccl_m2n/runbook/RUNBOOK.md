@@ -322,56 +322,19 @@ were not run.
 
 ## 13. Optional: PyTorch (`nccl.m2n`)
 
-`nccl.m2n` (upstream `NVIDIA/nccl-extensions` `python/`) runs on RCCL through the RCCL port of `nccl4py`
-in this tree (`projects/rccl/bindings/nccl4py`, with its `nccl._hip_compat` HIP shim). The package itself
-is not in this tree: take `python/` at the commit in `../UPSTREAM_VERSION` (the same sources as `nccl_m2n`)
-and apply `m2n-nccl4py-port.patch` (distributed separately). The patch builds the Cython bindings against
-the port's `nccl.bindings.cynccl` (no CUDA headers, `nccl_m2n` only), skips `cuda.pathfinder` on ROCm, and
-adds `rocm/sitecustomize.py` (one `librccl` per process) and the DTensor check
-`tests/rocm/xdtensor_reshard_check.py`. The communicator comes from nccl4py (`nccl.core.Communicator`) or
-from torch (`ProcessGroupNCCL._comm_ptr()`).
-
-The image (section 2) already has what this needs: no NVIDIA `cuda-python`/`cuda-core`/`cuda-bindings`/
-`cuda-pathfinder` (a real `cuda.core` would shadow the port's HIP shim and needs `libcuda.so.1`), `mpi4py`,
-`hip-python`, `setuptools < 82` (torch), Cython, and `/opt/hipdev/libamdhip64.so` (hip-python dlopens the
-unversioned name, torch's `_rocm_sdk_core` ships only `.so.7`). `py_env.sh` sets the runtime environment
-instead of `env.sh` (which points `LD_LIBRARY_PATH` at `_rocm_sdk_devel`, a different HIP build than torch's).
-Container only; the native stack (section 12) has no torch.
-
-After section 5, in your shell inside the container:
+`nccl.m2n` is in this tree: `projects/rccl/bindings/nccl_m2n` (the `nccl_m2n` part of upstream
+`nccl-extensions` `python/` at its `UPSTREAM_VERSION`, built on the RCCL nccl4py port in
+`projects/rccl/bindings/nccl4py`). Build, install and checks are in `../scripts/README.md` (sections 2 and 4);
+they use the same `~/m2n-ruby` layout and image as this runbook. The communicator comes from
+`nccl.core.Communicator` (`--comm rccl`) or `ProcessGroupNCCL._comm_ptr()` (`--comm pg`).
 
 ```bash
-cd ~/m2n-ruby && git clone https://github.com/NVIDIA/nccl-extensions.git && cd nccl-extensions
-git checkout $(awk '/^commit:/{print $2}' ~/m2n-ruby/rocm-systems/projects/rccl/contrib/nccl_m2n/UPSTREAM_VERSION)
-git apply --directory=python /path/to/m2n-nccl4py-port.patch
-bash $RB/py_build.sh                 # nccl4py + nccl_extensions wheels -> ~/m2n-ruby/whl
+SD=$SRC/projects/rccl/contrib/nccl_m2n/scripts
+bash $SD/build.sh py                      # nccl4py + nccl.m2n wheels -> ~/m2n-ruby/whl (manylinux: whl/repaired/)
+# install the wheels as root in every container (../scripts/README.md section 2), then in the container:
+bash $SD/py_check.sh                      # 1 node: python reshard_bench --validate + DTensor (--comm rccl, pg)
+HF=~/m2n-ruby/hostfile bash $SD/py_check.sh 16   # 2 nodes
 ```
-
-Install both wheels as root, from the node (`--no-deps`: nccl-extensions still declares `cuda-core`):
-
-```bash
-sudo docker exec $NAME bash -c "/opt/venv/bin/pip install --no-deps --force-reinstall $HOME/m2n-ruby/whl/*.whl"
-```
-
-Run (inside the container):
-
-```bash
-. $RB/py_env.sh && cd /tmp
-mpirun -np 8 "${PYMPI_ARGS[@]}" -m nccl.m2n.benchmarks.reshard_bench --validate --buffer-provider torch \
-  --src-mesh-dims 1,4 --dst-mesh-dims 1,4 --src-shard-dim 0 --dst-shard-dim 1 --tensor-dims 8192,8192,16 \
-  --algorithm direct --copy-algorithm pack --iterations 10 --warmup 2
-mpirun -np 8 "${PYMPI_ARGS[@]}" $NCCLX/python/tests/rocm/xdtensor_reshard_check.py --comm rccl   # nccl.core.Communicator
-mpirun -np 8 "${PYMPI_ARGS[@]}" $NCCLX/python/tests/rocm/xdtensor_reshard_check.py --comm pg     # ProcessGroupNCCL._comm_ptr()
-```
-
-Expected: `VALIDATION PASSED` with the same bandwidth as the C bench at 1 GiB (PACK cross-dim ~170 GiB/s per
-source rank); the DTensor check (TP4 on ranks 0-3 -> DP2 x TP2 on 4-7, 3 placements x bf16/fp32/int8) ends
-with `RESULT PASS failures=0` for both `--comm rccl` and `--comm pg`. For 2 nodes use
-`-np 16 --hostfile ~/m2n-ruby/hostfile` and 8-rank meshes in the bench (`--src-mesh-dims 1,8
---dst-mesh-dims 1,8`, node 1 -> node 2); the DTensor check sizes itself from the world size (TP8 -> DP2 x TP4).
-Only `--buffer-provider torch` is supported on ROCm. Known port issue: `--api window` passes, but freeing an
-`nccl.core.torch.empty` buffer raises `TypeError` in `nccl/_hip_compat/cuda_core_shim/_memory.py`
-(`deallocate(..., stream)` against a keyword-only `stream`), so `ncclMemFree` is skipped.
 
 ## Troubleshooting
 

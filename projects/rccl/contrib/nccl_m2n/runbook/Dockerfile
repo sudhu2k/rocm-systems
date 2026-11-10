@@ -39,7 +39,7 @@ RUN R=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel \
 
 # nccl.m2n on PyTorch (RUNBOOK section 13). NVIDIA cuda-python goes: its cuda.core shadows the HIP shim of
 # the RCCL nccl4py port and needs libcuda.so.1. setuptools < 82 for torch; hip-python dlopens an unversioned
-# libamdhip64.so, which torch's _rocm_sdk_core lacks (py_env.sh puts /opt/hipdev on LD_LIBRARY_PATH).
+# libamdhip64.so, which torch's _rocm_sdk_core lacks (../scripts/py_env.sh puts /opt/hipdev on LD_LIBRARY_PATH).
 RUN /opt/venv/bin/python -m pip uninstall -y cuda-python cuda-bindings cuda-core cuda-pathfinder \
  && /opt/venv/bin/python -m pip install --no-cache-dir mpi4py hip-python==7.2.2.562.43 'setuptools>=80,<82' \
       'setuptools-scm>=10.2,<11' 'Cython>=3.1' \
