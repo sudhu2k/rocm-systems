@@ -535,10 +535,18 @@ public:
     });
   }
 
-  void onAmdgpuBarrierResolved(std::span<amdgpu::Wavefront *> wavefronts) {
+  void onAmdgpuBarrierResolved(std::span<amdgpu::Wavefront *> wavefronts,
+                               bool whole_workgroup = false) {
     dispatch_with_plugin_lock([&]() {
-      for (auto &entry : plugins_)
+      for (auto &entry : plugins_) {
+        if (whole_workgroup) {
+          if (auto *observer = dynamic_cast<AmdgpuWorkgroupBarrierObserver *>(entry.plugin.get())) {
+            observer->onAmdgpuWorkgroupBarrierResolved(wavefronts);
+            continue;
+          }
+        }
         entry.plugin->onAmdgpuBarrierResolved(wavefronts);
+      }
     });
   }
 

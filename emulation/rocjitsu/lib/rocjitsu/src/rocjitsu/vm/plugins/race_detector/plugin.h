@@ -81,9 +81,10 @@ struct RaceWavefrontState : WavefrontState {
   };
   std::optional<LdsOperandRead> lds_operand_read;
 
-  // Inline image queries write every selected DWORD on the same
+  // The GFX10 and GFX11 inline image queries write every selected DWORD on the same
   // active lanes. Gather the actual register writes until execution succeeds.
   struct ImageQuery {
+    amdgpu::VmemWriteback type;
     amdgpu::WaitCounterType counter;
     uint64_t lanes = 0;
     std::vector<uint32_t> registers;
@@ -92,6 +93,7 @@ struct RaceWavefrontState : WavefrontState {
 };
 
 class RaceDetectorPlugin : public ExecutionPlugin,
+                           public AmdgpuWorkgroupBarrierObserver,
                            public AmdgpuImageFeedbackObserver,
                            public AmdgpuLdsDirectReadObserver {
 public:
@@ -148,6 +150,7 @@ public:
   void onAmdgpuAfterExecuteInstruction(uint64_t pc, const Instruction &inst,
                                        amdgpu::Wavefront &wf) override;
 
+  void onAmdgpuWorkgroupBarrierResolved(std::span<amdgpu::Wavefront *> wavefronts) override;
   void onAmdgpuBarrierResolved(std::span<amdgpu::Wavefront *> wavefronts) override;
 
   std::string getSummary() const;

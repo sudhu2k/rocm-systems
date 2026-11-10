@@ -55,6 +55,11 @@ std::optional<uint32_t> ComputeUnitCore::xcc_id() const {
   return cp_->xcc_id();
 }
 
+bool InstructionComputeUnitView::in_multiwave_workgroup() const {
+  const auto &wave = raw_wavefront();
+  return raw_cu().barrier_wgs_.contains(wg_key(wave.dispatch_id(), wave.wg_id()));
+}
+
 bool InstructionComputeUnitView::signal_queue_exception(
     uint32_t queue_id, uint32_t process_id, uint64_t status, bool clear_debug_stop_on_success,
     bool retain_failure_for_debugger, QueueExceptionDeliveryPolicy delivery_policy,
@@ -750,7 +755,7 @@ bool ComputeUnitCore::barrier_signal(Wavefront &wf, int32_t barrier_id, uint32_t
 
   barrier->signal_count = 0;
   auto members = complete_barrier(wf.dispatch_id(), wf.wg_id(), completion_bit, named_id);
-  notify_barrier_complete(members);
+  notify_barrier_complete(members, completion_bit != kNamedBarrierBit);
   return is_first;
 }
 
@@ -778,9 +783,10 @@ std::vector<Wavefront *> ComputeUnitCore::complete_barrier(uint32_t dispatch_id,
   return members;
 }
 
-void ComputeUnitCore::notify_barrier_complete(std::span<Wavefront *> members) {
+void ComputeUnitCore::notify_barrier_complete(std::span<Wavefront *> members,
+                                              bool whole_workgroup) {
   if (!members.empty()) {
-    plugin_group_->onAmdgpuBarrierResolved(members);
+    plugin_group_->onAmdgpuBarrierResolved(members, whole_workgroup);
   }
 }
 
@@ -861,7 +867,7 @@ bool ComputeUnitCore::named_barrier_leave(Wavefront &wf) {
   if (barrier.signal_count >= barrier.member_count) {
     barrier.signal_count = 0;
     auto members = complete_barrier(wf.dispatch_id(), wf.wg_id(), kNamedBarrierBit, id);
-    notify_barrier_complete(members);
+    notify_barrier_complete(members, false);
   }
   return barrier.member_count == 0;
 }
@@ -913,7 +919,7 @@ void ComputeUnitCore::release_wf(uint32_t dispatch_id, uint32_t wg_id,
         return;
       barrier.signal_count = 0;
       auto members = complete_barrier(dispatch_id, wg_id, completion_bit, joined_id);
-      notify_barrier_complete(members);
+      notify_barrier_complete(members, completion_bit != kNamedBarrierBit);
     };
 
     retire_member(group->second.workgroup[0], kWorkgroupBarrierBit);
@@ -1190,7 +1196,7 @@ static bool flat_shared_atomic_misaligned(rj_code_arch_t arch, const VectorMemSt
 }
 
 VmAccessOutcome ComputeUnitCore::route_prepared_memory_inst(Instruction *inst, Wavefront &wf,
-                                                            uint64_t) {
+                                                            uint64_t deferred_gds_sources) {
   if (observes_memory_instruction_routing_)
     plugin_group_->onAmdgpuRouteMemoryInstruction(*inst, wf);
   const bool observe_routed_access =
@@ -1305,11 +1311,20 @@ VmAccessOutcome ComputeUnitCore::route_prepared_memory_inst(Instruction *inst, W
     if (const auto *issue = inst->amdgpu_memory_issue_info()) {
       const uint64_t requests = transpose_request_lane_mask(d, wf.wf_size());
       const uint64_t shared = (flat_local_lane_mask | flat_dds_lane_mask) & requests;
-      d.routed_issue_info = issue->for_flat_memory_domains((requests & ~shared) != 0, shared != 0);
+      if (flat_issues_both_counter_domains(arch()))
+        d.routed_issue_info = *issue;
+      else {
+        // A clipped CDNA2 private lane still returns zero on the VMEM completion bus.
+        const bool vmem =
+            (requests & ~shared) || (arch() == ROCJITSU_CODE_ARCH_CDNA2 && d.scratch_lane_mask);
+        d.routed_issue_info = issue->for_flat_memory_domains(vmem, shared != 0);
+      }
     }
   }
 
   const uint8_t route_tag = inst->data()->tag();
+  if (deferred_gds_sources)
+    lock_gds_sources(*inst, wf, deferred_gds_sources);
   // After the aperture rewrite, before the pipeline takes the instruction:
   // this is the one point at which the space, the counter, and the addresses
   // are all the ones the memory system is about to use. Gated on a plugin that
@@ -1422,11 +1437,13 @@ void ComputeUnitCore::report_memory_wait(void *context,
         hazard.producer.pc, required));
   } else {
     util::Logger::warn(std::format(
-        "memory-wait: {} wg={} wave={} pc={:#x}: {} of {} before memory result from pc={:#x} is "
-        "known ready ({}). A wait threshold <= {} is required; set top-level wait_checking "
+        "memory-wait: {} wg={} wave={} pc={:#x}: {} of {} before {} from pc={:#x} is "
+        "{} ({}). A wait threshold <= {} is required; set top-level wait_checking "
         "to \"off\" (rocjitsu --wait-checking=off) to disable wait checking.",
         cu.full_path(), wf.wg_id(), wf.wf_id(), hazard.consumer_pc,
-        hazard.write ? "overwrite" : "read", register_name, hazard.producer.pc, counter_name,
+        hazard.write ? "overwrite" : "read", register_name,
+        hazard.producer.gds_source_lock ? "GDS source" : "memory result", hazard.producer.pc,
+        hazard.producer.gds_source_lock ? "safe to overwrite" : "known ready", counter_name,
         required));
   }
   if (count == kMaxMemoryWaitDiagnostics)
@@ -1434,7 +1451,26 @@ void ComputeUnitCore::report_memory_wait(void *context,
                               : "memory-wait: further diagnostics on this CU are suppressed");
 }
 
+void ComputeUnitCore::lock_gds_sources(const Instruction &inst, Wavefront &wf, uint64_t sequence) {
+  const RegisterAccess registers(wf);
+  const uint64_t lanes = registers.gds_source_lanes(inst);
+  auto lock = [&](RegisterRef reg, uint64_t mask) {
+    MemoryWaitScoreboard::Event source{
+        sequence, wf.pc, mask, reg, WaitCounterKind::Exp, MemoryWaitScoreboard::kFullDwordByteMask};
+    source.gds_source_lock = true;
+    wf.ensure_memory_wait_scoreboard().add(source);
+  };
+  if (lanes)
+    registers.for_each_gds_source(inst, [&](RegisterRef reg) { lock(reg, lanes); });
+  lock({RegClass::EXEC, 0, static_cast<uint8_t>(wf.wf_size() / 32)}, ~uint64_t{0});
+}
+
 void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf) {
+  track_memory_wait(inst, wf, nullptr);
+}
+
+void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf,
+                                        uint64_t *deferred_gds_sources) {
   using namespace waitcheck_detail;
   // Common single-counter loads have one decoded full-dword destination.
   // Resolve and issue that dependency before instruction execution.
@@ -1459,10 +1495,11 @@ void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf) {
       scoreboard.bind(wf.pc, &wf, &ComputeUnitCore::report_memory_wait);
       uint64_t lanes = scalar ? ~uint64_t{0}
                        : info->exec_masked
-                           ? wf.exec()
+                           ? wf.memory_exec(inst)
                            : (wf.wf_size() == 64 ? ~uint64_t{0} : uint64_t{0xffffffff});
       uint64_t issue_lanes = lanes;
-      if (!scalar && (inst.flags() & CONDITIONAL_MEMORY_LANES)) {
+      if (!scalar &&
+          (config_.arch == ROCJITSU_CODE_ARCH_RDNA2 || (inst.flags() & CONDITIONAL_MEMORY_LANES))) {
         const auto masks = MemoryWaitScoreboard::memory_lanes(inst, wf);
         issue_lanes = masks.issue;
         lanes = masks.result;
@@ -1482,9 +1519,10 @@ void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf) {
       assert(inst.num_dst_operands() == 1);
       const auto &operand = *inst.dst_operand(0);
       if (scalar) {
-        if (const auto range = resolve_scalar_destination_range(
-                wf, operand.encoding_value(), std::max(1, operand.size_bits() / 32)))
-          if (const auto reg = range->register_ref())
+        if (const auto range = resolve_scalar_register_range(wf, operand.encoding_value(),
+                                                             std::max(1, operand.size_bits() / 32)))
+          if (const auto reg = range->register_ref();
+              reg && (reg->cls != RegClass::TTMP || wf.shader_can_write_ttmp()))
             scoreboard.add(
                 {sequence, wf.pc, lanes, *reg, counter, MemoryWaitScoreboard::kFullDwordByteMask});
       } else {
@@ -1539,16 +1577,22 @@ void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf) {
            : MemoryWaitScoreboard::FlatLanes{};
   const uint64_t flat_shared_lanes = planned_flat.shared;
   const uint64_t flat_requests = planned_flat.requests;
+  const bool issue_both = flat && flat_issues_both_counter_domains(config_.arch);
   const auto flat_counter_lanes = [&](WaitCounterKind counter) {
+    if (flat_requires_both_counters(config_.arch))
+      return flat_requests;
     return counter == WaitCounterKind::Ds ? flat_requests & flat_shared_lanes
                                           : flat_requests & ~flat_shared_lanes;
+  };
+  const auto issues_flat_counter = [&](WaitCounterKind counter) {
+    return issue_both || flat_counter_lanes(counter) != 0;
   };
   const auto is_flat_memory_counter = [&](WaitCounterKind counter) {
     return flat && (counter == WaitCounterKind::Load || counter == WaitCounterKind::Store ||
                     counter == WaitCounterKind::Ds);
   };
   for (const auto &event : classified) {
-    if (!is_flat_memory_counter(event.counter) || !flat_counter_lanes(event.counter))
+    if (!is_flat_memory_counter(event.counter) || !issues_flat_counter(event.counter))
       continue;
     const auto maximum = WaitCounterPolicy::maximum_dependency_wait(config_.arch, event.counter);
     if (maximum.succeeded())
@@ -1645,7 +1689,9 @@ void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf) {
   // Check all writes before adding any new dependencies. FLAT has the same
   // destination on two counters; those entries are not writes racing each other.
   const bool flat_result = defs != classified.end() && defs->kind == WaitEventKind::FlatLoad;
-  const auto vmem_write_order = has_ordered_vmem_writeback(config_.arch) &&
+  const bool dual_flat_result = flat_result && flat_requires_both_counters(config_.arch);
+  const auto vmem_write_order = !(flat_result && has_gfx10_vmem_fifo(config_.arch)) &&
+                                        has_ordered_vmem_writeback(config_.arch) &&
                                         defs != classified.end() &&
                                         defs->counter == WaitCounterKind::Load
                                     ? scoreboard.ordered_write_order(*defs, config_.arch)
@@ -1683,7 +1729,7 @@ void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf) {
   std::optional<WaitCounterKind> xcnt_completion;
   for (const auto &event : classified) {
     const auto counter = event.counter;
-    if (is_flat_memory_counter(counter) && !flat_counter_lanes(counter))
+    if (is_flat_memory_counter(counter) && !issues_flat_counter(counter))
       continue;
     if (counter == WaitCounterKind::X) {
       if (track_xcnt && (xscalar || vector_lanes || scoreboard.outstanding(counter))) {
@@ -1739,8 +1785,14 @@ void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf) {
     const bool scalar = event.kind == WaitEventKind::Smem ||
                         event.kind == WaitEventKind::SqMessage ||
                         event.kind == WaitEventKind::SccWrite;
-    // Zero-EXEC instructions still occupy positions behind pending requests.
-    if (!scalar && !memory_lanes.issue && !scoreboard.outstanding(counter))
+    const bool lock_gds_sources =
+        has_ordered_gds_writeback(config_.arch) && counter == WaitCounterKind::Exp &&
+        event.kind == WaitEventKind::Gds && info &&
+        info->counter_obligations().front().completion_class() == MemoryCompletionClass::GDS &&
+        RegisterAccess(wf).vgpr_results_fit_allocation(inst);
+    if (!scalar && !memory_lanes.issue && !issue_both && !lock_gds_sources &&
+        (!info || info->exec_masked) && !scoreboard.outstanding(counter) &&
+        !is_flat_memory_counter(counter))
       continue;
     const auto sequence =
         scoreboard.issue(event, config_.arch, scoreboard.issue_units(inst, event, config_.arch));
@@ -1750,6 +1802,13 @@ void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf) {
     // must not add result dependencies or report completion hazards.
     if (config_.memory_wait_diagnostics == MemoryWaitDiagnostics::Off)
       continue;
+    if (lock_gds_sources) {
+      if (config_.arch == ROCJITSU_CODE_ARCH_RDNA2 && deferred_gds_sources && inst.is_memory_op() &&
+          (wf.mode_raw() & Wavefront::kRdna2MemoryViolationEnable))
+        *deferred_gds_sources = sequence;
+      else
+        this->lock_gds_sources(inst, wf, sequence);
+    }
     if (event.special_reg && MemoryWaitScoreboard::result_is_written(inst, wf)) {
       scoreboard.add({sequence, wf.pc, ~uint64_t{0}, *event.special_reg, counter,
                       MemoryWaitScoreboard::kFullDwordByteMask});
@@ -1758,9 +1817,12 @@ void ComputeUnitCore::track_memory_wait(Instruction &inst, Wavefront &wf) {
       for (size_t i = 0; i < num_destinations; ++i) {
         const auto &d = destinations[i];
         uint64_t lanes = d.lanes;
-        if (event.kind == WaitEventKind::FlatLoad)
+        if (event.kind == WaitEventKind::FlatLoad && !dual_flat_result)
           lanes &= counter == WaitCounterKind::Ds ? flat_shared_lanes : ~flat_shared_lanes;
         MemoryWaitScoreboard::Event result{sequence, wf.pc, lanes, d.reg, counter, d.bytes};
+        if (dual_flat_result && has_ordered_flat_lds_writeback(config_.arch))
+          result.writeback_lanes =
+              counter == WaitCounterKind::Ds ? flat_shared_lanes : ~flat_shared_lanes;
         // FLAT's LDS-serviced lanes share native LDS's order class, so partial
         // waits retire them together. Only qualified targets also write them
         // to registers in order with native LDS results.
@@ -1854,6 +1916,7 @@ void ComputeUnitCore::report_routed_access(const Instruction &inst, Wavefront &w
     // An atomic is one element of elem_size bytes, matching vector atomic
     // observations; num_dwords counts its returned dwords.
     access.elements_per_lane = state.atomic_op != AtomicOp::NONE ? 1 : state.num_dwords;
+    access.force_l1_bypass = state.request_force_l1_bypass;
     // A scalar access is one address, so it is a one-lane wavefront as far as
     // the memory system is concerned. Saying so lets a consumer treat both
     // routes with the same per-lane arithmetic.
@@ -1899,8 +1962,23 @@ void ComputeUnitCore::report_routed_access(const Instruction &inst, Wavefront &w
     access.request_lane_mask = rejected ? 0 : requests;
     access.flat_local_lane_mask = flat_local_lane_mask & access.request_lane_mask;
     access.flat_dds_lane_mask = flat_dds_lane_mask & access.request_lane_mask;
+    if (decoded_route_tag == LOCAL_MEM && arch() == ROCJITSU_CODE_ARCH_CDNA4) {
+      const auto lanes =
+          LocalMemPipeline::cdna4_ds_access_lanes(state, wf, access.request_lane_mask);
+      access.ds_suppressed_lanes = state.exec_mask & ~lanes.primary;
+      if (state.ds2_active)
+        access.ds2_suppressed_lanes = state.exec_mask & ~lanes.secondary;
+    }
     access.flat_local_oob_lane_mask = rejected ? 0 : state.flat_local_oob_lane_mask;
-    access.flat_local_allocation_end = state.flat_local_allocation_end;
+    access.lds_allocation = state.lds_allocation;
+    if (!access.lds_allocation && route_tag == LOCAL_MEM)
+      access.lds_allocation = LdsAllocationRange::from_size(wf.lds_base(), wf.lds_size());
+    if (access.lds_allocation) {
+      access.lds_allocation->end =
+          std::min<uint64_t>(access.lds_allocation->end, wf.lds().size_bytes());
+      if (access.flat_local_lane_mask)
+        access.flat_local_allocation_end = access.lds_allocation->end;
+    }
     // Intersected with the requesting lanes, which is how the global pipeline
     // splits the wave: a swizzled lane that never requests costs nothing.
     access.scratch_lane_mask =
@@ -1917,7 +1995,7 @@ void ComputeUnitCore::report_routed_access(const Instruction &inst, Wavefront &w
       access.addresses = std::span<const uint64_t>(state.per_lane_addr.data(), wf_size);
     if (!rejected)
       access.element_lane_masks = state.element_lane_masks.view();
-    if (state.ds2_active)
+    if (state.has_second_ds_address(arch(), access.request_lane_mask))
       access.secondary_addresses =
           std::span<const uint64_t>(state.ds2_per_lane_addr.data(), wf_size);
     break;
@@ -1982,7 +2060,7 @@ void ComputeUnitCore::update_wf_states() {
             other_wf->waiting_barrier_bit_ == Wavefront::kNoBarrierWait)
           barrier_wfs.push_back(other_wf.get());
       }
-      notify_barrier_complete(barrier_wfs);
+      notify_barrier_complete(barrier_wfs, true);
       for (auto *bwf : barrier_wfs) {
         bwf->set_state(WfState::RUNNING);
         bwf->set_ready_cycle(cycle_counter_);
@@ -2311,11 +2389,25 @@ template <bool EnableAsync>
   }
   auto *wait_state =
       config_.memory_wait_checks_enabled() ? active->memory_wait_scoreboard() : nullptr;
+  if (has_gfx10_trap_wait(config_.arch, inst->mnemonic())) {
+    if (!active->wait_counters().empty()) {
+      drain_async_window();
+      active->set_wait_all();
+      --active->trace_inst_count_;
+      return IssueOutcome::NotIssued;
+    }
+    // Inline and functionally completed producers can still have diagnostic dependencies.
+    if (wait_state)
+      wait_state->clear();
+  }
   if (wait_state) {
-    if (inst->is_waitcnt() || inst->has_embedded_memory_wait() || inst->is_memory_wait_producer() ||
+    // GFX10 split waits retire dependencies after the SGPR read, once their true
+    // modulo threshold is available. The read itself can have a dependency.
+    if ((inst->is_waitcnt() && !WaitCounterPolicy::is_gfx10_sopk_wait(*inst, config_.arch)) ||
+        inst->has_embedded_memory_wait() || inst->is_memory_wait_producer() ||
         (config_.arch == ROCJITSU_CODE_ARCH_CDNA5 &&
          waitcheck_detail::WaitcheckTarget::is_xcnt_drain(*inst)))
-      wait_state->before(*inst, config_.arch);
+      wait_state->before(*inst, config_.arch, active);
     wait_state->bind(active->pc, active, &ComputeUnitCore::report_memory_wait);
   }
   const bool deferred_texel_feedback =
@@ -2372,8 +2464,13 @@ template <bool EnableAsync>
     }
   }
 
-  if (wait_state && !wait_checked && !check_prepared_memory)
-    wait_state->check_instruction(*inst, *active);
+  if (wait_state) {
+    if (!wait_checked && !check_prepared_memory)
+      wait_state->check_instruction(*inst, *active);
+    // An explicit wait reads its threshold operands before it can retire producers.
+    if (inst->is_waitcnt())
+      wait_state->before(*inst, config_.arch, active);
+  }
 
   struct ProbeWaitIssue {
     MemoryWaitScoreboard::IssueSnapshot before;
@@ -2382,6 +2479,7 @@ template <bool EnableAsync>
   };
   std::optional<ProbeWaitIssue> probe_wait_issue;
   const Operand *gfx12_atomic_payload = nullptr;
+  uint64_t deferred_gds_sources = 0;
   if (inst->is_memory_wait_producer() && config_.memory_wait_checks_enabled()) {
     if (wait_state && !wait_state->empty() && config_.arch == ROCJITSU_CODE_ARCH_RDNA4) {
       RegisterModifiers modifiers;
@@ -2392,7 +2490,7 @@ template <bool EnableAsync>
       probe_wait_issue = ProbeWaitIssue{active->ensure_memory_wait_scoreboard().issue_snapshot(),
                                         active->pc, active->dispatch_generation()};
     if (!gfx12_atomic_payload && !check_prepared_memory)
-      track_memory_wait(*inst, *active);
+      track_memory_wait(*inst, *active, &deferred_gds_sources);
   }
 
   // The cause classifiers report into this as they run; see alu_exceptions.h.
@@ -2555,12 +2653,15 @@ template <bool EnableAsync>
     }
   }
   if (check_prepared_memory || gfx12_atomic_payload)
-    track_memory_wait(*inst, *active);
+    track_memory_wait(*inst, *active, &deferred_gds_sources);
 
   if (execution_result.failed()) [[unlikely]] {
     fail_current_instruction();
     return IssueOutcome::Issued;
   }
+
+  if (wait_state && WaitCounterPolicy::is_gfx10_sopk_wait(*inst, config_.arch))
+    wait_state->apply_explicit_wait(active->wait_target().gfx10_wait_fields());
 
   record_gws_instruction_progress(executing_process);
 
@@ -2579,6 +2680,10 @@ template <bool EnableAsync>
   if (active->is_halted()) {
     return IssueOutcome::Issued;
   }
+
+  if (wait_state && has_ordered_gds_writeback(config_.arch) && !inst->is_memory_wait_producer())
+    if (auto reg = active->instruction_exec_write())
+      wait_state->access(*reg, ~uint64_t{0}, MemoryWaitScoreboard::kFullDwordByteMask, true);
 
   if (observes_after_execute_instruction_)
     plugin_group_->onAmdgpuAfterExecuteInstruction(active->pc, *inst, *active);
@@ -2827,6 +2932,8 @@ template <bool EnableAsync>
       // register operand before constructing pipeline state. Treat that as a
       // fully suppressed instruction: no route callback, wait-counter update,
       // or memory transaction is permitted.
+      if (deferred_gds_sources)
+        lock_gds_sources(*inst, *active, deferred_gds_sources);
       decoded.value().reset();
     } else {
       if (inst->data()->tag() == GLOBAL_MEM) {
@@ -2848,7 +2955,8 @@ template <bool EnableAsync>
         }
         d->issue_pc = active->pc;
       }
-      const VmAccessOutcome memory_outcome = route_memory_inst(decoded.value().release(), *active);
+      const VmAccessOutcome memory_outcome =
+          route_prepared_memory_inst(decoded.value().release(), *active, deferred_gds_sources);
       if (memory_outcome != VmAccessOutcome::Complete) {
         if (memory_outcome == VmAccessOutcome::Unavailable) {
           request_functional_yield();

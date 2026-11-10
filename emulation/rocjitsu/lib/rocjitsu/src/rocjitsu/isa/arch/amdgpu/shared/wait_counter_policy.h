@@ -4,6 +4,7 @@
 #pragma once
 
 #include "rocjitsu/code/rj_code.h"
+#include "rocjitsu/isa/arch/amdgpu/shared/memory_issue.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/wait_counter.h"
 #include "util/result.h"
 
@@ -81,6 +82,12 @@ enum class WaitcntModel { LegacyNoVscnt, LegacyVscnt, SplitGfx12 };
   return arch == ROCJITSU_CODE_ARCH_RDNA4 || arch == ROCJITSU_CODE_ARCH_CDNA5;
 }
 
+/// GFX10 S_TRAP waits for all outstanding instructions before it can issue.
+[[nodiscard]] constexpr bool has_gfx10_trap_wait(rj_code_arch_t arch, std::string_view mnemonic) {
+  return (arch == ROCJITSU_CODE_ARCH_RDNA1 || arch == ROCJITSU_CODE_ARCH_RDNA2) &&
+         mnemonic == "s_trap";
+}
+
 // GFX10 retires VMCNT reads in issue order across these VGPR writeback types.
 [[nodiscard]] constexpr bool has_gfx10_vmem_fifo(rj_code_arch_t arch) {
   return arch == ROCJITSU_CODE_ARCH_RDNA1 || arch == ROCJITSU_CODE_ARCH_RDNA2;
@@ -89,6 +96,12 @@ enum class WaitcntModel { LegacyNoVscnt, LegacyVscnt, SplitGfx12 };
 /// GFX11 VMCNT tracks independently ordered ordinary, sampled and BVH loads.
 [[nodiscard]] constexpr bool has_gfx11_vmem_fifos(rj_code_arch_t arch) {
   return arch == ROCJITSU_CODE_ARCH_RDNA3 || arch == ROCJITSU_CODE_ARCH_RDNA3_5;
+}
+
+/// GFX11 and GFX12 exports retire in independent target streams.
+[[nodiscard]] constexpr bool has_typed_export_waits(rj_code_arch_t arch) {
+  return arch == ROCJITSU_CODE_ARCH_RDNA3 || arch == ROCJITSU_CODE_ARCH_RDNA3_5 ||
+         arch == ROCJITSU_CODE_ARCH_RDNA4;
 }
 
 enum class VmemWriteback : uint8_t { Ordinary, Sample, Bvh, GenericFlat };
@@ -111,6 +124,12 @@ enum class VmemWriteback : uint8_t { Ordinary, Sample, Bvh, GenericFlat };
          arch == ROCJITSU_CODE_ARCH_CDNA3 || arch == ROCJITSU_CODE_ARCH_CDNA4 ||
          arch == ROCJITSU_CODE_ARCH_RDNA1 || arch == ROCJITSU_CODE_ARCH_RDNA2 ||
          arch == ROCJITSU_CODE_ARCH_RDNA3 || arch == ROCJITSU_CODE_ARCH_RDNA3_5;
+}
+
+// GFX10 ISA section 4.4 orders VGPR returns within GDS, separately from LDS.
+// EXPCNT tracks outgoing data and has no bearing on that writeback order.
+[[nodiscard]] constexpr bool has_ordered_gds_writeback(rj_code_arch_t arch) {
+  return arch == ROCJITSU_CODE_ARCH_RDNA1 || arch == ROCJITSU_CODE_ARCH_RDNA2;
 }
 
 // FLAT's LDS route stays in order with indexed LDS: RDNA3/3.5 FLAT ordering
@@ -301,9 +320,15 @@ struct WaitCounterPolicy {
 
   // Absent fields leave their counters unchanged. An engaged result with no
   // active fields represents an explicit no-wait sentinel.
-  // SOPK forms currently use only SIMM16; SGPR addends are not modeled.
+  // Static analysis can prove a split wait with a NULL addend. A runtime
+  // checker can also provide the register addend or the executed limits.
   [[nodiscard]] static util::FailureOr<std::optional<WaitFields>>
-  explicit_wait_fields(const Instruction &inst, rj_code_arch_t arch);
+  explicit_wait_fields(const Instruction &inst, rj_code_arch_t arch,
+                       std::optional<uint32_t> sopk_addend = std::nullopt);
+  [[nodiscard]] static util::FailureOr<std::optional<WaitFields>>
+  explicit_wait_fields(const Instruction &inst, rj_code_arch_t arch,
+                       const WaitFields *executed_limits);
+  [[nodiscard]] static bool is_gfx10_sopk_wait(const Instruction &inst, rj_code_arch_t arch);
 
   [[nodiscard]] static uint32_t depctr_field(uint32_t value, uint32_t shift, uint32_t width);
 };

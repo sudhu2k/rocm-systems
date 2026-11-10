@@ -6,6 +6,7 @@
 #include "rocjitsu/isa/arch/amdgpu/shared/wait_counter_policy.h"
 
 #include <cassert>
+#include <optional>
 #include <ostream>
 #include <span>
 #include <sstream>
@@ -48,8 +49,10 @@ enum class MemoryEventType {
   /// defaultWaitCounterType and defaultMemoryOrder return those of a tensor DMA
   /// store (TENSORCNT, TENSOR).
   LDS_TO_GLOBAL,
+  DIRECT_LDS_READ, ///< Completed synchronous read, retained until a workgroup barrier.
 
-  /// A synchronous VALU operand read visible to peers until a barrier.
+
+  /// A completed GFX10 VALU operand read, visible to peer writes until a barrier.
   LDS_OPERAND_READ,
 
   N
@@ -58,7 +61,20 @@ enum class MemoryEventType {
 /// Race-detector name for the decoded hardware completion-order classification.
 using MemoryOrderClass = amdgpu::MemoryCompletionClass;
 
-/// VMEM result writes can use distinct hardware FIFOs while sharing a counter.
+/// Effects on ordinary LDS bytes, independent of the instruction's registers.
+struct LdsAccess {
+  // A routed FLAT operation publishes its LDS bytes when the LDS counter retires.
+  bool uses_flat_lds = false;
+  bool read_modify_write = false;
+  uint8_t aligned_atomic_bytes = 0;
+
+  MemoryOrderClass order(MemoryOrderClass wholeEventOrder) const {
+    return uses_flat_lds ? MemoryOrderClass::LDS : wholeEventOrder;
+  }
+};
+
+/// GFX10 VMEM reads retire on one counter while separate types can write the
+/// same VGPR out of issue order.
 struct VgprWriteOrder {
   constexpr VgprWriteOrder(MemoryOrderClass completion,
                            amdgpu::VmemWriteback type = amdgpu::VmemWriteback::Ordinary)
@@ -66,11 +82,11 @@ struct VgprWriteOrder {
   bool operator==(const VgprWriteOrder &) const = default;
   MemoryOrderClass completion;
   amdgpu::VmemWriteback type;
-};
-
-struct LdsAccess {
-  bool read_modify_write = false;
-  uint8_t aligned_atomic_bytes = 0;
+  // Parameter and direct LDS loads share an EXPCNT stream separate from indexed DS.
+  bool direct_lds = false;
+  // GFX11 FLAT reads require both counters, while each lane writes back in
+  // the FIFO of the memory it accessed. A mask of zero means all lanes use VMEM.
+  std::optional<uint64_t> flat_lds_lanes;
 };
 
 /// Derive the ordering usable for whole-event hazards such as destination WAW.
@@ -107,7 +123,7 @@ inline bool isToScalar(MemoryEventType t) { return isToSgpr(t) || isToTtmp(t); }
 
 inline bool isFromLds(MemoryEventType t) {
   return t == MemoryEventType::LDS_TO_VGPR || t == MemoryEventType::LDS_TO_GLOBAL ||
-         t == MemoryEventType::LDS_OPERAND_READ;
+         t == MemoryEventType::LDS_OPERAND_READ || t == MemoryEventType::DIRECT_LDS_READ;
 }
 
 /// True if the event touches LDS (read or write).
@@ -137,6 +153,7 @@ inline amdgpu::WaitCounterType defaultWaitCounterType(MemoryEventType t) {
   case MemoryEventType::LDS_TO_GLOBAL:
     return amdgpu::WaitCounterType::TENSORCNT;
   case MemoryEventType::LDS_OPERAND_READ:
+  case MemoryEventType::DIRECT_LDS_READ: // Synchronous reads have no counter.
   case MemoryEventType::N:
     break;
   }
@@ -158,6 +175,7 @@ inline MemoryOrderClass defaultMemoryOrder(MemoryEventType t) {
   case MemoryEventType::GLOBAL_TO_SGPR:
   case MemoryEventType::GLOBAL_TO_TTMP:
   case MemoryEventType::SCALAR_TO_GLOBAL:
+  case MemoryEventType::DIRECT_LDS_READ:
     return MemoryOrderClass::UNORDERED;
   case MemoryEventType::LDS_TO_GLOBAL:
     return MemoryOrderClass::TENSOR;

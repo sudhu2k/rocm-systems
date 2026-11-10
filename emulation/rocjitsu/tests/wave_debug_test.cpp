@@ -72,6 +72,25 @@ struct WaveDebugFixture {
   }
 };
 
+TEST(WaveDebugTest, Gfx10TrapDrainsBeforeEnteringPrivilegedHandler) {
+  for (auto arch : {ROCJITSU_CODE_ARCH_RDNA1, ROCJITSU_CODE_ARCH_RDNA2}) {
+    WaveDebugFixture f(arch);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    f.gpu_mem.write32(kKernelAddr, kSTrapSeven);
+    f.cu->set_trap_handler_resolver([](const amdgpu::Wavefront &) {
+      return amdgpu::ComputeUnitCore::TrapHandlerConfig{kTrapHandlerAddr, 0x3000, true};
+    });
+    auto *wave = f.dispatch(kKernelAddr);
+    ASSERT_NE(wave, nullptr);
+    wave->wait_counters().increment(amdgpu::WaitCounterType::VMCNT);
+    f.cu->step();
+    EXPECT_EQ(wave->pc, kKernelAddr);
+    EXPECT_FALSE(wave->in_trap_handler());
+    wave->release_wait_counter(amdgpu::WaitCounterType::VMCNT);
+    f.cu->step();
+    ASSERT_EQ(wave->pc, kTrapHandlerAddr);
+  }
+}
 TEST(WaveDebugTest, PrivateB64AtomicPrecedesGlobalDebuggerProbes) {
   constexpr uint64_t private_base = uint64_t{4} << 32;
   constexpr uint64_t scratch = 0x20000;

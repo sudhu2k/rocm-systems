@@ -289,8 +289,10 @@ bool MemoryWaitScoreboard::needs_buffer_payload_lanes(const Instruction &inst,
 void MemoryWaitScoreboard::check_instruction(const Instruction &inst, Wavefront &wf) {
   if (empty() || inst.is_empty_global_transpose(wf.exec()))
     return;
-  const bool cdna2_valu = wf.cu().arch() == ROCJITSU_CODE_ARCH_CDNA2 && (inst.flags() & VALU);
-  if (cdna2_valu && !cdna2::valu_destinations_in_range(inst, wf))
+  const bool is_cdna2 = wf.cu().arch() == ROCJITSU_CODE_ARCH_CDNA2;
+  const bool cdna2_valu = is_cdna2 && (inst.flags() & VALU);
+  if ((cdna2_valu && !cdna2::valu_destinations_in_range(inst, wf)) ||
+      (is_cdna2 && inst.is_memory_op() && wf.cdna2_memory_destination_out_of_range(inst)))
     return;
   // A clear register byte proves independence for every lane and byte mask.
   // Only a possible overlap needs the precise instruction-specific footprints.
@@ -426,6 +428,22 @@ void MemoryWaitScoreboard::check_instruction_pending(const Instruction &inst, Wa
   // These VGPR-returning loads reject the entire tuple, including TFE, before address preparation.
   if (gfx11_rejects_buffer_load(inst, wf))
     return;
+  // GFX10 checks synchronous EXEC destinations after successful execution. Static
+  // liveness includes untaken conditional moves and control-flow paths.
+  auto access = [&](RegisterRef reg, uint64_t lanes, uint8_t bytes, bool write) {
+    if (write && reg.cls == RegClass::EXEC && has_ordered_gds_writeback(wf.cu().arch()))
+      return;
+    this->access(reg, lanes, bytes, write);
+  };
+  RegisterModifiers modifiers;
+  inst.amdgpu_register_modifiers(modifiers);
+  // Routed image instructions validate their descriptors even with no result lanes.
+  // Other RDNA2 memory returns, DS permutations and GET_RESINFO skip their sources
+  // when the decoded destination tuple crosses the allocation.
+  if (wf.cu().arch() == ROCJITSU_CODE_ARCH_RDNA2 && inst.is_memory_wait_producer() &&
+      (!inst.is_memory_op() || !modifiers.image_address) &&
+      !RegisterAccess(wf).vgpr_results_fit_allocation(inst))
+    return;
   if (wf.discards_valu_result(inst))
     return;
   const auto name = inst.mnemonic();
@@ -446,11 +464,16 @@ void MemoryWaitScoreboard::check_instruction_pending(const Instruction &inst, Wa
                             scalar_lane_write || (memory_issue && !memory_issue->exec_masked);
   const uint64_t all_lanes = wf.wf_size() == 64 ? ~uint64_t{0} : uint64_t{0xffffffff};
   uint64_t lanes = ignores_exec ? all_lanes : wf.memory_exec(inst);
+  if ((wf.cu().arch() == ROCJITSU_CODE_ARCH_RDNA1 || wf.cu().arch() == ROCJITSU_CODE_ARCH_RDNA2) &&
+      name.starts_with("ds_gws_"))
+    lanes = RegisterAccess(wf).gds_source_lanes(inst);
+  else if (wf.cu().arch() == ROCJITSU_CODE_ARCH_RDNA2 && inst.is_memory_op())
+    lanes = result_lanes(inst, wf);
   if (vector && !ignores_exec)
     access({RegClass::EXEC, 0, static_cast<uint8_t>(wf.wf_size() / 32)}, ~uint64_t{0}, 0xf, false);
-  RegisterModifiers modifiers;
-  inst.amdgpu_register_modifiers(modifiers);
   const RegisterAccess registers(wf);
+  if (vector && !ignores_exec)
+    access({RegClass::EXEC, 0, static_cast<uint8_t>(wf.wf_size() / 32)}, ~uint64_t{0}, 0xf, false);
   const bool gfx11 =
       wf.cu().arch() == ROCJITSU_CODE_ARCH_RDNA3 || wf.cu().arch() == ROCJITSU_CODE_ARCH_RDNA3_5;
   const bool gfx12_image_atomic =
@@ -565,8 +588,11 @@ void MemoryWaitScoreboard::check_instruction_pending(const Instruction &inst, Wa
   }
   if (modifiers.exec_all_if_nonzero)
     lanes = wave32_exec_all_if_nonzero(lanes);
-  if (modifiers.exec_whole_quads)
+  if (modifiers.exec_whole_quads || modifiers.exec_parameter_quads) {
     lanes = result_is_written(inst, wf) ? whole_active_quads(lanes) : 0;
+    if (modifiers.exec_parameter_quads)
+      lanes &= 0x7777777777777777ULL;
+  }
   bool read_buffer_address = true;
   bool read_buffer_offset = true;
   bool cdna5_type_mismatch = false;
@@ -619,10 +645,11 @@ void MemoryWaitScoreboard::check_instruction_pending(const Instruction &inst, Wa
   }
   // FLAT's result ordering depends on its planned memory domains. The issuer
   // checks those results after checking address sources, still before execution.
-  if (inst.is_memory_wait_producer() && !name.starts_with("flat_"))
-    check_memory_result(inst, wf,
-                        (inst.flags() & CONDITIONAL_MEMORY_LANES) ? result_lanes(inst, wf) : lanes,
-                        modifiers);
+  if (inst.is_memory_wait_producer() && !name.starts_with("flat_")) {
+    const uint64_t results =
+        (inst.flags() & CONDITIONAL_MEMORY_LANES) ? result_lanes(inst, wf) : lanes;
+    check_memory_result(inst, wf, results, modifiers);
+  }
   uint64_t src0_lanes = lanes;
   uint64_t destination_lanes = lanes;
   if (modifiers.dpp || modifiers.dpp8) {
@@ -669,14 +696,26 @@ void MemoryWaitScoreboard::check_instruction_pending(const Instruction &inst, Wa
     access(*data, source_lanes, 0xf, false);
     return;
   }
-  if (!pending_scalar_ && inst.is_memory_op() && name.starts_with("ds_")) {
+  const bool ds = inst.is_memory_op() && name.starts_with("ds_");
+  const bool ds_vgpr0 = ds && wf.cu().arch() == ROCJITSU_CODE_ARCH_RDNA2 &&
+                        RegisterAccess::ds_sources_use_vgpr0(inst);
+  const auto check_ds_source = [&](const Operand &operand) {
+    registers.for_each_ds_source_range(operand, true, [&](RegisterRef reg) {
+      access(reg, lanes, operand.register_byte_mask(), false);
+    });
+  };
+  if (!pending_scalar_ && ds) {
     for (int i = 0; i < inst.num_src_operands(); ++i) {
       if (!inst.tracks_explicit_source(i))
         continue;
-      if (const auto *op = inst.src_operand(i); op && op->is_vgpr())
-        if (auto reg = registers.source_register(*op, op == modifiers.wordwise_source0 ||
-                                                          op == modifiers.wordwise_source1))
+      if (const auto *op = inst.src_operand(i); op && op->is_vgpr()) {
+        if (ds_vgpr0) {
+          check_ds_source(*op);
+        } else if (auto reg = registers.source_register(
+                       *op, op == modifiers.wordwise_source0 || op == modifiers.wordwise_source1)) {
           access(*reg, lanes, op->register_byte_mask(), false);
+        }
+      }
     }
     return;
   }
@@ -787,7 +826,7 @@ void MemoryWaitScoreboard::check_instruction_pending(const Instruction &inst, Wa
         return 0;
       if (const auto value = operand->const_value())
         return *value;
-      if (const auto reg = registers.source_register(*operand); reg && reg->cls == RegClass::VGPR)
+      if (const auto reg = resolve(*operand, false); reg && reg->cls == RegClass::VGPR)
         return registers.vector_control_value(*reg, lane).value_or(0);
       return registers.scalar_control_value(operand->encoding_value()).value_or(0);
     };
@@ -962,6 +1001,10 @@ void MemoryWaitScoreboard::check_instruction_pending(const Instruction &inst, Wa
         op == modifiers.image_address || op == modifiers.image_atomic_data ||
         op == modifiers.image_store_data || (!pending_scalar_ && !op->is_vgpr()))
       return;
+    if (!write && ds_vgpr0 && op->decoded_vgpr()) {
+      check_ds_source(*op);
+      return;
+    }
     if (op == modifiers.block_data) {
       for (uint32_t word = 0; word < kBlockDwordCount; ++word)
         if (block_dword_enabled(wf.m0(), word))
@@ -1154,7 +1197,8 @@ bool has_ordered_writeback(const waitcheck_detail::ClassifiedEvent &event, rj_co
     return has_ordered_vmem_writeback(arch);
   case WaitCounterKind::Ds:
     // LDS writeback is in-order on all targets.
-    return event.kind == WaitEventKind::Ds;
+    return event.kind == WaitEventKind::Ds ||
+           (event.kind == WaitEventKind::Gds && has_ordered_gds_writeback(arch));
   case WaitCounterKind::Exp:
     // LDS direct and parameter loads use EXP independently of exports and
     // indexed LDS accesses.
@@ -1331,9 +1375,7 @@ bool MemoryWaitScoreboard::cancel_issue_units(uint64_t pc,
   may_overlap_ = false;
   for (const auto &event : events_) {
     pending_scalar_ |= event.reg.cls != RegClass::VGPR;
-    may_overlap_ |= pending_.mark(event.reg, event.counter == WaitCounterKind::X
-                                                 ? MemoryWaitShadow::kReplaySource
-                                                 : MemoryWaitShadow::kResult);
+    may_overlap_ |= pending_.mark(event.reg, event.shadow_kind());
   }
   return true;
 }
@@ -1381,10 +1423,14 @@ std::optional<uint32_t> completion_order_kind(const waitcheck_detail::Classified
   const bool legacy_flat =
       model == WaitcntModel::LegacyNoVscnt &&
       (event.kind == WaitEventKind::FlatLoad || event.kind == WaitEventKind::FlatStore);
-  if (legacy_flat || event.kind == WaitEventKind::Smem || event.kind == WaitEventKind::Gds ||
-      event.kind == WaitEventKind::Export || event.kind == WaitEventKind::SqMessage ||
-      event.kind == WaitEventKind::SccWrite || event.kind == WaitEventKind::GlobalInv ||
-      event.kind == WaitEventKind::Unknown)
+  if (event.kind == WaitEventKind::Gds) {
+    if (event.counter == WaitCounterKind::Ds && has_ordered_gds_writeback(arch))
+      return uint32_t{1} << static_cast<unsigned>(WaitEventKind::Gds);
+    return std::nullopt;
+  }
+  if (legacy_flat || event.kind == WaitEventKind::Smem || event.kind == WaitEventKind::Export ||
+      event.kind == WaitEventKind::SqMessage || event.kind == WaitEventKind::SccWrite ||
+      event.kind == WaitEventKind::GlobalInv || event.kind == WaitEventKind::Unknown)
     return std::nullopt;
   uint32_t kind = 0;
   if (!(model == WaitcntModel::LegacyNoVscnt && event.counter == WaitCounterKind::Load))
@@ -1464,6 +1510,12 @@ void MemoryWaitScoreboard::backpressure(WaitCounterKind counter, uint32_t capaci
     // Even an unordered incoming operation must reserve all its counter units.
     // At most remaining units from any old ordered class can still be pending
     // when the incoming instruction is admitted to read its operands.
+    // If this FIFO accounts for every outstanding unit, its progress also
+    // proves a prefix of the whole counter sequence (including empty issues).
+    const auto i = static_cast<size_t>(counter);
+    if (!unordered_[i] && order.issued - order.retired == issued_[i] - retired_[i] &&
+        issued_[i] - retired_[i] > remaining)
+      retired_[i] = issued_[i] - remaining;
     const auto through = order.issued - remaining;
     changed |= through > order.retired;
     order.retired = std::max(order.retired, through);
@@ -1496,11 +1548,9 @@ void MemoryWaitScoreboard::add(Event event) {
   event.reg = pending_.canonical(event.reg);
   stamp_order(event);
   // A newer result covering the entire old destination is the stronger
-  // dependency within the same FIFO class. Discard the superseded record rather
+  // dependency within the same VGPR writeback class. Discard the superseded record rather
   // than growing with a loop that repeatedly loads an unused destination.
-  const bool overlap =
-      pending_.mark(event.reg, event.counter == WaitCounterKind::X ? MemoryWaitShadow::kReplaySource
-                                                                   : MemoryWaitShadow::kResult);
+  const bool overlap = pending_.mark(event.reg, event.shadow_kind());
   may_overlap_ |= overlap;
   if (overlap)
     std::erase_if(events_, [&](const Event &old) {
@@ -1511,11 +1561,14 @@ void MemoryWaitScoreboard::add(Event event) {
       // drains their entire X group, so its newest covering source is enough.
       const bool scalar_replay =
           xcnt_scalar_ && old.counter == WaitCounterKind::X && event.counter == WaitCounterKind::X;
-      const bool superseded = (ordered || scalar_replay) && old.reg.cls == event.reg.cls &&
-                              event.reg.index <= old.reg.index &&
-                              event.reg.index + event.reg.width >= old.reg.index + old.reg.width &&
-                              (event.lanes & old.lanes) == old.lanes &&
-                              (event.bytes & old.bytes) == old.bytes;
+      const bool superseded =
+          (ordered || scalar_replay || (event.gds_source_lock && old.gds_source_lock)) &&
+          old.holds_source() == event.holds_source() && old.reg.cls == event.reg.cls &&
+          event.reg.index <= old.reg.index &&
+          event.reg.index + event.reg.width >= old.reg.index + old.reg.width &&
+          (event.lanes & old.lanes) == old.lanes &&
+          (event.writeback_lanes & old.writeback_lanes) == old.writeback_lanes &&
+          (event.bytes & old.bytes) == old.bytes;
       if (superseded && old.sequence < event.sequence) {
         std::erase_if(superseded_, [&](const auto &saved) {
           return saved.replacement_counter == event.counter &&
@@ -1542,8 +1595,7 @@ void MemoryWaitScoreboard::rebuild_mask() {
   // Erasing a record cleared its destinations. Restore any overlapping records
   // that remain; unrelated shadow bytes already have the right value.
   for (const auto &event : events_)
-    pending_.mark(event.reg, event.counter == WaitCounterKind::X ? MemoryWaitShadow::kReplaySource
-                                                                 : MemoryWaitShadow::kResult);
+    pending_.mark(event.reg, event.shadow_kind());
 }
 
 void MemoryWaitScoreboard::wait(WaitCounterKind counter, uint32_t threshold) {
@@ -1639,7 +1691,16 @@ void MemoryWaitScoreboard::xcnt_ordered_write(RegisterRef reg, uint64_t lanes, u
          static_cast<uint32_t>(issued_[static_cast<size_t>(WaitCounterKind::X)] - through));
 }
 
-void MemoryWaitScoreboard::before(const Instruction &inst, rj_code_arch_t arch) {
+util::FailureOr<std::optional<WaitFields>>
+MemoryWaitScoreboard::runtime_wait_fields(const Instruction &inst, const Wavefront &wf) {
+  std::optional<uint32_t> addend;
+  if (inst.is_waitcnt() && inst.num_src_operands() == 2)
+    addend = RegisterAccess(wf).scalar_control_value(inst.src_operand(0)->encoding_value());
+  return WaitCounterPolicy::explicit_wait_fields(inst, wf.cu().arch(), addend);
+}
+
+void MemoryWaitScoreboard::before(const Instruction &inst, rj_code_arch_t arch,
+                                  const Wavefront *wf) {
   using namespace waitcheck_detail;
   // Most kernels wait well before a queue is full. Avoid classifying the
   // incoming instruction twice unless some ordered class can force progress.
@@ -1656,9 +1717,9 @@ void MemoryWaitScoreboard::before(const Instruction &inst, rj_code_arch_t arch) 
     const auto events = WaitcheckTarget::classify_events(inst, arch);
     if (events.succeeded())
       for (const auto &event : events.value()) {
-        // FLAT may not use either memory domain. Its resolved requests apply
-        // the corresponding capacity constraint after address calculation.
-        if (inst.mnemonic().starts_with("flat_") &&
+        // Fixed-domain FLAT reserves both counter slots before reading its address.
+        // Targets with address-dependent counters apply capacity after routing.
+        if (!flat_issues_both_counter_domains(arch) && inst.mnemonic().starts_with("flat_") &&
             (event.counter == WaitCounterKind::Load || event.counter == WaitCounterKind::Store ||
              event.counter == WaitCounterKind::Ds))
           continue;
@@ -1675,16 +1736,22 @@ void MemoryWaitScoreboard::before(const Instruction &inst, rj_code_arch_t arch) 
     wait(WaitCounterKind::X, 0);
   if (!inst.is_waitcnt() && !inst.has_embedded_memory_wait())
     return;
-  const auto fields = inst.is_waitcnt() ? WaitCounterPolicy::explicit_wait_fields(inst, arch)
-                                        : WaitcheckTarget::embedded_wait_fields(inst, arch);
-  if (fields.failed() || !fields.value())
-    return;
+  const auto fields = !inst.is_waitcnt() ? WaitcheckTarget::embedded_wait_fields(inst, arch)
+                      : wf               ? runtime_wait_fields(inst, *wf)
+                                         : WaitCounterPolicy::explicit_wait_fields(inst, arch);
+  if (fields.succeeded() && fields.value())
+    wait(*fields.value());
+}
+
+void MemoryWaitScoreboard::wait(const WaitFields &fields) { apply_explicit_wait(fields); }
+
+void MemoryWaitScoreboard::apply_explicit_wait(const WaitFields &fields) {
   bool changed = false;
   for (auto counter :
        {WaitCounterKind::Load, WaitCounterKind::Store, WaitCounterKind::Ds, WaitCounterKind::Km,
         WaitCounterKind::Exp, WaitCounterKind::Sample, WaitCounterKind::Bvh, WaitCounterKind::Async,
         WaitCounterKind::Tensor, WaitCounterKind::X})
-    if (const auto value = (*fields.value())[static_cast<size_t>(counter)])
+    if (const auto value = fields[static_cast<size_t>(counter)])
       changed |= apply_wait(counter, *value);
   if (changed)
     retire_completed();
@@ -1723,8 +1790,9 @@ void MemoryWaitScoreboard::check_pending(RegisterRef reg, uint64_t lanes, uint8_
                                          const DeferredWrite *deferred) {
   for (auto &event : events_) {
     // Sharing a counter does not prove ordered writeback. The old result and
-    // incoming write must belong to the same FIFO class, even in a mixed queue.
-    if (event.reported || (!write && event.counter == WaitCounterKind::X) ||
+    // incoming write must also share their VGPR writeback class.
+    if (event.reported || (!write && event.holds_source()) ||
+        (write && ordered_write_order.fifo != kUnordered && !(event.writeback_lanes & lanes)) ||
         (write && ordered_write_order.fifo != kUnordered &&
          event.order == ordered_write_order.fifo &&
          event.writeback == ordered_write_order.writeback && event.ordered_overwrite) ||

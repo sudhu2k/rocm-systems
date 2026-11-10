@@ -700,92 +700,48 @@ public:
   /// @param expcnt Export counter threshold.
   const WaitTarget &wait_target() const { return wait_target_; }
 
-  /// Wait for every modeled memory pipeline, including stores and async DMA.
-  void set_wait_all() {
-    wait_target_ = {.vmcnt = 0,
-                    .lgkmcnt = 0,
-                    .expcnt = 0,
-                    .vscnt = 0,
-                    .dscnt = 0,
-                    .kmcnt = 0,
-                    .tensorcnt = 0,
-                    .asynccnt = 0,
-                    .samplecnt = 0};
+  /// Install the thresholds of the current wait instruction. Unspecified
+  /// counters use their no-wait values, even if a previous wait used them.
+  void wait_for(WaitTarget target) {
+    wait_target_ = target;
     if (!wait_satisfied())
       set_state(WfState::WAITCNT);
+  }
+  void set_wait_target(WaitTarget target) { wait_for(target); }
+  void wait_for_all_memory() { set_wait_all(); }
+
+  /// Wait for every modeled memory pipeline, including stores and async DMA.
+  void set_wait_all() {
+    wait_for({.vmcnt = 0,
+              .lgkmcnt = 0,
+              .expcnt = 0,
+              .vscnt = 0,
+              .dscnt = 0,
+              .kmcnt = 0,
+              .tensorcnt = 0,
+              .asynccnt = 0,
+              .samplecnt = 0,
+              .bvhcnt = 0});
   }
 
   void set_wait_target(uint8_t vmcnt, uint8_t lgkmcnt, uint8_t expcnt) {
-    wait_target_.vmcnt = vmcnt;
-    wait_target_.lgkmcnt = lgkmcnt;
-    wait_target_.expcnt = expcnt;
-    if (!wait_satisfied())
-      set_state(WfState::WAITCNT);
+    wait_for({.vmcnt = vmcnt, .lgkmcnt = lgkmcnt, .expcnt = expcnt});
   }
 
-  /// @brief Set the VSCNT target (GFX10 S_WAITCNT_VSCNT).
-  void set_wait_target_vscnt(uint8_t threshold) {
-    wait_target_.vscnt = threshold;
-    if (!wait_satisfied())
-      set_state(WfState::WAITCNT);
-  }
+  void set_wait_target_vscnt(uint8_t threshold) { wait_for({.vscnt = threshold}); }
+  void set_wait_target_loadcnt(uint8_t threshold) { wait_for({.vmcnt = threshold}); }
+  void set_wait_target_storecnt(uint8_t threshold) { wait_for({.vscnt = threshold}); }
+  void set_wait_target_dscnt(uint8_t threshold) { wait_for({.dscnt = threshold}); }
+  void set_wait_target_kmcnt(uint8_t threshold) { wait_for({.kmcnt = threshold}); }
+  void set_wait_target_tensorcnt(uint8_t threshold) { wait_for({.tensorcnt = threshold}); }
+  void set_wait_target_asynccnt(uint8_t threshold) { wait_for({.asynccnt = threshold}); }
 
-  /// @brief Set the LOADCNT target (GFX11+ S_WAITCNT_VMCNT / S_WAIT_LOADCNT).
-  void set_wait_target_loadcnt(uint8_t threshold) {
-    wait_target_.vmcnt = threshold;
-    if (!wait_satisfied())
-      set_state(WfState::WAITCNT);
-  }
-
-  /// @brief Set the STORECNT target (GFX11+ S_WAITCNT_VSCNT / S_WAIT_STORECNT).
-  void set_wait_target_storecnt(uint8_t threshold) {
-    wait_target_.vscnt = threshold;
-    if (!wait_satisfied())
-      set_state(WfState::WAITCNT);
-  }
-
-  /// @brief Set the DSCNT target (GFX11+ S_WAITCNT_LGKMCNT / S_WAIT_DSCNT).
-  void set_wait_target_dscnt(uint8_t threshold) {
-    wait_target_.dscnt = threshold;
-    if (!wait_satisfied())
-      set_state(WfState::WAITCNT);
-  }
-
-  /// @brief Set the KMCNT target (GFX11+ S_WAIT_KMCNT).
-  void set_wait_target_kmcnt(uint8_t threshold) {
-    wait_target_.kmcnt = threshold;
-    if (!wait_satisfied())
-      set_state(WfState::WAITCNT);
-  }
-
-  /// @brief Set the TENSORCNT target (GFX12.5 S_WAIT_TENSORCNT).
-  void set_wait_target_tensorcnt(uint8_t threshold) {
-    wait_target_.tensorcnt = threshold;
-    if (!wait_satisfied())
-      set_state(WfState::WAITCNT);
-  }
-
-  /// @brief Set the ASYNCCNT target (GFX12.5 S_WAIT_ASYNCCNT).
-  void set_wait_target_asynccnt(uint8_t threshold) {
-    wait_target_.asynccnt = threshold;
-    if (!wait_satisfied())
-      set_state(WfState::WAITCNT);
-  }
-
-  /// @brief Set combined STORECNT + DSCNT targets (GFX12 S_WAIT_STORECNT_DSCNT).
   void set_wait_target_storecnt_dscnt(uint8_t storecnt, uint8_t dscnt) {
-    wait_target_.vscnt = storecnt;
-    wait_target_.dscnt = dscnt;
-    if (!wait_satisfied())
-      set_state(WfState::WAITCNT);
+    wait_for({.vscnt = storecnt, .dscnt = dscnt});
   }
 
-  /// @brief Set combined LOADCNT + DSCNT targets (GFX12 S_WAIT_LOADCNT_DSCNT).
   void set_wait_target_loadcnt_dscnt(uint8_t loadcnt, uint8_t dscnt) {
-    wait_target_.vmcnt = loadcnt;
-    wait_target_.dscnt = dscnt;
-    if (!wait_satisfied())
-      set_state(WfState::WAITCNT);
+    wait_for({.vmcnt = loadcnt, .dscnt = dscnt});
   }
 
   /// @brief Set a single split-wait counter threshold by name.
@@ -797,29 +753,23 @@ public:
     std::string_view name{counter_name};
     auto t = static_cast<uint8_t>(threshold);
     if (name == "wait_loadcnt")
-      set_wait_target_loadcnt(t);
+      set_wait_target_loadcnt(t & WaitCounters::VMCNT_MAX);
     else if (name == "wait_storecnt")
-      set_wait_target_storecnt(t);
+      set_wait_target_storecnt(t & WaitCounters::VSCNT_MAX);
     else if (name == "wait_dscnt")
-      set_wait_target_dscnt(t);
+      set_wait_target_dscnt(t & WaitCounters::DSCNT_MAX);
     else if (name == "wait_kmcnt")
-      set_wait_target_kmcnt(t);
+      set_wait_target_kmcnt(t & WaitCounters::KMCNT_MAX);
     else if (name == "wait_tensorcnt")
-      set_wait_target_tensorcnt(t);
+      set_wait_target_tensorcnt(t & WaitCounters::TENSORCNT_MAX);
     else if (name == "wait_asynccnt")
-      set_wait_target_asynccnt(t);
+      set_wait_target_asynccnt(t & WaitCounters::ASYNCCNT_MAX);
     else if (name == "wait_expcnt") {
-      wait_target_.expcnt = static_cast<uint8_t>(threshold & 0x07);
-      if (!wait_satisfied())
-        set_state(WfState::WAITCNT);
+      wait_for({.expcnt = static_cast<uint8_t>(threshold & 0x07)});
     } else if (name == "wait_samplecnt") {
-      wait_target_.samplecnt = static_cast<uint8_t>(threshold & 0x3f);
-      if (!wait_satisfied())
-        set_state(WfState::WAITCNT);
+      wait_for({.samplecnt = static_cast<uint8_t>(threshold & 0x3f)});
     } else if (name == "wait_bvhcnt") {
-      wait_target_.vmcnt = t; // map to vmcnt
-      if (!wait_satisfied())
-        set_state(WfState::WAITCNT);
+      wait_for({.bvhcnt = static_cast<uint8_t>(t & WaitCounters::BVHCNT_MAX)});
     } else if (name == "wait_loadcnt_dscnt") {
       set_wait_target_loadcnt_dscnt(static_cast<uint8_t>((threshold >> 8) & 0x3F),
                                     static_cast<uint8_t>(threshold & 0x3F));
@@ -1196,7 +1146,20 @@ public:
   /// @brief End program execution. If all memory ops are drained, halts
   /// immediately. Otherwise, transitions to ENDING and lets the memory
   /// pipeline drain remaining ops before halting.
-  void end() {
+  enum class EndReason : uint8_t {
+    Normal,
+    Saved,
+    OrderedPsDone,
+    None,
+    ContextSaved = Saved,
+    OrderedPixelDone = OrderedPsDone
+  };
+  EndReason end_reason() const { return end_reason_; }
+
+  using ProgramEnd = EndReason;
+  ProgramEnd program_end() const { return end_reason(); }
+  void end(EndReason reason = EndReason::Normal) {
+    end_reason_ = reason;
     if (wait_counters_.empty())
       halt();
     else
@@ -1273,6 +1236,7 @@ public:
     if (memory_wait_scoreboard_)
       memory_wait_scoreboard_->clear();
     wait_counters_ = {};
+    end_reason_ = EndReason::None;
     wait_target_ = {};
     ready_cycle_ = 0;
     set_state(WfState::HALTED);
@@ -1493,6 +1457,7 @@ private:
   mutable LdsSourceRead lds_source_read_{};
   mutable bool observing_lds_direct_read_ = false;
   uint64_t ready_cycle_ = 0;
+  EndReason end_reason_ = EndReason::None;
   WaitTarget wait_target_; ///< Current s_waitcnt thresholds.
 
   friend struct ::rocjitsu::config::Gfx10CheckpointResources;

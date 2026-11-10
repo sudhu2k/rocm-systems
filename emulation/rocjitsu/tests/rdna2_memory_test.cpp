@@ -294,6 +294,26 @@ TEST_F(Rdna2MemoryTest, FlatAndBufferAtomicsCheckTheReturnedWidthBeforeRmw) {
   EXPECT_EQ(wave->lds().read32(1024), 42u);
 }
 
+TEST_F(Rdna2MemoryTest, NullifiedMemoryReturnsStillAcquireAndReleaseTheirCounters) {
+  test::execution_plugin::CounterObservingPipeline probe;
+  const std::array local = rdna2::build_ds(rdna2::kDsAddRtnU32, {.vdst = 16});
+  const std::array global =
+      rdna2::build_flat(rdna2::kFlatAtomicAdd, {.seg = 2, .glc = 1, .vdst = 16});
+  const std::array buffer =
+      rdna2::build_mubuf(rdna2::kBufferAtomicAdd, {.glc = 1, .vdata = 16, .soffset = 128});
+  for (const auto &words : {local, global, buffer}) {
+    auto inst = execute(words);
+    ASSERT_TRUE(inst && inst->data());
+    EXPECT_EQ(inst->data_as<amdgpu::VectorMemState>()->exec_mask, 0u);
+    ASSERT_EQ(probe.issue(inst.release(), *wave), amdgpu::VmAccessOutcome::Complete);
+    EXPECT_EQ(probe.counters_at_access.lgkmcnt, words == local ? 1u : 0u);
+    EXPECT_EQ(probe.counters_at_access.vmcnt, words == local ? 0u : 1u);
+    EXPECT_EQ(wave->wait_counters().lgkmcnt, 0u);
+    EXPECT_EQ(wave->wait_counters().vmcnt, 0u);
+    EXPECT_EQ(wave->exec(), 1u);
+  }
+}
+
 TEST_F(Rdna2MemoryTest, RegisterLanePermutationsRespectTheLogicalDestination) {
   v(0, 0);
   v(1, 0x12345678);

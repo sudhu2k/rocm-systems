@@ -93,6 +93,7 @@ public:
                               QueueExceptionDeliveryPolicy delivery_policy =
                                   QueueExceptionDeliveryPolicy::WaitForAcknowledgment,
                               bool retain_wave = true);
+  bool in_multiwave_workgroup() const;
   bool observes_tensor_dma_memory_access() const;
   void report_tensor_dma_memory_access(const TensorDmaMemoryAccessObservation &access);
   bool observes_tensor_dma_issue() const;

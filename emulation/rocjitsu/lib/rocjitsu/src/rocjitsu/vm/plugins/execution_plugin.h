@@ -392,4 +392,12 @@ private:
   PluginSink *sink_ = &StderrSink::instance();
 };
 
+/// A full workgroup barrier also synchronizes completed writes from waves that
+/// have already exited. Only live waves remain in the callback span.
+class AmdgpuWorkgroupBarrierObserver {
+public:
+  virtual ~AmdgpuWorkgroupBarrierObserver() = default;
+  virtual void onAmdgpuWorkgroupBarrierResolved(std::span<amdgpu::Wavefront *> wavefronts) = 0;
+};
+
 } // namespace rocjitsu

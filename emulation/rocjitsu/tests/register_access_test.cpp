@@ -1412,8 +1412,8 @@ TEST(RegisterAccessTest, IssuedScalarReturningAtomicChecksTtmpWritePermission) {
     fx.wf->debug_write_sgpr(0, data);
     fx.wf->debug_write_sgpr(1, 0);
     fx.gpu_mem.write32(data, 12);
-    const auto words =
-        cdna2::build_smem(cdna2::kSAtomicAddSmem, {.sbase = 0, .sdata = 112, .glc = 1, .imm = 1});
+    const auto words = cdna2::build_smem(cdna2::kSAtomicAddSmem,
+                                         {.sbase = 0, .sdata = 112, .glc = 1, .imm = 1});
     fx.gpu_mem.write32(code, words[0]);
     fx.gpu_mem.write32(code + 4, words[1]);
     fx.gpu_mem.write32(code + 8, 0xbe860070u); // s_mov_b32 s6, ttmp4

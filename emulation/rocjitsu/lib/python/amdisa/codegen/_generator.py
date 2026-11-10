@@ -8322,23 +8322,24 @@ class CodeGenerator:
         if cls == 'wait_counter':
             # RDNA4 split-wait instructions: the immediate operand is
             # the counter threshold directly (no bit-packing).
-            L.append(
-                f'  uint16_t cnt = static_cast<uint16_t>({src_ops[0]}.encoding_value_);'
-            )
-            if op == 'waitcnt_vscnt':
-                L.append('  wf.set_wait_target_vscnt(static_cast<uint8_t>(cnt));')
-            elif op == 'waitcnt_vmcnt':
-                L.append('  wf.set_wait_target_loadcnt(static_cast<uint8_t>(cnt));')
-            elif op == 'waitcnt_expcnt':
-                L.append('  wf.set_wait_counter("wait_expcnt", cnt);')
-            elif op == 'waitcnt_lgkmcnt':
-                L.append('  const auto current_wait = wf.wait_target();')
-                L.append(
-                    '  wf.set_wait_target(current_wait.vmcnt, static_cast<uint8_t>(cnt), current_wait.expcnt);'
+            if op.startswith('waitcnt_'):
+                field = op.removeprefix('waitcnt_')
+                mask = '0x7u' if field == 'expcnt' else '0x3fu'
+                scalar_part = (
+                    'amdgpu::RegisterAccess(wf).read_scalar(sdst) + '
+                    if self.isa_spec.profile.waitcnt_family == 'gfx10'
+                    else ''
                 )
-            else:
-                L.append(f'  wf.set_wait_counter("{op}", cnt);')
-            return '\n'.join(L)
+                return (
+                    '  const uint32_t threshold = '
+                    + scalar_part
+                    + 'static_cast<uint32_t>(simm16.encoding_value_);\n'
+                    f'  wf.wait_for({{.{field} = static_cast<uint8_t>(threshold & {mask})}});'
+                )
+            return (
+                f'  wf.set_wait_counter("{op}", '
+                f'static_cast<uint16_t>({src_ops[0]}.encoding_value_));'
+            )
 
         if cls == 'tensor_load_to_lds':
             return (
@@ -9733,6 +9734,8 @@ class CodeGenerator:
     ) -> str | None:
         """Return the additional counter used by a generic FLAT instruction."""
         kind = self._MEMORY_ISSUE_KINDS[sem_class]
+        if sem_class == 'buffer_store_from_lds':
+            return 'amdgpu::WaitCounterType::LGKMCNT'
         if not kind.startswith('flat_'):
             return None
         if 'seg' not in inst_fields and not sem.name.startswith('FLAT_'):
@@ -9879,6 +9882,12 @@ class CodeGenerator:
         args = '{' + ', '.join(obligations) + '}'
         if not exec_masked:
             args += ', false'
+        elif (
+            self.isa_spec.arch_name == 'rdna3_5'
+            and 'gds' in inst_fields
+            and self._MEMORY_ISSUE_KINDS[sem_class] == 'local'
+        ):
+            args += ', !inst_.gds'
         return f'set_memory_issue_info({args});'
 
     def _append_wait_counter_type(
