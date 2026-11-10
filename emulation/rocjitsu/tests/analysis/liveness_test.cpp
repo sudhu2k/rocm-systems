@@ -8594,6 +8594,42 @@ std::unique_ptr<Instruction> decode_cdna1(std::initializer_list<uint32_t> words)
   return std::unique_ptr<Instruction>(decoder ? decode_valid(*decoder, buf.data()) : nullptr);
 }
 
+TEST(GeneratedInstDefUse, Gfx1150ExportTracksEnabledChannelsAndRowSource) {
+  constexpr auto arch = ROCJITSU_CODE_ARCH_RDNA3_5;
+  auto decoder = Decoder::create(arch);
+  ASSERT_NE(decoder, nullptr);
+  constexpr std::array<uint16_t, 4> sources{0, 5, 9, 17};
+  for (uint8_t mask = 0; mask < 16; ++mask) {
+    for (bool row_en : {false, true}) {
+      SCOPED_TRACE(testing::Message() << "EN=" << +mask << " ROW_EN=" << row_en);
+      auto words = rdna3_5::build_exp({.en = mask,
+                                       .tgt = 12,
+                                       .row_en = row_en,
+                                       .vsrc0 = 0,
+                                       .vsrc1 = 5,
+                                       .vsrc2 = 9,
+                                       .vsrc3 = 17});
+      TestCodeObject co({words[0], words[1], rdna3_5::build_sopp(rdna3_5::kSEndpgmSopp)[0]});
+      auto blocks = build_valid_blocks(co, *decoder, arch);
+      ASSERT_EQ(blocks.size(), 1u);
+      auto scope = block_scope(blocks);
+      LivenessAnalysis liveness(KernelBlockScope(scope), 32);
+      const auto &inst = *blocks.front()->instructions().begin();
+      InstDefUse du(inst, 32);
+      const auto live = liveness.live_before(inst);
+      ASSERT_TRUE(live.succeeded());
+      for (unsigned channel = 0; channel < sources.size(); ++channel) {
+        const RegisterRef reg{RegClass::VGPR, sources[channel], 1};
+        const bool enabled = mask & (1u << channel);
+        EXPECT_EQ(du.uses.contains(reg), enabled) << channel;
+        EXPECT_EQ(live.value()->contains(reg), enabled) << channel;
+      }
+      EXPECT_TRUE(du.uses.contains({RegClass::EXEC, 0, 1}));
+      EXPECT_EQ(du.uses.contains({RegClass::M0, 0, 1}), row_en);
+    }
+  }
+}
+
 TEST(GeneratedInstDefUse, Gfx1150D16SampleKeepsPackedDataHalfLive) {
   auto decoder = Decoder::create(ROCJITSU_CODE_ARCH_RDNA3_5);
   ASSERT_NE(decoder, nullptr);

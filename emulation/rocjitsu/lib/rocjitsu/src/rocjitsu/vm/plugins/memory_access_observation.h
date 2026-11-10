@@ -283,8 +283,8 @@ struct MemoryAccessObservation {
   /// twice @ref bytes_per_lane().
   std::span<const uint64_t> secondary_addresses;
   /// @brief Per-texel footprints of sample, gather and multisample-load instructions.
-  /// @details IMAGE_SAMPLE*, IMAGE_GATHER4* and IMAGE_MSAA_LOAD replace addresses with these footprints,
-  /// including point samples. Each has wavefront_size addresses and a lane mask
+  /// @details IMAGE_SAMPLE*, IMAGE_GATHER4* and IMAGE_MSAA_LOAD replace addresses with these
+  /// footprints, including point samples. Each has wavefront_size addresses and a lane mask
   /// contained in request_lane_mask. Border/zero-weight taps have cleared masks.
   /// bytes_per_lane() is bytes per texel; all footprints share one instruction
   /// issue and one completion-counter event. A null resource or unbacked sampler

@@ -172,6 +172,9 @@ table WavefrontState {
   // GFX11 user-visible prefetch and launch flags. Wave size is reconstructed at restore.
   ib_sts2_gfx11: uint32;
   exceptions: WaveExceptionRegisters;
+  // Non-RDNA2 waves distinguish direct memory from the standalone VM's identity mapping.
+  // Older records with process-owned GFX12 work cannot establish which mapping was used.
+  uses_internal_address_space: bool = null;
 }
 
 /// A formerly multiwave group retains its barriers even with one live member.
@@ -217,6 +220,8 @@ table ComputeUnitState {
   // records used its length as the bump allocator reservation.
   lds: [ubyte];
   lds_cursor: uint32 = null;
+  // Raw simulation ticks for the shader realtime clock. GFX10 stores these in gfx10_scheduling.
+  model_realtime: uint64 = null;
 }
 
 /// Serialized state of a command processor.

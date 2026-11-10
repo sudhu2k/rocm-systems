@@ -5,11 +5,14 @@
 #include "rocjitsu/config/config_common.h"
 #include "rocjitsu/config/config_loader.h"
 #include "rocjitsu/config/gfx10_checkpoint_resources.h"
+#include "rocjitsu/config/gfx10_checkpoint_scheduler.h"
 #include "rocjitsu/isa/arch/amdgpu/cdna3/sgpr_layout.h"
 #include "rocjitsu/isa/arch/amdgpu/generated/shared/isa_properties.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/accvgpr_layout.h"
+#include "rocjitsu/isa/arch/amdgpu/shared/wait_counter_policy.h"
 #include "rocjitsu/vm/amdgpu/matrix_coexecution.h"
 #include "rocjitsu/vm/amdgpu/partitioning.h"
+#include "rocjitsu/vm/amdgpu/workgroup_key.h"
 #include "rocjitsu/vm/virtual_machine.h"
 
 #include "checkpoint_generated.h"
@@ -21,6 +24,8 @@
 #include <cstddef>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -32,6 +37,126 @@ namespace {
 bool checkpoint_cu_owned_lds(rj_code_arch_t arch) {
   return arch != ROCJITSU_CODE_ARCH_RDNA1 && arch != ROCJITSU_CODE_ARCH_RDNA2 &&
          arch != ROCJITSU_CODE_ARCH_RV32I && arch != ROCJITSU_CODE_ARCH_RV64I;
+}
+
+const char *checkpoint_group_target(rj_code_arch_t arch) {
+  if (arch == ROCJITSU_CODE_ARCH_RDNA4)
+    return "RDNA4";
+  if (arch == ROCJITSU_CODE_ARCH_CDNA5)
+    return "CDNA5";
+  return arch_to_string(arch);
+}
+
+bool checkpoint_tracks_workgroups(rj_code_arch_t arch) {
+  return arch_is_cdna_4_or_lower(arch) || arch == ROCJITSU_CODE_ARCH_RDNA3 ||
+         arch == ROCJITSU_CODE_ARCH_RDNA3_5 ||
+         amdgpu::Wavefront::supports_sleep_wakeup_credit(arch);
+}
+
+// Check the group graph before modifying a CU, or opening the output file on save.
+util::Result validate_checkpoint_groups(const fb::ComputeUnitState &state, uint32_t slots,
+                                        const flatbuffers::Vector<uint32_t> *cursors,
+                                        rj_code_arch_t arch, util::DiagnosticEmitter emit_error) {
+  const auto *target = checkpoint_group_target(arch);
+  const auto *groups = state.rdna4_workgroups();
+  if ((cursors != nullptr) != (groups != nullptr))
+    return emit_error.emit() << "Inconsistent " << target << " checkpoint workgroup metadata";
+  struct Group {
+    const fb::Rdna4CheckpointGroup *record;
+    uint32_t seen = 0;
+    uint32_t process = 0, queue = 0;
+  };
+  std::unordered_map<uint64_t, Group> by_key;
+  if (groups) {
+    for (const auto *group : *groups) {
+      const auto live = group->live_members();
+      if (!live || live > slots || (!group->multiwave() && live != 1) ||
+          group->workgroup_signals() >= live || group->trap_signals() >= live ||
+          !by_key.emplace(amdgpu::wg_key(group->dispatch_id(), group->wg_id()), Group{group})
+               .second)
+        return emit_error.emit() << "Invalid " << target
+                                 << " checkpoint workgroup count or duplicate identity";
+    }
+  }
+  if (const auto *waves = state.wavefronts()) {
+    std::unordered_set<uint32_t> seen_slots;
+    for (const auto *wave : *waves) {
+      if (!groups) {
+        // RDNA4 has required identity for sleep since this layout was introduced.
+        // Older CDNA5 files stored wave-local timers and may carry a wake
+        // credit. Restore those fields even when no group table was recorded.
+        if (arch == ROCJITSU_CODE_ARCH_RDNA4 && (wave->sleep_cycles() || wave->sleep_wakeup()))
+          return emit_error.emit()
+                 << "Legacy RDNA4 checkpoint lacks workgroup identity for sleeping wave";
+        continue;
+      }
+      if (wave->wf_id() >= slots || !seen_slots.insert(wave->wf_id()).second)
+        return emit_error.emit() << "Invalid " << target << " checkpoint wave slot";
+      if (std::find(cursors->begin(), cursors->end(), wave->dispatch_id()) != cursors->end())
+        return emit_error.emit() << target << " checkpoint dispatch cursor aliases a live wave";
+      auto it = by_key.find(amdgpu::wg_key(wave->dispatch_id(), wave->wg_id()));
+      const auto waiting = wave->waiting_barrier();
+      const auto complete = wave->barrier_complete_mask();
+      if (complete > 3 || waiting > 2 || (waiting && (complete & (1u << (waiting - 1)))) ||
+          (waiting && (it == by_key.end() || !it->second.record->multiwave())))
+        return emit_error.emit() << "Invalid " << target
+                                 << " checkpoint wave barrier or wake state";
+      if (it == by_key.end())
+        continue; // Directly dispatched standalone wave.
+      auto &group = it->second;
+      if (group.seen && (group.process != wave->process_id() || group.queue != wave->queue_id()))
+        return emit_error.emit() << "Inconsistent " << target
+                                 << " checkpoint workgroup process or queue";
+      group.process = wave->process_id();
+      group.queue = wave->queue_id();
+      ++group.seen;
+    }
+  }
+  for (const auto &[key, group] : by_key)
+    if (group.seen != group.record->live_members())
+      return emit_error.emit() << target
+                               << " checkpoint workgroup member count differs from saved waves";
+  return util::Result::success();
+}
+
+util::Result validate_checkpoint_workgroups(const fb::SimulationCheckpoint &checkpoint,
+                                            const SoC &soc, util::DiagnosticEmitter emit_error) {
+  const auto *cursors = checkpoint.rdna4_next_dispatch_ids();
+  const auto *units = checkpoint.compute_units();
+  const bool groups_supported = checkpoint_tracks_workgroups(soc.arch());
+  const auto *target = checkpoint_group_target(soc.arch());
+  if (cursors && (!groups_supported || cursors->size() != soc.xcds().size()))
+    return emit_error.emit() << "Invalid " << target << " checkpoint dispatch cursor count";
+  size_t i = 0;
+  for (size_t x = 0; x < soc.xcds().size(); ++x) {
+    auto *xcd = soc.xcds()[x];
+    if (cursors) {
+      const uint32_t cursor = cursors->Get(x);
+      if (cursor < x + 1 || (cursor - x - 1) % soc.num_xcds() != 0)
+        return emit_error.emit() << "Invalid " << target << " checkpoint dispatch cursor for XCD "
+                                 << x;
+    }
+    for (auto *se : xcd->shader_engines())
+      for (uint32_t ci = 0; ci < se->num_compute_units(); ++ci, ++i) {
+        const auto *unit = units && i < units->size() ? units->Get(i) : nullptr;
+        if (!unit) {
+          if (cursors)
+            return emit_error.emit() << "Missing " << target << " checkpoint compute unit";
+          continue;
+        }
+        if (groups_supported) {
+          if (validate_checkpoint_groups(*unit, se->compute_unit(ci)->num_wf_slots(), cursors,
+                                         soc.arch(), emit_error)
+                  .failed())
+            return util::Result::failure();
+        } else if (unit->rdna4_workgroups())
+          return emit_error.emit()
+                 << "GFX12 group metadata on incompatible checkpoint architecture";
+      }
+  }
+  if (cursors && units && i != units->size())
+    return emit_error.emit() << "Invalid " << target << " checkpoint compute unit count";
+  return util::Result::success();
 }
 
 /// @brief First scalar selector that named a TTMP before TTMPs became their own
@@ -273,13 +398,13 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
   if (!covers_tree(covers_tree, soc.component_root()) || !serialized_cus.empty())
     return emit_error.emit() << "Cannot checkpoint topology: serialization does not cover every CU";
 
+  const bool gfx12 = amdgpu::Wavefront::supports_sleep_wakeup_credit(soc.arch());
+  const bool groups_supported = checkpoint_tracks_workgroups(soc.arch());
   flatbuffers::FlatBufferBuilder builder(1024 * 1024);
 
   // Serialize compute unit states across all XCDs and their shader engines.
-  const bool gfx12 =
-      soc.arch() == ROCJITSU_CODE_ARCH_RDNA4 || soc.arch() == ROCJITSU_CODE_ARCH_CDNA5;
-  std::vector<flatbuffers::Offset<fb::ComputeUnitState>> cu_offsets;
   std::unordered_set<uint32_t> live_dispatch_ids;
+  std::vector<flatbuffers::Offset<fb::ComputeUnitState>> cu_offsets;
   for (auto *xcd : soc.xcds()) {
     for (auto *se : xcd->shader_engines()) {
       for (uint32_t ci = 0; ci < se->num_compute_units(); ++ci) {
@@ -287,6 +412,19 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
         if (cu->gws_device().tracked_process_count() != 0)
           return emit_error.emit() << "Cannot checkpoint GWS resource state: the shared table "
                                       "is not part of the checkpoint format";
+        const bool gfx10 = Gfx10CheckpointResources::supported(*cu);
+        flatbuffers::Offset<fb::Gfx10CuResources> cu_resources;
+        flatbuffers::Offset<fb::Gfx10CuScheduling> cu_scheduling;
+        if (gfx10) {
+          auto resources = Gfx10CheckpointResources::save_cu(builder, *cu, emit_error);
+          if (resources.failed())
+            return util::Result::failure();
+          cu_resources = resources.value();
+          auto scheduling = Gfx10CheckpointScheduler::save_cu(builder, *cu, emit_error);
+          if (scheduling.failed())
+            return util::Result::failure();
+          cu_scheduling = scheduling.value();
+        }
         const bool cdna3_wave = cu->arch() == ROCJITSU_CODE_ARCH_CDNA3;
         const bool cu_owned_lds = checkpoint_cu_owned_lds(cu->arch());
         const auto lds_cursor =
@@ -294,18 +432,7 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
         uint64_t lds_end =
             cu_owned_lds ? std::max<uint64_t>(*lds_cursor, cu->lds().materialized_size_bytes()) : 0;
         if (cu_owned_lds && cu->lds_allocation_pinned())
-          return emit_error.emit() << "Cannot checkpoint shared LDS reservations on " << cu->name();
-        if (gfx12 && cu->has_registered_workgroups())
-          return emit_error.emit()
-                 << "Cannot checkpoint resident GFX12 workgroups without their scheduler records";
-        const bool gfx10 = Gfx10CheckpointResources::supported(*cu);
-        flatbuffers::Offset<fb::Gfx10CuResources> cu_resources;
-        if (gfx10) {
-          auto saved = Gfx10CheckpointResources::save_cu(builder, *cu, emit_error);
-          if (saved.failed())
-            return util::Result::failure();
-          cu_resources = saved.value();
-        }
+          return emit_error.emit() << "Cannot checkpoint a pinned LDS allocation";
         std::vector<flatbuffers::Offset<fb::WavefrontState>> wf_offsets;
         std::vector<uint32_t> register_blocks;
         for (uint32_t i = 0; i < cu->num_wf_slots(); ++i) {
@@ -315,25 +442,47 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
           if (!w || w->is_halted())
             continue;
 
-          // The record holds the architectural registers and the TTMPs, but
-          // none of the trap/debug state around them: in_trap_handler, the
-          // saved EXEC and STATUS the handler will restore, TRAPSTS, and the
-          // halted/suspended reasons. Restoring a wave captured mid-handler
-          // from such a record would skip the EXEC restore and the privileged
-          // STATUS write on the way out and resume the application with the
-          // handler's state installed -- silently wrong, and hard to trace
-          // back here. Refuse instead of writing a checkpoint that cannot be
-          // restored faithfully.
+          // The group record contains only workgroup/trap barrier counters.
+          // A nonzero named-barrier state means its allocation or membership
+          // would be lost, changing the recipients of a later S_WAKEUP.
+          if (gfx12 && w->barrier_state(1) != 0)
+            return emit_error.emit()
+                   << "Cannot checkpoint a GFX12 workgroup with allocated named barriers";
+          const bool rdna2 = cu->arch() == ROCJITSU_CODE_ARCH_RDNA2;
+          // Only the SoC's built-in identity mapping and direct standalone memory
+          // are present in this file. A PASID alone cannot restore a frontend VM.
+          const bool internal =
+              w->address_space() && w->address_space() == soc.internal_address_space();
+          const auto *access = w->vm_access();
+          if ((!internal && (w->address_space() || access || (rdna2 && w->process_id()))) ||
+              (access && (!access->is_current() ||
+                          access->cache_namespace().address_space != w->address_space())))
+            return emit_error.emit() << "Cannot checkpoint a resident wave with an "
+                                        "external or stale address space";
+
+          // A mid-handler checkpoint also needs the interrupted EXEC, any pending
+          // debugger edit to the resume mask, and saved STATUS.PRIV. The record
+          // omits these fields and the trap/debug reasons that own the stopped wave.
           //
           // Queue suspension belongs to the live command processor. A restored
           // checkpoint has no registered queue that can resume this wave.
           if (w->runtime_suspended())
             return emit_error.emit() << "Cannot checkpoint a wave suspended by its runtime queue";
+          // A GFX10 wave stopped by its own S_SETHALT has no external owner.
+          const bool shader_stop = gfx10 && w->self_halted() && w->debug_halted() &&
+                                   !w->debug_suspended() && !cu->debug_active();
+          if (cu_owned_lds && w->state() != amdgpu::WfState::RUNNING) {
+            const bool recorded_barrier = gfx12 && w->state() == amdgpu::WfState::BARRIER &&
+                                          w->checkpoint_waiting_barrier() != 0;
+            if (!recorded_barrier)
+              return emit_error.emit()
+                     << "Cannot checkpoint AMDGPU state without its scheduler record on "
+                     << cu->name();
+          }
           if (cu_owned_lds &&
-              (w->state() != amdgpu::WfState::RUNNING || w->sleep_cycles() ||
-               w->ready_cycle() > cu->cycle_count() || w->fatal_exception_pending()))
+              (w->ready_cycle() > cu->cycle_count() || w->fatal_exception_pending()))
             return emit_error.emit()
-                   << "Cannot checkpoint AMDGPU state without its scheduler record on "
+                   << "Cannot checkpoint a delayed or exception-pending AMDGPU wave on "
                    << cu->name();
           // GFX10 has a separate resource record for restorable scratch allocations.
           if (cu_owned_lds && w->scratch_lane_size())
@@ -344,13 +493,19 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
                (w->memory_wait_scoreboard() && !w->memory_wait_scoreboard()->empty())))
             return emit_error.emit()
                    << "Cannot checkpoint pending AMDGPU memory or wait state on " << cu->name();
-          if (w->in_trap_handler() || w->debug_stopped())
+          if (w->in_trap_handler() || (w->debug_stopped() && !shader_stop))
             return emit_error.emit()
                    << "Cannot checkpoint " << cu->name() << " wf" << w->wf_id()
                    << ": the wave is in a trap handler or stopped for a debugger, and that state "
                       "is not part of the checkpoint format";
 
-          const bool rdna2 = cu->arch() == ROCJITSU_CODE_ARCH_RDNA2;
+          if (rdna2) {
+            const auto block = w->vgpr_alloc().base / cu->vgpr_allocation_block_size();
+            if (block != w->sgpr_alloc().base / cu->sgpr_allocation_block_size())
+              return emit_error.emit()
+                     << "Cannot checkpoint separately placed RDNA2 register blocks";
+            register_blocks.push_back(block);
+          }
           const bool cdna4 = cu->arch() == ROCJITSU_CODE_ARCH_CDNA4;
           uint32_t sgpr_words = w->num_sgprs();
           if (rdna2)
@@ -382,6 +537,22 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
           const auto &wg_coord = w->wg_coord();
           auto wg_coord_vec = builder.CreateVector(wg_coord.data(), wg_coord.size());
 
+          flatbuffers::Offset<fb::Gfx10WaveResources> wave_resources;
+          flatbuffers::Offset<fb::Gfx10WaveScheduling> wave_scheduling;
+          if (gfx10) {
+            auto resources = Gfx10CheckpointResources::save_wave(builder, *cu, *w,
+                                                                 rdna2 && internal, emit_error);
+            if (resources.failed())
+              return util::Result::failure();
+            wave_resources = resources.value();
+            auto scheduling = Gfx10CheckpointScheduler::save_wave(builder, *cu, *w, emit_error);
+            if (scheduling.failed())
+              return util::Result::failure();
+            wave_scheduling = scheduling.value();
+          }
+          const fb::Rdna2WaveRegisters registers(w->num_sgprs(), w->num_vgprs(), w->trapsts());
+          if (groups_supported)
+            live_dispatch_ids.insert(w->dispatch_id());
           const fb::LdsWindow lds_window(w->lds_base(), w->lds_size());
           if (cu_owned_lds) {
             const uint64_t end = uint64_t{w->lds_base()} + w->lds_size();
@@ -390,78 +561,46 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
             if (w->lds_size())
               lds_end = std::max(lds_end, end);
           }
-          const bool internal =
-              rdna2 && w->address_space() && w->address_space() == soc.internal_address_space();
-          flatbuffers::Offset<fb::Gfx10WaveResources> resources;
-          if (gfx10) {
-            auto saved =
-                Gfx10CheckpointResources::save_wave(builder, *cu, *w, internal, emit_error);
-            if (saved.failed())
-              return util::Result::failure();
-            resources = saved.value();
-          }
+          const flatbuffers::Optional<uint32_t> num_sgprs =
+              cdna4 ? flatbuffers::Optional<uint32_t>(w->num_sgprs()) : flatbuffers::nullopt;
+          const flatbuffers::Optional<uint32_t> num_vgprs =
+              gfx10 ? std::nullopt : std::optional{w->num_vgprs()};
           const fb::WaveExceptionRegisters exceptions(
               w->trapsts(), w->gfx12_excp_flag_user_extra_raw(), w->gfx12_trap_ctrl_raw());
-          fb::WavefrontStateBuilder record(builder);
-          record.add_exceptions(&exceptions);
-          if (gfx10)
-            record.add_gfx10_resources(resources);
-          record.add_wf_id(w->wf_id());
-          record.add_wg_id(w->wg_id());
-          record.add_dispatch_id(w->dispatch_id());
-          if (gfx12) {
-            live_dispatch_ids.insert(w->dispatch_id());
-            record.add_process_id(w->process_id());
-            record.add_queue_id(w->queue_id());
-            record.add_wave_in_group(w->wave_in_group());
-          }
-          record.add_pc(w->pc);
-          record.add_exec(w->exec_raw());
-          record.add_vcc(w->vcc());
-          record.add_m0(w->m0());
-          record.add_halted(w->is_halted());
-          record.add_status(w->status_raw());
-          if (cu->arch() == ROCJITSU_CODE_ARCH_RDNA3 || cu->arch() == ROCJITSU_CODE_ARCH_RDNA3_5 ||
-              cu->arch() == ROCJITSU_CODE_ARCH_RDNA4)
-            record.add_graphics_wait(fb::GraphicsWait_LaunchDefaults);
-          record.add_sgprs(sgprs_vec);
-          record.add_vgprs(vgprs_vec.value());
-          record.add_mode(w->mode_raw());
-          record.add_wave_sched_mode(w->wave_sched_mode_raw());
-          record.add_ttmps(ttmps_vec);
-          record.add_wg_coord(wg_coord_vec);
-          record.add_kernel_wave_size(w->kernel_wave_size());
-          record.add_vgpr_lane_count(w->wf_size());
-          record.add_setreg_vgpr_msb_hazard(w->setreg_vgpr_msb_hazard());
-          if (rdna2) {
-            const auto block = w->vgpr_alloc().base / cu->vgpr_allocation_block_size();
-            if (block != w->sgpr_alloc().base / cu->sgpr_allocation_block_size())
-              return emit_error.emit()
-                     << "Cannot checkpoint separately placed RDNA2 register blocks";
-            register_blocks.push_back(block);
-            const fb::Rdna2WaveRegisters registers(w->num_sgprs(), w->num_vgprs(), w->trapsts());
-            record.add_rdna2_registers(&registers);
-            record.add_rdna2_allocation_state_known(true);
-            record.add_rdna2_lds_base(w->lds_base());
-            record.add_rdna2_scratch_base(w->scratch_base());
-            record.add_rdna2_process_id(w->process_id());
-            record.add_rdna2_internal_address_space(internal);
-          }
-          if (cu_owned_lds) {
-            record.add_lds_window(&lds_window);
-            record.add_flat_scratch(w->scratch_base());
-          }
-          if (cdna3_wave)
-            record.add_requested_sgprs(w->num_sgprs());
-          if (cdna4)
-            record.add_num_sgprs(w->num_sgprs());
-          if (!gfx10)
-            record.add_num_vgprs(w->num_vgprs());
-          if (cdna4 || cu->arch() == ROCJITSU_CODE_ARCH_CDNA2)
-            record.add_accum_vgpr_base(w->accum_vgpr_base());
-          wf_offsets.push_back(record.Finish());
+          auto wfs = fb::CreateWavefrontState(
+              builder, w->wf_id(), w->wg_id(), w->pc, w->exec_raw(), w->vcc(), w->m0(),
+              w->is_halted(), w->status_raw(), sgprs_vec, vgprs_vec.value(), w->mode_raw(),
+              w->wave_sched_mode_raw(), ttmps_vec, wg_coord_vec, w->kernel_wave_size(),
+              w->wf_size(), w->setreg_vgpr_msb_hazard(), wave_resources, wave_scheduling,
+              w->dispatch_id(), w->sleep_cycles(), rdna2, rdna2 ? w->lds_base() : 0,
+              rdna2 ? w->scratch_base() : 0, rdna2 ? std::optional{w->process_id()} : std::nullopt,
+              rdna2 && internal, rdna2 ? &registers : nullptr, gfx12 && w->sleep_wakeup(),
+              groups_supported ? w->process_id() : 0, groups_supported ? w->queue_id() : 0,
+              groups_supported ? w->wave_in_group() : 0,
+              gfx12 ? unsigned(w->workgroup_barrier_complete()) |
+                          (unsigned(w->trap_barrier_complete()) << 1)
+                    : 0,
+              gfx12 ? w->checkpoint_waiting_barrier() : 0,
+              cdna3_wave ? std::optional{w->num_sgprs()} : std::nullopt,
+              cu_owned_lds ? std::optional{w->scratch_base()} : std::nullopt,
+              cu_owned_lds ? &lds_window : nullptr, num_vgprs,
+              (cdna4 || cu->arch() == ROCJITSU_CODE_ARCH_CDNA2) ? w->accum_vgpr_base() : 0,
+              num_sgprs, flatbuffers::nullopt,
+              (cu->arch() == ROCJITSU_CODE_ARCH_RDNA3 || cu->arch() == ROCJITSU_CODE_ARCH_RDNA3_5)
+                  ? w->ib_sts2_gfx11() & ~(1u << 11)
+                  : 0,
+              &exceptions, rdna2 ? std::nullopt : std::optional{internal});
+          wf_offsets.push_back(wfs);
         }
 
+        flatbuffers::Offset<flatbuffers::Vector<const fb::Rdna4CheckpointGroup *>> group_vec;
+        if (groups_supported) {
+          std::vector<fb::Rdna4CheckpointGroup> groups;
+          for (const auto &g : cu->rdna4_checkpoint_groups())
+            groups.emplace_back(g.dispatch_id, g.wg_id, g.live_members, g.workgroup_signals,
+                                g.trap_signals, g.multiwave);
+          group_vec = builder.CreateVectorOfStructs(groups);
+        }
         flatbuffers::Offset<flatbuffers::Vector<uint8_t>> lds;
         if (cu_owned_lds && (!wf_offsets.empty() || lds_end)) {
           if (lds_end > cu->lds().size_bytes() || lds_end > UINT32_MAX)
@@ -474,16 +613,14 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
         }
         auto name = builder.CreateString(cu->name());
         auto wfs_vec = builder.CreateVector(wf_offsets);
-        // Standalone GFX12 waves use an empty group table to mark their saved identity.
-        const auto groups =
-            gfx12 ? builder.CreateVectorOfStructs<fb::Rdna4CheckpointGroup>(nullptr, 0) : 0;
         auto cus = fb::CreateComputeUnitState(
             builder, name, wfs_vec, 0, cu->config().functional_quantum, true,
             cu->config().memory_wait_diagnostics != amdgpu::MemoryWaitDiagnostics::Off,
             cu->config().xcnt_diagnostics != amdgpu::MemoryWaitDiagnostics::Off,
             cu->config().gws_wait_limit, arithmetic_to_fb(builder, cu->config().arithmetic),
-            cu_resources, 0, 0, register_blocks.empty() ? 0 : builder.CreateVector(register_blocks),
-            groups, lds, lds_cursor);
+            cu_resources, cu_scheduling, cu->cycle_count(),
+            register_blocks.empty() ? 0 : builder.CreateVector(register_blocks), group_vec, lds,
+            lds_cursor, gfx10 ? std::nullopt : std::optional{cu->model_realtime_timestamp()});
 
         cu_offsets.push_back(cus);
       }
@@ -503,8 +640,8 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
         return emit_error.emit() << "Cannot checkpoint AQL workgroups awaiting launch "
                                     "or a pending completion signal";
       auto next = xcd_cp->next_dispatch_id_for_topology(i, soc.num_xcds());
-      // Standalone waves can install a dispatch ID without consuming it from the command processor.
-      while (live_dispatch_ids.contains(next))
+      // Direct CU dispatch can install an ID without consuming it from the CP.
+      while (groups_supported && live_dispatch_ids.contains(next))
         next = amdgpu::CommandProcessor::step_dispatch_id(next, i + 1, soc.num_xcds());
       cursors.push_back(next);
     }
@@ -530,8 +667,13 @@ util::Result save_checkpoint(const std::string &path, const SoC &soc, uint64_t t
                                         async_helper_threads);
 
   auto checkpoint = fb::CreateSimulationCheckpoint(builder, tick, config_offset, cu_vec, cp_offset,
-                                                   mem_state, gfx12 ? cursor_vec : 0);
+                                                   mem_state, groups_supported ? cursor_vec : 0);
   builder.Finish(checkpoint);
+  if (groups_supported &&
+      validate_checkpoint_workgroups(*fb::GetSimulationCheckpoint(builder.GetBufferPointer()), soc,
+                                     emit_error)
+          .failed())
+    return util::Result::failure();
 
   // Write to file.
   std::ofstream f(path, std::ios::binary);
@@ -655,6 +797,13 @@ util::FailureOr<LoadedConfig> restore_checkpoint(const std::string &path,
     }
   }
 
+  if (validate_checkpoint_workgroups(*checkpoint, *soc, emit_error).failed())
+    return util::Result::failure();
+  if (const auto *cursors = checkpoint->rdna4_next_dispatch_ids())
+    for (size_t i = 0; i < soc->xcds().size(); ++i)
+      soc->xcds()[i]->command_processor()->restore_dispatch_id_sequence(i, cursors->size(),
+                                                                        cursors->Get(i));
+
   // Restore GPU memory pages.
   if (auto *mem_state = checkpoint->memory()) {
     if (auto *pages = mem_state->pages()) {
@@ -682,16 +831,19 @@ util::FailureOr<LoadedConfig> restore_checkpoint(const std::string &path,
       if (!cu_state)
         continue;
       auto *cu = all_cus[i];
-      if (const auto *groups = cu_state->rdna4_workgroups(); groups && groups->size())
-        return emit_error.emit()
-               << "Cannot restore resident GFX12 workgroups without scheduler support";
       const auto *cu_resources = cu_state->gfx10_resources();
-      if (cu_state->gfx10_scheduling() || (cu_resources && !cu_resources->memory_resources_only()))
-        return emit_error.emit() << "Cannot restore GFX10 checkpoint scheduling state";
+      const auto *cu_scheduling = cu_state->gfx10_scheduling();
+      if ((cu_resources && !cu_resources->memory_resources_only()) != (cu_scheduling != nullptr) ||
+          (cu_resources && !Gfx10CheckpointResources::supported(*cu)))
+        return emit_error.emit() << "Unexpected or incomplete GFX10 CU checkpoint records";
       if (cu_resources &&
-          (!Gfx10CheckpointResources::supported(*cu) ||
-           Gfx10CheckpointResources::restore_cu(*cu_resources, *cu, emit_error).failed()))
-        return emit_error.emit() << "Invalid GFX10 checkpoint CU resources";
+          (Gfx10CheckpointResources::restore_cu(*cu_resources, *cu, emit_error).failed() ||
+           (cu_scheduling &&
+            Gfx10CheckpointScheduler::restore_cu(*cu_scheduling, *cu, emit_error).failed())))
+        return util::Result::failure();
+      cu->restore_cycle_count(cu_state->cycle_count());
+      if (auto realtime = cu_state->model_realtime())
+        cu->restore_model_realtime(*realtime);
       if (cu_state->gws_wait_limit())
         cu->set_gws_wait_limit(*cu_state->gws_wait_limit());
       if (cu_state->arithmetic()) {
@@ -711,6 +863,12 @@ util::FailureOr<LoadedConfig> restore_checkpoint(const std::string &path,
               : cu->config().memory_wait_diagnostics,
           xcnt_checks ? (*xcnt_checks ? MemoryWaitDiagnostics::Warn : MemoryWaitDiagnostics::Off)
                       : cu->config().xcnt_diagnostics);
+      const auto *groups = cu_state->rdna4_workgroups();
+      if (groups)
+        for (const auto *g : *groups)
+          cu->restore_rdna4_checkpoint_group({g->dispatch_id(), g->wg_id(), g->live_members(),
+                                              g->workgroup_signals(), g->trap_signals(),
+                                              g->multiwave()});
       const bool restore_lds = checkpoint_cu_owned_lds(cu->arch());
       const auto *lds = cu_state->lds();
       const auto cursor = cu_state->lds_cursor();
@@ -731,21 +889,11 @@ util::FailureOr<LoadedConfig> restore_checkpoint(const std::string &path,
       if (wf_states) {
         for (uint32_t wi = 0; wi < wf_states->size(); ++wi) {
           const auto *wf_state = wf_states->Get(wi);
-          if (wf_state->gfx10_scheduling())
-            return emit_error.emit() << "Cannot restore GFX10 checkpoint scheduling state";
-          const auto graphics = wf_state->graphics_wait();
-          if (!wf_state->halted() &&
-              (graphics == fb::GraphicsWait_Export || graphics == fb::GraphicsWait_Parameters ||
-               wf_state->sleep_cycles() || wf_state->sleep_wakeup() || wf_state->waiting_barrier()))
-            return emit_error.emit() << "Cannot restore an active wave requiring scheduler state";
           const auto pid = wf_state->rdna2_process_id();
           const auto *sgprs = wf_state->sgprs();
           const uint32_t sgpr_capacity = cu->config().sgprs_per_wf;
           uint32_t num_sgprs = sgprs ? sgprs->size() : sgpr_capacity;
           uint32_t restore_sgpr_words = num_sgprs;
-          const auto *resources = wf_state->gfx10_resources();
-          if ((resources != nullptr) != (cu_resources != nullptr))
-            return emit_error.emit() << "Inconsistent GFX10 wave checkpoint records";
           const auto *window = wf_state->lds_window();
           if (restore_lds && !wf_state->halted() && (!window || !lds))
             return emit_error.emit() << "Cannot restore active wave without saved LDS state";
@@ -753,22 +901,28 @@ util::FailureOr<LoadedConfig> restore_checkpoint(const std::string &path,
               (!restore_lds || !lds || window->base() > cu->lds().size_bytes() ||
                (window->size() && uint64_t{window->base()} + window->size() > lds->size())))
             return emit_error.emit() << "Invalid checkpoint LDS window";
-          if (cu->arch() == ROCJITSU_CODE_ARCH_RDNA1 && !resources) {
+          const uint32_t stored_sgprs =
+              wf_state->sgprs() ? wf_state->sgprs()->size() : cu->config().sgprs_per_wf;
+          num_sgprs = wf_state->requested_sgprs().value_or(stored_sgprs);
+          if (!num_sgprs || num_sgprs > stored_sgprs ||
+              stored_sgprs > cu->sgpr_allocation_block_size())
+            return emit_error.emit() << "Invalid checkpoint SGPR allocation";
+          const auto *wave_resources = wf_state->gfx10_resources();
+          const auto *wave_scheduling = wf_state->gfx10_scheduling();
+          if ((wave_resources != nullptr) != (cu_resources != nullptr) ||
+              (wave_scheduling != nullptr) != (cu_scheduling != nullptr))
+            return emit_error.emit() << "Inconsistent GFX10 wave checkpoint records";
+          if (cu->arch() == ROCJITSU_CODE_ARCH_RDNA1 && !wave_resources) {
             if (wf_state->halted())
               continue;
             return emit_error.emit() << "Cannot restore active RDNA1 wave: checkpoint omitted "
                                         "its VGPR and LDS allocations";
           }
-          uint32_t num_vgprs = resources ? resources->vgpr_count() : cu->config().vgprs_per_wf;
-          if (resources && (!num_vgprs || num_vgprs > cu->vgpr_allocation_block_size()))
+          uint32_t num_vgprs =
+              wave_resources ? wave_resources->vgpr_count() : cu->config().vgprs_per_wf;
+          if (wave_resources &&
+              (num_vgprs > cu->vgpr_allocation_block_size() || wf_state->halted()))
             return emit_error.emit() << "Invalid GFX10 wave allocation";
-          if (cu->arch() == ROCJITSU_CODE_ARCH_CDNA3) {
-            num_sgprs = wf_state->requested_sgprs().value_or(num_sgprs);
-            if (!num_sgprs || num_sgprs > restore_sgpr_words ||
-                restore_sgpr_words > cu->sgpr_allocation_block_size())
-              return emit_error.emit() << "Invalid checkpoint SGPR allocation";
-          }
-          const auto *registers = wf_state->rdna2_registers();
           if (rdna2) {
             if (wf_state->halted())
               continue;
@@ -780,13 +934,15 @@ util::FailureOr<LoadedConfig> restore_checkpoint(const std::string &path,
                                           "LDS and scratch allocation state";
             if (*pid != 0 && !wf_state->rdna2_internal_address_space())
               return emit_error.emit() << "RDNA2 checkpoint process lacks its address space";
+            const auto *registers = wf_state->rdna2_registers();
             if (!registers)
               return emit_error.emit() << "Cannot restore active RDNA2 wave: checkpoint omitted "
                                           "its register allocation and TRAPSTS";
-            if (resources && (registers->num_vgprs() != resources->vgpr_count() ||
-                              registers->trapsts() != resources->trapsts() ||
-                              wf_state->rdna2_lds_base() != resources->lds_base() ||
-                              wf_state->rdna2_scratch_base() != resources->scratch_base()))
+            if (wave_resources &&
+                (registers->num_vgprs() != wave_resources->vgpr_count() ||
+                 registers->trapsts() != wave_resources->trapsts() ||
+                 wf_state->rdna2_lds_base() != wave_resources->lds_base() ||
+                 wf_state->rdna2_scratch_base() != wave_resources->scratch_base()))
               return emit_error.emit() << "Inconsistent RDNA2 checkpoint wave resources";
             num_sgprs = registers->num_sgprs();
             num_vgprs = registers->num_vgprs();
@@ -842,44 +998,71 @@ util::FailureOr<LoadedConfig> restore_checkpoint(const std::string &path,
           auto *wf = cu->dispatch_wf_at(wf_state->wf_id(), wf_state->wg_id(), wf_state->pc(),
                                         num_sgprs, num_vgprs, wave_size,
                                         blocks ? std::optional{blocks->Get(wi)} : std::nullopt);
-          if (!wf) {
-            if (blocks)
-              return emit_error.emit()
-                     << "Failed to restore wavefront into its recorded slot or register block";
-            return emit_error.emit() << "Failed to restore wavefront into its recorded slot";
-          }
+          if (!wf)
+            return emit_error.emit()
+                   << (blocks
+                           ? "Failed to restore wavefront into its recorded slot or register block"
+                           : "Failed to restore wavefront into its recorded slot");
+
           if (rdna2) {
-            wf->set_trapsts(registers->trapsts());
+            wf->set_trapsts(wf_state->rdna2_registers()->trapsts());
             wf->set_lds_base(wf_state->rdna2_lds_base());
             wf->set_scratch_base(wf_state->rdna2_scratch_base());
             wf->set_process_id(*pid);
             if (wf_state->rdna2_internal_address_space())
               wf->set_address_space(soc_ptr->internal_address_space());
           }
+          wf->set_dispatch_id(wf_state->dispatch_id());
           if (window) {
             wf->set_lds_base(window->base());
             wf->set_lds_size(window->size());
           }
-          wf->set_dispatch_id(wf_state->dispatch_id());
-          if (cu->arch() == ROCJITSU_CODE_ARCH_RDNA4 || cu->arch() == ROCJITSU_CODE_ARCH_CDNA5) {
-            wf->set_process_id(wf_state->process_id());
-            wf->set_queue_id(wf_state->queue_id());
-            wf->set_wave_in_group(wf_state->wave_in_group());
+          if (wf_state->ib_sts2_gfx11()) {
+            if ((cu->arch() != ROCJITSU_CODE_ARCH_RDNA3 &&
+                 cu->arch() != ROCJITSU_CODE_ARCH_RDNA3_5) ||
+                (wf_state->ib_sts2_gfx11() & ~0x703u))
+              return emit_error.emit() << "Invalid GFX11 checkpoint IB_STS2";
+            wf->set_ib_sts2_gfx11(wf_state->ib_sts2_gfx11());
           }
           wf->set_accum_vgpr_base(accum_base);
           wf->set_exec_raw(wf_state->exec());
           wf->set_m0(wf_state->m0());
           // Halted wavefronts are never saved (see save_checkpoint skip above),
-          // so halted() is always false here. Keep the branch for future-proofing.
+          // so halted() is always false here. Keep the branch for
+          // future-proofing.
           wf->set_state(wf_state->halted() ? amdgpu::WfState::HALTED : amdgpu::WfState::RUNNING);
-          wf->set_status_raw(wf_state->status());
-          if (resources &&
-              Gfx10CheckpointResources::restore_wave(*resources, *cu, *wf, emit_error).failed())
-            return util::Result::failure();
-          if (!rdna2 && resources && wf_state->rdna2_internal_address_space()) {
-            wf->set_process_id(wf_state->rdna2_process_id().value_or(0));
-            wf->set_address_space(soc_ptr->internal_address_space());
+          if (!rdna2) {
+            const auto internal = wf_state->uses_internal_address_space();
+            if (!internal && groups && wf_state->process_id() != 0)
+              return emit_error.emit()
+                     << "Legacy GFX12 checkpoint lacks the resident process address-space binding";
+            if (internal.value_or(false)) {
+              if (!soc_ptr->internal_address_space())
+                return emit_error.emit() << "Checkpoint requires the standalone VM's address space";
+              wf->set_address_space(soc_ptr->internal_address_space());
+            }
           }
+          if (groups) {
+            wf->set_process_id(wf_state->process_id());
+            wf->set_queue_id(wf_state->queue_id());
+            wf->set_wave_in_group(wf_state->wave_in_group());
+            wf->restore_rdna4_checkpoint_barriers(wf_state->barrier_complete_mask(),
+                                                  wf_state->waiting_barrier());
+          }
+          if (const auto wait = wf_state->graphics_wait();
+              wait && *wait != fb::GraphicsWait_None && *wait != fb::GraphicsWait_LaunchDefaults)
+            return emit_error.emit() << "Unsupported checkpoint graphics wait";
+          wf->set_status_raw(wf_state->status());
+          wf->set_sleep_cycles(wf_state->sleep_cycles());
+          if (wf->supports_sleep_wakeup_credit())
+            wf->set_sleep_wakeup(wf_state->sleep_wakeup());
+          if (wave_resources &&
+              (Gfx10CheckpointResources::restore_wave(*wave_resources, *cu, *wf, emit_error)
+                   .failed() ||
+               (wave_scheduling &&
+                Gfx10CheckpointScheduler::restore_wave(*wave_scheduling, *cu, *wf, emit_error)
+                    .failed())))
+            return util::Result::failure();
           if (const auto *exceptions = wf_state->exceptions()) {
             const bool gfx12 =
                 cu->arch() == ROCJITSU_CODE_ARCH_RDNA4 || cu->arch() == ROCJITSU_CODE_ARCH_CDNA5;

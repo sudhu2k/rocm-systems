@@ -55,6 +55,17 @@ std::optional<uint32_t> ComputeUnitCore::xcc_id() const {
   return cp_->xcc_id();
 }
 
+uint64_t InstructionComputeUnitView::trap_address(bool memory) const {
+  const auto &resolve = raw_cu().trap_handler_resolver_;
+  const auto config = resolve ? resolve(raw_wavefront()) : std::nullopt;
+  return config ? (memory ? config->tma : config->tba) : 0;
+}
+
+bool InstructionComputeUnitView::update_trap_address(bool memory, uint64_t mask, uint64_t value) {
+  const auto &update = raw_cu().trap_address_updater_;
+  return update && update(raw_wavefront(), memory, mask, value);
+}
+
 bool InstructionComputeUnitView::in_multiwave_workgroup() const {
   const auto &wave = raw_wavefront();
   return raw_cu().barrier_wgs_.contains(wg_key(wave.dispatch_id(), wave.wg_id()));
@@ -157,6 +168,7 @@ std::string_view instruction_execution_error_name(InstructionExecutionError erro
     return "invalid register access";
   case InstructionExecutionError::UnimplementedInstruction:
     return "unimplemented instruction";
+
   case InstructionExecutionError::DecodeFailure:
     return "instruction decode failure";
   case InstructionExecutionError::IllegalInstruction:
@@ -210,6 +222,33 @@ std::string ComputeUnitCore::disassemble_instruction(std::span<const uint32_t> e
     throw std::logic_error(std::format("cannot disassemble captured instruction at PC {:#x}: {}",
                                        pc, error.message()));
   return decoded.value()->disassemble();
+}
+
+uint64_t InstructionComputeUnitView::return_message(uint32_t message) const {
+  const auto &cu = raw_cu();
+  const auto &wf = raw_wavefront();
+  switch (message) {
+  case 0x80: // GET_DOORBELL
+    return cu.doorbell_resolver_ ? cu.doorbell_resolver_(wf).value_or(0xbad) : 0xbad;
+  case 0x81: // GET_DDID
+    return wf.dispatch_id();
+  case 0x82: // GET_TMA
+  case 0x85: // GET_TBA
+    return trap_message_address(message);
+  case 0x83: // GET_REALTIME
+    return wf.realtime_timestamp();
+  case 0x84: // SAVE_WAVE
+    if (wf.in_trap_handler()) {
+      // SPI must reserve a distinct GPU save record before the handler can store
+      // its registers. GFX11.5 currently has no per-wave CWSR allocator.
+      throw util::UnimplementedInst("privileged SAVE_WAVE requires a GFX11.5 CWSR record");
+    }
+    [[fallthrough]]; // An ordinary shader's SAVE_WAVE becomes MSG_ILLEGAL_RTN.
+  case 0xff:         // MSG_ILLEGAL_RTN
+    return 0;
+  default:
+    return 0;
+  }
 }
 
 ComputeUnitCore::ComputeUnitCore(std::string name, const Config &config, GpuMemory *memory,
@@ -594,6 +633,110 @@ void ComputeUnitCore::flush_cp_notifications() {
   }
 }
 
+bool ComputeUnitCore::enter_trap_handler(Wavefront &wave, uint32_t trap_id) {
+  if (wave.in_trap_handler() || !trap_handler_resolver_)
+    return false;
+  const auto config = trap_handler_resolver_(wave);
+  if (!config || !config->tba)
+    return false;
+  enter_trap_handler(wave, *config, trap_id, wave.pc);
+  return true;
+}
+
+void ComputeUnitCore::deliver_memory_trap(Wavefront &wave) {
+  assert(wave.state() == WfState::MEMORY_TRAP);
+  wave.set_state(WfState::RUNNING);
+  // Hardware saves the next PC and a zero software trap ID (RDNA2 §3.11).
+  if (enter_trap_handler(wave, 0))
+    return;
+  wave.set_status_raw(wave.status_raw() | Wavefront::kStatusFatalHaltMask);
+  if (wave.fail_pm4_submission()) {
+    abort_dispatch(wave.dispatch_id());
+    return;
+  }
+  defer_queue_exception(nullptr, wave.queue_id(), wave.process_id(), kAqlQueueApertureViolation,
+                        /*clear_debug_stop_on_success=*/false,
+                        /*retain_failure_for_debugger=*/false,
+                        QueueExceptionDeliveryPolicy::PublishOrFail);
+}
+
+void ComputeUnitCore::enter_trap_handler(Wavefront &wave, const TrapHandlerConfig &config,
+                                         uint32_t trap_id, uint64_t saved_pc) {
+  if (arch() == ROCJITSU_CODE_ARCH_CDNA2 && config_.memory_wait_checks_enabled()) {
+    if (auto *scoreboard = wave.memory_wait_scoreboard())
+      scoreboard->clear();
+  }
+  const uint32_t saved_status = wave.status_raw();
+  const auto properties = isa_properties(this->arch());
+  const auto wave_state_layout = properties.wave_state_layout;
+  const bool uses_split_wave_state = wave_state_layout != WaveStateLayout::Legacy;
+  wave.set_ttmp(0, static_cast<uint32_t>(saved_pc));
+  if (uses_split_wave_state) {
+    // GFX12 trap entry carries the four-bit trap id in TTMP1[31:28].
+    // GFX12.0 has a 48-bit PC and preserves SCHED_MODE in TTMP1[27:26];
+    // GFX12.5 expands the PC to 57 bits and enters privileged scheduling.
+    const uint32_t pc_hi_mask =
+        wave_state_layout == WaveStateLayout::Gfx12_5 ? 0x01FFFFFFu : 0x0000FFFFu;
+    const uint32_t sched_mode = wave_state_layout == WaveStateLayout::Gfx12
+                                    ? (wave.wave_sched_mode_raw() & 0x3u) << 26
+                                    : 0u;
+    wave.set_ttmp(1, (static_cast<uint32_t>(saved_pc >> 32) & pc_hi_mask) | sched_mode |
+                         ((trap_id & 0xFu) << 28));
+    const uint32_t debug_enabled = config.debug_enabled ? (1u << 23) : 0u;
+    wave.set_ttmp(11, (wave.ttmp(11) & ~(1u << 23)) | debug_enabled);
+    constexpr uint16_t kWholeStatePriv = 4u | (31u << 11);
+    uint32_t state_priv = 0;
+    const auto state_result = read_hwreg_field(wave, kWholeStatePriv, state_priv);
+    assert(state_result == HwregAccessResult::Success);
+    (void)state_result;
+    wave.set_ttmp(12, state_priv);
+  } else {
+    wave.set_ttmp(1, static_cast<uint32_t>(saved_pc >> 32) | (trap_id << 16));
+  }
+  // Dispatch identity. Which TTMPs carry it is architecture-specific and
+  // this must not disagree with what CWSR publishes for the same wave, or
+  // rocm-dbgapi correlates the stopped wave to the wrong workgroup.
+  //
+  // On the profiles where the SPI puts workgroup ids in TTMP6/7/9,
+  // init_wavefront_regs() already seeded them at dispatch and trap entry
+  // has nothing to add -- zeroing TTMP9 here destroyed one of them. The
+  // rest use the gfx9 layout, TTMP8/9/10 = workgroup id x/y/z, which is
+  // also what CWSR serializes (cwsr.cpp writes wg_coord into ttmp[8..10]).
+  // Writing the flat wg_id() into TTMP8 disagreed with that too.
+  if (!properties.uses_ttmp_workgroup_ids) {
+    const auto &wg = wave.wg_coord();
+    wave.set_ttmp(8, wg[0]);
+    wave.set_ttmp(9, wg[1]);
+    wave.set_ttmp(10, wg[2]);
+  }
+  if (!uses_split_wave_state) {
+    wave.set_ttmp(11,
+                  ((wave.queue_packet_id() & 0x1FFFFFFu) << 6) | (wave.wave_in_group() & 0x3Fu));
+    wave.set_ttmp(12, saved_status);
+    const uint32_t debug_enabled = config.debug_enabled ? (1u << 23) : 0u;
+    wave.set_ttmp(13, (wave.ttmp(13) & ~(1u << 23)) | debug_enabled);
+  }
+  wave.set_ttmp(14, static_cast<uint32_t>(config.tma));
+  wave.set_ttmp(15, static_cast<uint32_t>(config.tma >> 32));
+  wave.set_trap_id(trap_id);
+  wave.set_trap_saved_status(saved_status);
+  wave.set_trap_saved_exec(wave.exec());
+  wave.set_trap_interrupt_sent(false);
+  wave.clear_trap_exception_status();
+  // A fresh handler entry owns the halt state from here on; a marker left
+  // over from a previous stop would attribute this entry's HALT to an
+  // s_sendmsghalt that has already been resumed past.
+  wave.set_self_halted(false);
+  wave.set_in_trap_handler(true);
+  if (wave.supports_sleep_wakeup_credit())
+    wave.set_sleep_cycles(0);
+  if (uses_split_wave_state)
+    wave.set_status_raw(saved_status | kPrivilegedStatusBit);
+  wave.pc = config.tba;
+  if (plugin_group_)
+    plugin_group_->onAmdgpuTrapEntered(wave);
+}
+
 void ComputeUnitCore::handle_memory_access_failure(Wavefront &wf, VmAccessOutcome outcome,
                                                    uint64_t issue_pc) {
   assert(outcome != VmAccessOutcome::Complete && outcome != VmAccessOutcome::Unavailable);
@@ -656,9 +799,28 @@ void ComputeUnitCore::fail_gws_wait(Wavefront &wf, std::string_view reason) {
   }
 }
 
+uint64_t InstructionComputeUnitView::trap_message_address(uint32_t message) const {
+  const auto &resolve = raw_cu().trap_handler_resolver_;
+  auto handler = resolve ? resolve(raw_wavefront()) : std::nullopt;
+  if (!handler)
+    return 0;
+  if (message == 0x82)
+    return handler->tma;
+  return handler->tba ? handler->tba | (uint64_t{1} << 63) : 0;
+}
+
 void ComputeUnitCore::maybe_reset_lds_alloc() {
   if (!has_active_wfs() && !lds_allocation_pinned())
     reset_lds_alloc();
+}
+
+std::array<uint64_t, 2> InstructionComputeUnitView::trap_handler_addresses() const {
+  const auto &resolver = raw_cu().trap_handler_resolver_;
+  if (resolver) {
+    if (const auto config = resolver(raw_wavefront()))
+      return {config->tba, config->tma};
+  }
+  return {};
 }
 
 void ComputeUnitCore::begin_workgroup(uint32_t dispatch_id, uint32_t wg_id, uint32_t wf_count,
@@ -685,6 +847,32 @@ void ComputeUnitCore::begin_workgroup(uint32_t dispatch_id, uint32_t wg_id, uint
   group.allocated_count = std::min(num_named_barriers, kMaxNamedBarriers);
   for (auto &barrier : group.workgroup)
     barrier.member_count = wf_count;
+}
+
+std::vector<ComputeUnitCore::Rdna4CheckpointGroup>
+ComputeUnitCore::rdna4_checkpoint_groups() const {
+  std::vector<Rdna4CheckpointGroup> result;
+  for (const auto &[key, members] : active_wgs_) {
+    const auto it = barrier_wgs_.find(key);
+    const bool multiwave = it != barrier_wgs_.end();
+    result.push_back({wg_key_dispatch_id(key), static_cast<uint32_t>(key), members,
+                      static_cast<uint8_t>(multiwave ? it->second.workgroup[0].signal_count : 0),
+                      static_cast<uint8_t>(multiwave ? it->second.workgroup[1].signal_count : 0),
+                      multiwave});
+  }
+  std::ranges::sort(result, {},
+                    [](const Rdna4CheckpointGroup &g) { return wg_key(g.dispatch_id, g.wg_id); });
+  return result;
+}
+
+void ComputeUnitCore::restore_rdna4_checkpoint_group(const Rdna4CheckpointGroup &group) {
+  const auto key = wg_key(group.dispatch_id, group.wg_id);
+  active_wgs_.emplace(key, group.live_members);
+  if (group.multiwave) {
+    auto &barriers = barrier_wgs_[key].workgroup;
+    barriers[0] = {group.live_members, group.workgroup_signals};
+    barriers[1] = {group.live_members, group.trap_signals};
+  }
 }
 
 void ComputeUnitCore::named_barrier_init(Wavefront &wf, int32_t barrier_id, uint32_t member_count) {
@@ -1070,6 +1258,11 @@ void ComputeUnitCore::retry_paused_queue_memory(uint32_t process_id, uint32_t qu
     global_mem_pipeline_.retry_for_queue(process_id, queue_id);
     local_mem_pipeline_.retry_for_queue(process_id, queue_id);
     tensor_dma_pipeline_.retry_for_queue(process_id, queue_id);
+    // Publish the continuation/handler state before a paused queue is inspected for CWSR.
+    for (const auto &wave : wfs_)
+      if (wave && wave->process_id() == process_id && wave->queue_id() == queue_id &&
+          wave->state() == WfState::MEMORY_TRAP)
+        deliver_memory_trap(*wave);
   }
   if (replay_loads) {
     for (const auto &wave : wfs_) {
@@ -2024,7 +2217,14 @@ void ComputeUnitCore::update_wf_states() {
     auto &wf = wfs_[slot];
     if (!wf)
       continue;
-    if (wf->state() == WfState::WAITCNT && wf->wait_satisfied()) {
+    // A debugger resume can release HALT, but FATAL_HALT blocks issue even in
+    // privileged mode until the host clears the architectural cause.
+    if (arch() == ROCJITSU_CODE_ARCH_RDNA3_5 && (wf->status_raw() & (1u << 23)) &&
+        !wf->is_halted() && !wf->debug_halted())
+      wf->set_debug_halted(true);
+    if (wf->state() == WfState::MEMORY_TRAP) {
+      deliver_memory_trap(*wf);
+    } else if (wf->state() == WfState::WAITCNT && wf->wait_satisfied()) {
       wf->set_state(WfState::RUNNING);
       wf->set_ready_cycle(cycle_counter_);
     } else if (wf->state() == WfState::ENDING && wf->wait_counters().empty()) {
@@ -2126,7 +2326,11 @@ void ComputeUnitCore::fail_wave_instruction(Wavefront &wf, std::string_view inst
       "CU {}: wf{} could not execute {} at pc={:#x} (pid={} qid={} dispatch={} wg={}): {}",
       this->name(), wf.wf_id(), instruction, pc, wf.process_id(), wf.queue_id(), wf.dispatch_id(),
       wf.wg_id(), reason);
-  handle_instruction_failure(wf, failure);
+  const bool exception_claimed = error == InstructionExecutionError::IllegalInstruction &&
+                                 !wf.fail_pm4_submission() && illegal_inst_handler_ &&
+                                 illegal_inst_handler_(wf);
+  if (!exception_claimed || !wf.debug_halted())
+    handle_instruction_failure(wf, failure, exception_claimed);
 }
 
 void AsyncInstructionWindow::materialize() {
@@ -2229,6 +2433,23 @@ template <bool EnableAsync>
         window->drain();
     }
   };
+
+  // A completed FLAT exception interrupts between instructions. Software
+  // S_TRAP instead saves its own PC so the handler may inspect the instruction.
+  if (active->pending_memory_trap_) [[unlikely]] {
+    const auto config = trap_handler_resolver_ ? trap_handler_resolver_(*active) : std::nullopt;
+    if (config && config->tba && !active->in_trap_handler()) {
+      drain_async_window();
+      if (!active->wait_counters().empty()) {
+        active->set_wait_all();
+        return IssueOutcome::NotIssued;
+      }
+      active->pending_memory_trap_ = false;
+      enter_trap_handler(*active, *config, 0, active->pc);
+      return IssueOutcome::NotIssued;
+    }
+    active->pending_memory_trap_ = false;
+  }
 
   std::optional<GpuVmAccess> fresh_vm_access;
   const GpuVmAccess *vm_access = active->vm_access();
@@ -2335,13 +2556,12 @@ template <bool EnableAsync>
     return IssueOutcome::NotIssued;
   }
 
-  active->trace_inst_count_++;
-
   util::StringDiagnostic decode_error;
   const bool reuse_decoded = !debugger_active;
   DecodeResult decoded = decoded_inst_cache_.decode(*decoder_, active->pc, vmid, words,
                                                     decode_error.emitter(), reuse_decoded);
   if (decoded.failed()) {
+    ++active->trace_inst_count_;
     drain_async_window();
     // Preserve debugger-first handling of illegal instructions. PM4 failures
     // remain exclusive to their submission and are handled below.
@@ -2376,7 +2596,30 @@ template <bool EnableAsync>
   };
   // Operand resolution outside execute_instruction() participates in the same
   // per-instruction failure contract as the generated execution callback.
-  active->clear_instruction_execution_error();
+  active->begin_instruction_execution();
+
+  const bool gfx10 =
+      config_.arch == ROCJITSU_CODE_ARCH_RDNA1 || config_.arch == ROCJITSU_CODE_ARCH_RDNA2;
+  const bool code_end =
+      (gfx10 || config_.arch == ROCJITSU_CODE_ARCH_RDNA3 ||
+       config_.arch == ROCJITSU_CODE_ARCH_RDNA3_5 || config_.arch == ROCJITSU_CODE_ARCH_RDNA4 ||
+       config_.arch == ROCJITSU_CODE_ARCH_CDNA5) &&
+      inst->mnemonic() == "s_code_end";
+  const bool software_trap = inst->mnemonic() == "s_trap";
+  const auto trap_config =
+      (code_end || software_trap) && !active->in_trap_handler() && trap_handler_resolver_
+          ? trap_handler_resolver_(*active)
+          : std::nullopt;
+  const bool enters_trap = trap_config && trap_config->tba != 0;
+  const bool ordered_end = gfx10 && inst->mnemonic() == "s_endpgm_ordered_ps_done";
+  if (enters_trap || code_end || ordered_end) {
+    // Drain older requests before publishing the trap or ordered pixel completion.
+    drain_async_window();
+    active->set_wait_all();
+    if (!active->wait_satisfied())
+      return IssueOutcome::NotIssued;
+  }
+  ++active->trace_inst_count_;
 
   int inst_size_signed = inst->size();
   assert(inst_size_signed > 0 && "instruction size must be positive");
@@ -2387,6 +2630,19 @@ template <bool EnableAsync>
     active->pc += inst_size;
     return IssueOutcome::NotIssued;
   }
+  // VINTERP consumes its operands only after WAIT_EXP is satisfied. Park on
+  // the instruction itself so a late LDS parameter return is visible on retry.
+  if (inst->has_embedded_memory_wait() &&
+      (config_.arch == ROCJITSU_CODE_ARCH_RDNA3 || config_.arch == ROCJITSU_CODE_ARCH_RDNA3_5) &&
+      active->wait_counters().expcnt) {
+    const auto threshold = waitcheck_detail::WaitcheckTarget::vinterp_wait_exp(*inst);
+    if (threshold && active->wait_counters().expcnt > *threshold) {
+      active->wait_for({.expcnt = static_cast<uint8_t>(*threshold)});
+      --active->trace_inst_count_;
+      return IssueOutcome::NotIssued;
+    }
+  }
+
   auto *wait_state =
       config_.memory_wait_checks_enabled() ? active->memory_wait_scoreboard() : nullptr;
   if (has_gfx10_trap_wait(config_.arch, inst->mnemonic())) {
@@ -2518,100 +2774,62 @@ template <bool EnableAsync>
     }
   }
 
-  if (observes_before_execute_instruction_)
-    plugin_group_->onAmdgpuBeforeExecuteInstruction(
-        active->pc, *inst, *active,
-        std::span(words).first(std::max<size_t>(kFirstFetchWords, inst_size / 4)));
+  const auto observe_before_execute = [&] {
+    if (observes_before_execute_instruction_)
+      plugin_group_->onAmdgpuBeforeExecuteInstruction(
+          active->pc, *inst, *active,
+          std::span(words).first(std::max<size_t>(kFirstFetchWords, inst_size / 4)));
+  };
 
   // s_trap enters the per-process handler configured by SET_TRAP_HANDLER. The
   // hardware saves the interrupted PC/status in TTMPs and begins fetching at
   // TBA. The handler advances TTMP0:1 for software traps, sends the KFD
   // interrupt message, restores STATUS, and returns through s_rfe_b64.
-  if (std::string_view(inst->mnemonic()) == "s_trap") {
-    // s_trap bypasses execute_instruction(), but still occupies the adjacent
-    // instruction slot that ends the gfx1250 setreg/VGPR-MSB hazard window.
-    active->clear_setreg_vgpr_msb_hazard();
-    uint32_t trap_id = words[0] & 0xFFu;
-    if (!active->in_trap_handler() && trap_handler_resolver_) {
-      auto config = trap_handler_resolver_(*active);
-      if (config && config->tba != 0) {
-        const uint64_t saved_pc = active->pc;
-        const uint32_t saved_status = active->status_raw();
-        const auto properties = isa_properties(this->arch());
-        const auto wave_state_layout = properties.wave_state_layout;
-        const bool uses_split_wave_state = wave_state_layout != WaveStateLayout::Legacy;
-        active->set_ttmp(0, static_cast<uint32_t>(saved_pc));
-        if (uses_split_wave_state) {
-          // GFX12 trap entry carries the four-bit trap id in TTMP1[31:28].
-          // GFX12.0 has a 48-bit PC and preserves SCHED_MODE in TTMP1[27:26];
-          // GFX12.5 expands the PC to 57 bits and enters privileged scheduling.
-          const uint32_t pc_hi_mask =
-              wave_state_layout == WaveStateLayout::Gfx12_5 ? 0x01FFFFFFu : 0x0000FFFFu;
-          const uint32_t sched_mode = wave_state_layout == WaveStateLayout::Gfx12
-                                          ? (active->wave_sched_mode_raw() & 0x3u) << 26
-                                          : 0u;
-          active->set_ttmp(1, (static_cast<uint32_t>(saved_pc >> 32) & pc_hi_mask) | sched_mode |
-                                  ((trap_id & 0xFu) << 28));
-          const uint32_t debug_enabled = config->debug_enabled ? (1u << 23) : 0u;
-          active->set_ttmp(11, (active->ttmp(11) & ~(1u << 23)) | debug_enabled);
-          constexpr uint16_t kWholeStatePriv = 4u | (31u << 11);
-          uint32_t state_priv = 0;
-          const auto state_result = read_hwreg_field(*active, kWholeStatePriv, state_priv);
-          assert(state_result == HwregAccessResult::Success);
-          (void)state_result;
-          active->set_ttmp(12, state_priv);
-        } else {
-          active->set_ttmp(1, static_cast<uint32_t>(saved_pc >> 32) | (trap_id << 16));
-        }
-        // Dispatch identity. Which TTMPs carry it is architecture-specific and
-        // this must not disagree with what CWSR publishes for the same wave, or
-        // rocm-dbgapi correlates the stopped wave to the wrong workgroup.
-        //
-        // On the profiles where the SPI puts workgroup ids in TTMP6/7/9,
-        // init_wavefront_regs() already seeded them at dispatch and trap entry
-        // has nothing to add -- zeroing TTMP9 here destroyed one of them. The
-        // rest use the gfx9 layout, TTMP8/9/10 = workgroup id x/y/z, which is
-        // also what CWSR serializes (cwsr.cpp writes wg_coord into ttmp[8..10]).
-        // Writing the flat wg_id() into TTMP8 disagreed with that too.
-        if (!properties.uses_ttmp_workgroup_ids) {
-          const auto &wg = active->wg_coord();
-          active->set_ttmp(8, wg[0]);
-          active->set_ttmp(9, wg[1]);
-          active->set_ttmp(10, wg[2]);
-        }
-        if (!uses_split_wave_state) {
-          active->set_ttmp(11, ((active->queue_packet_id() & 0x1FFFFFFu) << 6) |
-                                   (active->wave_in_group() & 0x3Fu));
-          active->set_ttmp(12, saved_status);
-          const uint32_t debug_enabled = config->debug_enabled ? (1u << 23) : 0u;
-          active->set_ttmp(13, (active->ttmp(13) & ~(1u << 23)) | debug_enabled);
-        }
-        active->set_ttmp(14, static_cast<uint32_t>(config->tma));
-        active->set_ttmp(15, static_cast<uint32_t>(config->tma >> 32));
-        active->set_trap_id(trap_id);
-        active->set_trap_saved_status(saved_status);
-        active->set_trap_saved_exec(active->exec());
-        active->set_trap_interrupt_sent(false);
-        active->clear_trap_exception_status();
-        // A fresh handler entry owns the halt state from here on; a marker left
-        // over from a previous stop would attribute this entry's HALT to an
-        // s_sendmsghalt that has already been resumed past.
-        active->set_self_halted(false);
-        active->set_in_trap_handler(true);
-        if (uses_split_wave_state)
-          active->set_status_raw(saved_status | kPrivilegedStatusBit);
-        active->pc = config->tba;
-        return IssueOutcome::Issued;
-      }
+  if (code_end || software_trap) {
+    if (code_end)
+      active->set_trapsts(active->trapsts() | (1u << 11)); // EXCP_FLAG_PRIV.ILLEGAL_INST
+    // A trap stalled on older memory has not issued yet. Deliver the before
+    // hook and end the setreg hazard slot only when the instruction proceeds.
+    const auto begin_trap = [&] {
+      observe_before_execute();
+      active->clear_setreg_vgpr_msb_hazard();
+    };
+    const uint32_t trap_id =
+        code_end ? 0u : words[0] & (active->uses_separate_trap_ctrl() ? 0xFu : 0xFFu);
+    if (enters_trap) {
+      begin_trap();
+      if (wait_state)
+        wait_state->clear();
+      WaitFields drained{};
+      for (auto counter : {WaitCounterKind::Load, WaitCounterKind::Store, WaitCounterKind::Ds,
+                           WaitCounterKind::Exp, WaitCounterKind::Sample, WaitCounterKind::Bvh,
+                           WaitCounterKind::Async, WaitCounterKind::Tensor, WaitCounterKind::Km})
+        drained[static_cast<size_t>(counter)] = 0;
+      plugin_group_->onAmdgpuImplicitMemoryWait(*active, drained);
+      const auto saved_pc = active->pc;
+      enter_trap_handler(*active, *trap_config, trap_id, saved_pc);
+      if (observes_after_execute_instruction_)
+        plugin_group_->onAmdgpuAfterExecuteInstruction(saved_pc, *inst, *active);
+      return IssueOutcome::Issued;
     }
-
-    // With no configured TBA, or for a parked s_trap executed by TBA code,
-    // retire the instruction without inventing a host-side trap handler.
+    begin_trap();
+    if (code_end) {
+      const bool delivered =
+          !active->fail_pm4_submission() && illegal_inst_handler_ && illegal_inst_handler_(*active);
+      if (delivered && active->debug_halted())
+        return IssueOutcome::NotIssued;
+      active->set_status_raw(active->status_raw() | Wavefront::kStatusFatalHaltMask);
+      active->report_instruction_execution_error(InstructionExecutionError::IllegalInstruction);
+      handle_instruction_failure(*active, "s_code_end issued", delivered);
+      return IssueOutcome::NotIssued;
+    }
     active->pc += inst_size;
     return IssueOutcome::Issued;
   }
 
-  if (inst->flags() & (INDIRECT_BRANCH | INDIRECT_CALL)) {
+  observe_before_execute();
+
+  if (!gfx10 && (inst->flags() & (INDIRECT_BRANCH | INDIRECT_CALL))) {
     auto mn = std::string_view(inst->mnemonic());
     if (mn.find("s_setpc") != std::string_view::npos ||
         mn.find("s_swappc") != std::string_view::npos) {
@@ -2777,16 +2995,16 @@ template <bool EnableAsync>
       const bool check_buffer =
           d.reports_buffer_residency() && active->address_space() && vm_access;
       const auto ranges = check_residency ? vm_access->nonresident_prt_ranges() : nullptr;
-      const bool check_feedback = d.image_status && active->address_space() && vm_access &&
-                                  vm_access->info().ready;
+      const bool check_feedback =
+          d.image_status && active->address_space() && vm_access && vm_access->info().ready;
       if (check_residency || check_feedback || check_buffer) {
         d.translated.access = *vm_access;
         d.translated.initialized = true;
       }
       // Check sparse textures before offering a fault or watchpoint. The pipeline
       // reuses both the snapshot and the per-tap decisions made for the debugger.
-      const bool feedback_ready = !check_feedback ||
-                                  qualify_image_feedback(d, *vm_access) == VmAccessOutcome::Complete;
+      const bool feedback_ready =
+          !check_feedback || qualify_image_feedback(d, *vm_access) == VmAccessOutcome::Complete;
       BufferResidency buffer_residency;
       const bool buffer_ready =
           !check_buffer ||
@@ -2972,6 +3190,11 @@ template <bool EnableAsync>
         handle_memory_access_failure(*active, memory_outcome, issue_pc);
         return IssueOutcome::Issued;
       }
+      if (active->state() == WfState::MEMORY_TRAP) {
+        active->pc += inst_size;
+        deliver_memory_trap(*active);
+        return IssueOutcome::Issued;
+      }
     }
   }
 
@@ -2999,7 +3222,7 @@ template <bool EnableAsync>
   // s_rfe follows the same target-minus-size convention as other control-flow
   // instructions. Publish the handler-driven stop only after the common PC
   // increment has produced the architectural return PC for CWSR serialization.
-  // EXEC is put back by s_rfe itself, for every return and not just this one.
+  // On GFX10 the trap handler explicitly restores application EXEC before s_rfe.
   if (trap_return && active->debug_halted() && active->trap_interrupt_sent())
     notify_trap_complete(*active);
 
@@ -3039,6 +3262,8 @@ ComputeUnitCore::step_impl(MmaAdmissionCache *admission, uint32_t async_wave_siz
       // Burn down an in-flight S_SLEEP before issuing anything else. A
       // single-step request cancels the remainder instead of spending the
       // debugger's one step on it, which would look like a hung wave.
+      if (wf->nop_ready_cycle_ > cycle_counter_ && !wf->debug_single_step())
+        continue;
       if (wf->sleep_cycles() != 0) {
         if (!wf->debug_single_step()) {
           wf->tick_sleep();
@@ -3050,6 +3275,7 @@ ComputeUnitCore::step_impl(MmaAdmissionCache *admission, uint32_t async_wave_siz
       if ((selected_slots & slot_bit) == 0)
         continue;
       const bool single_step = wf->debug_single_step();
+      const uint64_t step_pc = wf->pc;
       if constexpr (EnableAsync) {
         issue_async_instruction(wf.get(), admission, async_wave_size, has_accvgprs);
         if (wf->is_halted()) {
@@ -3059,8 +3285,14 @@ ComputeUnitCore::step_impl(MmaAdmissionCache *admission, uint32_t async_wave_siz
       } else if (issue_instruction(wf.get()) == IssueOutcome::Issued && issued) {
         *issued |= slot_bit;
       }
-      if (single_step && !wf->in_trap_handler() && !wf->debug_halted() && single_step_handler_)
-        single_step_handler_(*wf);
+      if (single_step && !wf->in_trap_handler() && !wf->debug_halted() && single_step_handler_) {
+        // A trap can park the instruction before it issues.
+        // S_WAITCNT itself advances the PC even when it parks the wave.
+        const auto state = wf->state();
+        const bool waiting_to_issue = state == WfState::WAITCNT;
+        if (!waiting_to_issue || wf->pc != step_pc)
+          single_step_handler_(*wf);
+      }
     }
   }
 

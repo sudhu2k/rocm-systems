@@ -196,6 +196,42 @@ constexpr uint16_t gfx115_source_vgpr(uint32_t selector, uint32_t allocation) {
   return selector < allocation ? static_cast<uint16_t>(selector) : 0;
 }
 
+struct ShaderExportOperands {
+  uint8_t target;
+  uint8_t components;
+  bool done;
+  bool row_from_m0;
+  std::array<uint8_t, 4> sources;
+
+  template <typename Encoding> static ShaderExportOperands decode(const Encoding &inst) {
+    return {inst.tgt,
+            inst.en,
+            bool(inst.done),
+            bool(inst.row_en),
+            {inst.vsrc0, inst.vsrc1, inst.vsrc2, inst.vsrc3}};
+  }
+
+  uint64_t source_lanes(uint64_t exec) const {
+    if (target == 21) {
+      const uint64_t even = exec & 0x5555555555555555ULL;
+      return even | (even << 1);
+    }
+    if (target == 22) {
+      const uint64_t odd = exec & 0xaaaaaaaaaaaaaaaaULL;
+      return odd | (odd >> 1);
+    }
+    return exec;
+  }
+
+  bool channel_enabled(unsigned channel) const { return components & (1u << channel); }
+
+  template <typename Visit> void for_each_source(uint32_t allocation, Visit visit) const {
+    for (unsigned channel = 0; channel < sources.size(); ++channel)
+      if (channel_enabled(channel))
+        visit(channel, gfx115_source_vgpr(sources[channel], allocation));
+  }
+};
+
 /// @brief Decoded register-access modifiers.
 /// @details This view contains no wave state or values.
 struct RegisterModifiers {
@@ -226,6 +262,7 @@ struct RegisterModifiers {
   bool image_reads_address = true;
   std::optional<ImageSampleSources> image_sample_sources;
   const Operand *image_store_data = nullptr;
+  std::optional<ShaderExportOperands> shader_export;
   /// Coordinate VGPR selectors, including NSA selectors.
   ImageAddressRegisters image_coordinates{};
   /// Number of tracked coordinate components.

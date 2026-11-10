@@ -161,6 +161,64 @@ protected:
 INSTANTIATE_TEST_SUITE_P(Gfx10, Gfx10MemoryAllocation,
                          testing::Values(ROCJITSU_CODE_ARCH_RDNA1, ROCJITSU_CODE_ARCH_RDNA2));
 
+TEST_P(Gfx10MemoryAllocation, DebuggerAndTexelPipelineShareTheIssuedResidencySnapshot) {
+  constexpr uint32_t code = 0x8000, texel = 0x5000, value = 0x13579000;
+  amdgpu::GpuVm vm;
+  auto translator = std::make_shared<SparseTranslator>();
+  const auto hole = translator->holes;
+  auto handle =
+      vm.register_address_space(5, translator, std::make_shared<test::CountingGpuMemory>(memory_));
+  cu_->set_gpu_vm(&vm);
+  wf_->set_address_space(handle);
+  wf_->set_process_id(5);
+  cu_->set_debug_active(true);
+  std::vector<uint64_t> watches;
+  cu_->set_watchpoint_handler(
+      [&](amdgpu::Wavefront &, uint64_t address, uint32_t bytes, bool, bool) {
+        EXPECT_EQ(bytes, sizeof(value));
+        watches.push_back(address);
+        return false;
+      });
+  memory_.write32(texel, value);
+  const auto buffer =
+      rdna1::build_mubuf(rdna1::kBufferLoadDword, {.vdata = 8, .tfe = 1, .soffset = 128});
+  const auto sample = rdna1::build_mimg(rdna1::kImageSampleLzMimg,
+                                        {.dim = 1, .dmask = 1, .tfe = 1, .vdata = 8, .ssamp = 2});
+  for (bool sampled : {false, true}) {
+    for (unsigned reg = 0; reg < 12; ++reg)
+      scalar(reg, 0);
+    if (sampled) {
+      bind_single_texel_image(texel);
+    } else {
+      scalar(0, texel);
+      scalar(2, 4);
+      scalar(3, (3u << 28) | (20u << 12));
+    }
+    const auto &words = sampled ? sample : buffer;
+    memory_.load_image(reinterpret_cast<const uint8_t *>(words.data()), sizeof(words), code);
+    for (bool initially_resident : {true, false}) {
+      SCOPED_TRACE(testing::Message()
+                   << "sampled=" << sampled << " initially_resident=" << initially_resident);
+      // Publish the opposite PRT map just after the instruction takes its first snapshot.
+      translator->holes = initially_resident ? nullptr : hole;
+      translator->next_holes = initially_resident ? hole : nullptr;
+      wf_->pc = code;
+      vector(8, 0, 0xdeadbeef);
+      vector(9, 0, 0);
+      watches.clear();
+      ASSERT_TRUE(cu_->step());
+      EXPECT_EQ(vector(8, 0), initially_resident ? value : 0u);
+      EXPECT_EQ(vector(9, 0), initially_resident ? 0u : 1u);
+      EXPECT_EQ(watches,
+                initially_resident ? std::vector<uint64_t>{texel} : std::vector<uint64_t>{});
+    }
+  }
+  cu_->set_debug_active(false);
+  cu_->set_watchpoint_handler({});
+  wf_->set_address_space({});
+  cu_->set_gpu_vm(nullptr);
+}
+
 TEST_P(Gfx10MemoryAllocation, GenericFlatIgnoresImmediateBitEleven) {
   constexpr uint32_t pointer = 0x100000;
   vector(2, 0, pointer);
@@ -423,20 +481,129 @@ TEST_F(Rdna1Memory, ImageTfeTakesPrecedenceOverLodWarningAndPreservesResidentSta
     ASSERT_NO_FATAL_FAILURE(execute({get[0], 0}));
     EXPECT_EQ(cu_->read_sgpr(wf_->sgpr_alloc().base + 12), expected);
   };
+  wf_->set_vcc_raw(1);
   ASSERT_NO_FATAL_FAILURE(expect_hwreg_bit(1, 0));
   ASSERT_NO_FATAL_FAILURE(issue(sample));
   EXPECT_EQ(vector(8, 0), 12345u);
   EXPECT_EQ(vector(9, 0), 2u);
   ASSERT_NO_FATAL_FAILURE(expect_hwreg_bit(1, 1)); // MODE.LOD_CLAMPED
+  ASSERT_NO_FATAL_FAILURE(expect_hwreg_bit(2, 0)); // STATUS.VCCZ
   scalar(0, 0x5000 >> 8);
   const auto prior_reads = backing->reads;
   ASSERT_NO_FATAL_FAILURE(issue(sample));
   EXPECT_EQ(vector(8, 0), 0u);
   EXPECT_EQ(vector(9, 0), 1u);
   EXPECT_EQ(backing->reads, prior_reads);
+  wf_->set_vcc_raw(0);
   ASSERT_NO_FATAL_FAILURE(expect_hwreg_bit(1, 1)); // Sticky across the NACK.
+  ASSERT_NO_FATAL_FAILURE(expect_hwreg_bit(2, 1));
   wf_->set_address_space({});
   cu_->set_gpu_vm(nullptr);
+}
+
+TEST_P(Gfx10MemoryAllocation, DebuggerProbesOnlyResidentTexelRanges) {
+  constexpr uint64_t code_va = 0x40000000, resident = 0x50000000;
+  constexpr uint64_t hole = resident + amdgpu::kLegacyPageSize;
+  constexpr uint64_t unmapped = hole + amdgpu::kLegacyPageSize;
+  constexpr uint32_t vmid = 7, texel = 0xdecafbad, sentinel = 0xa5a5;
+  amdgpu::GpuVm vm;
+  amdgpu::LegacyGpuVmAdapter adapter(vm, &memory_);
+  KfdProcess process(vmid);
+  std::array<uint8_t, amdgpu::kLegacyPageSize> code{}, page{};
+  std::memcpy(page.data(), &texel, sizeof(texel));
+  const auto buffer = rdna1::build_mubuf(rdna1::kBufferLoadDword,
+                                         {.offen = 1, .vdata = 8, .tfe = 1, .soffset = 128});
+  const auto image =
+      rdna1::build_mimg(rdna1::kImageLoadMimg, {.dim = 1, .dmask = 1, .tfe = 1, .vdata = 8});
+  const auto sample = rdna1::build_mimg(rdna1::kImageSampleLzMimg,
+                                        {.dim = 1, .dmask = 1, .tfe = 1, .vdata = 8, .ssamp = 2});
+  std::memcpy(code.data(), buffer.data(), sizeof(buffer));
+  std::memcpy(code.data() + 16, image.data(), sizeof(image));
+  std::memcpy(code.data() + 32, sample.data(), sizeof(sample));
+  process.map_pages(code_va, code.data(), code.size(), amdgpu::Mtype::RW);
+  process.map_pages(resident, page.data(), page.size(), amdgpu::Mtype::RW);
+  process.prt_residency->nonresident.store(
+      std::make_shared<const amdgpu::PrtRanges>(amdgpu::PrtRanges{{hole, unmapped}}));
+  auto handle = adapter.register_address_space(
+      vmid, {.page_table = &process.page_table_,
+             .page_table_mutex = &process.page_table_mutex_,
+             .request_mutex = process.page_table_request_mutex(),
+             .page_table_cache_state = process.page_table_cache_state(),
+             .prt_residency = process.prt_residency});
+  ASSERT_TRUE(handle);
+  cu_->set_gpu_vm(&vm);
+  cache_.set_gpu_vm(&vm);
+  wf_->set_address_space(handle);
+  wf_->set_process_id(vmid);
+  std::vector<uint64_t> faults, watches;
+  cu_->set_memory_violation_handler([&](amdgpu::Wavefront &, uint64_t address, bool, uint64_t) {
+    faults.push_back(address);
+    return true;
+  });
+  cu_->set_watchpoint_handler(
+      [&](amdgpu::Wavefront &, uint64_t address, uint32_t bytes, bool, bool) {
+        EXPECT_EQ(bytes, sizeof(texel));
+        watches.push_back(address);
+        return false;
+      });
+
+  const auto step = [&](unsigned pc_offset, uint64_t address, bool debug, bool mixed = false) {
+    SCOPED_TRACE(testing::Message() << pc_offset << "/" << address << "/" << debug << "/" << mixed);
+    for (unsigned sgpr = 0; sgpr < 12; ++sgpr)
+      scalar(sgpr, 0);
+    if (pc_offset == 0) {
+      scalar(0, address);
+      scalar(2, 2 * amdgpu::kLegacyPageSize + 4);
+      scalar(3, (3u << 28) | (20u << 12));
+    } else {
+      bind_single_texel_image(address);
+    }
+    wf_->pc = code_va + pc_offset;
+    wf_->set_exec(mixed ? 3 : 1);
+    for (unsigned lane = 0; lane < 2; ++lane) {
+      vector(0, lane, mixed && lane == 1 ? amdgpu::kLegacyPageSize : 0);
+      vector(1, lane, 0);
+      vector(8, lane, sentinel);
+      vector(9, lane, 0);
+    }
+    faults.clear();
+    watches.clear();
+    cu_->set_debug_active(debug);
+    ASSERT_TRUE(cu_->step());
+    if (address == unmapped) {
+      EXPECT_EQ(faults, std::vector<uint64_t>{unmapped});
+      EXPECT_TRUE(watches.empty());
+      EXPECT_EQ(vector(8, 0), sentinel);
+      EXPECT_EQ(vector(9, 0), 0u);
+    } else {
+      EXPECT_TRUE(faults.empty());
+      EXPECT_EQ(vector(8, 0), address == hole ? 0u : texel);
+      EXPECT_EQ(vector(9, 0), address == hole ? 1u : 0u);
+      if (debug && address == resident) {
+        EXPECT_FALSE(watches.empty());
+        EXPECT_TRUE(std::ranges::all_of(watches, [&](auto addr) { return addr == resident; }));
+      } else {
+        EXPECT_TRUE(watches.empty());
+      }
+      if (mixed) {
+        EXPECT_EQ(vector(8, 1), 0u);
+        EXPECT_EQ(vector(9, 1), 1u);
+      }
+    }
+  };
+  for (auto pc_offset : {0u, 16u, 32u}) {
+    ASSERT_NO_FATAL_FAILURE(step(pc_offset, hole, false));
+    ASSERT_NO_FATAL_FAILURE(step(pc_offset, resident, true));
+    ASSERT_NO_FATAL_FAILURE(step(pc_offset, hole, true));
+    ASSERT_NO_FATAL_FAILURE(step(pc_offset, unmapped, true));
+  }
+  ASSERT_NO_FATAL_FAILURE(step(0, resident, true, true));
+  cu_->set_debug_active(false);
+  cu_->set_watchpoint_handler({});
+  cu_->set_memory_violation_handler({});
+  wf_->set_address_space({});
+  cu_->set_gpu_vm(nullptr);
+  cache_.set_gpu_vm(nullptr);
 }
 
 TEST_F(Rdna1Memory, DualDsHonorsIndependentBoundsAndAliasing) {

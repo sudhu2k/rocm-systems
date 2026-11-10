@@ -462,7 +462,10 @@ void SMemtimeSmem::execute_impl(amdgpu::Wavefront &wf) {
 }
 
 void SMemrealtimeSmem::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_s_memrealtime_smem(*this, wf);
+  const uint64_t counter = wf.realtime_clock();
+  const uint32_t dst_sel = inst_.sdata;
+  amdgpu::write_scalar_selector(wf, dst_sel, static_cast<uint32_t>(counter));
+  amdgpu::write_scalar_selector(wf, dst_sel + 1, static_cast<uint32_t>(counter >> 32));
 }
 
 void SAtcProbeSmem::execute_impl(amdgpu::Wavefront &wf) {

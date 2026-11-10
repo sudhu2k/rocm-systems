@@ -7282,13 +7282,19 @@ class CodeGenerator:
             if sem.name == 'S_SLEEP'
             else 'amdgpu::RegisterAccess(wf).read_scalar(ssrc0)'
         )
+        has_wakeup_credit = self.isa_spec.arch_name in ('rdna4', 'cdna5')
+        set_delay = (
+            'issue_sleep_with_credit' if has_wakeup_credit else 'set_sleep_cycles'
+        )
         return (
             '  constexpr uint32_t kSleepClocksPerUnit = 64;\n'
-            f'  wf.set_sleep_cycles(kSleepClocksPerUnit * ({count} & 0x7Fu));\n'
+            f'  wf.{set_delay}(kSleepClocksPerUnit * ({count} & 0x7Fu));\n'
             '  wf.cu().request_functional_yield();'
         )
 
-    def _trap_control_body(self, sem: InstructionSemantics) -> str | None:
+    def _trap_control_body(
+        self, sem: InstructionSemantics, *, clear_status_priv: bool = False
+    ) -> str | None:
         """execute() body for a trap-handler control op, or None if not one.
 
         The MR ISA carries no pseudocode for these, so they derive as
@@ -7298,7 +7304,10 @@ class CodeGenerator:
         docs/rocgdb-debugging.md). The bodies belong here rather than in a
         hand-edit of the generated header, which a regeneration would drop.
         """
-        if sem.name in self._TRAP_RETURN_NAMES:
+        if (
+            sem.name in self._TRAP_RETURN_NAMES
+            or sem.semantic_class == 'trap_return'
+        ):
             # Return from exception: restore the PC the trap handler saved in
             # ssrc0. gfx12.5 has a 57-bit PC; older targets use 48 address bits.
             # The instruction size is subtracted because the interpreter
@@ -7333,17 +7342,12 @@ class CodeGenerator:
                 '  const bool keep_halted = (wf.status_raw() & kStatusHalt) != 0;\n'
                 f'{split_state_status_restore}'
                 '\n'
-                '  // Returning from the handler puts the interrupted EXEC back. The handler runs\n'
-                '  // under its own mask -- it parks a doorbell id in EXEC_LO on the way to\n'
-                '  // MSG_INTERRUPT -- and restoring that is part of returning, not part of\n'
-                '  // stopping for a debugger: a handler that returns without stopping the wave\n'
-                '  // used to leave its mask installed, so the application ran on with every lane\n'
-                '  // active. That silently un-diverges a branch (gdb.rocm/lane-info.exp sees\n'
-                '  // lanes that converged out of a branch reported active again) and is\n'
-                '  // permanent, because nothing later puts the application\'s mask back.\n'
-                '  if (wf.in_trap_handler())\n'
-                '    wf.set_exec(wf.trap_saved_exec());\n'
-                '  wf.set_in_trap_handler(false);\n'
+                + (
+                    '  wf.set_status_raw(wf.status_raw() & ~(1u << 5));\n'
+                    if clear_status_priv
+                    else ''
+                )
+                + '  wf.set_in_trap_handler(false);\n'
                 '\n'
                 '  // The handler sets STATUS.HALT when it wants the wave to stay\n'
                 '  // stopped for the debugger; honour that on the way out.\n'
@@ -7365,8 +7369,17 @@ class CodeGenerator:
                 '  const uint32_t message = static_cast<uint32_t>(simm16.encoding_value_);\n'
                 '  if (wf.in_trap_handler() && (message & 0xFu) == 1u)\n'
                 '    wf.set_trap_interrupt_sent(true);\n'
-                '  wf.cu().handle_sendmsg(wf, message);'
             )
+            if self.isa_spec.arch_name in ('rdna1', 'rdna2'):
+                body += (
+                    '  const uint32_t id = message & 15u;\n'
+                    '  if (!wf.cu().handle_sendmsg(wf, message) && id >= 2u && id <= 7u) {\n'
+                    '    wf.report_instruction_execution_error(amdgpu::InstructionExecutionError::MissingExecutionBackend);\n'
+                    '    return;\n'
+                    '  }'
+                )
+            else:
+                body += '  wf.cu().handle_sendmsg(wf, message);'
             if sem.name == 'S_SENDMSGHALT':
                 # "...and then HALT the wavefront". The halt is architectural,
                 # so publish it in STATUS.HALT and not only in the debugger's
@@ -7471,7 +7484,7 @@ class CodeGenerator:
                 '  uint64_t target = encoded & kPcAddressMask;',
             ]
         )
-        if pc_bits == 48:
+        if pc_bits == 48 and self.isa_spec.arch_name not in ('rdna1', 'rdna2'):
             lines.extend(
                 [
                     '  if (encoded >> 32 == 0x1FFFFu && wf.code_load_bias() != 0)',
@@ -8211,12 +8224,22 @@ class CodeGenerator:
         L = []  # output lines
 
         if cls == 'true_nop':
+            if sem.name == 'S_CODE_END':
+                return '  wf.report_instruction_execution_error(amdgpu::InstructionExecutionError::IllegalInstruction);'
             # Sleep has no architectural register effect, but FUNCTIONAL
             # execution must return to the event loop so peer CUs can make
             # progress.
             if sem.name in ('S_SLEEP', 'S_SLEEP_VAR'):
                 return self._sleep_body(sem)
-            return self._trap_control_body(sem) or '  (void)wf;'
+            if self.isa_spec.arch_name in ('rdna1', 'rdna2'):
+                if sem.name == 'S_NOP':
+                    return '  wf.delay_nop_issue(simm16.encoding_value_ & 15u);'
+            return (
+                self._trap_control_body(
+                    sem, clear_status_priv=self.isa_spec.arch_name == 'cdna3'
+                )
+                or '  (void)wf;'
+            )
 
         if cls == 'set_vskip':
             return (
@@ -8273,12 +8296,21 @@ class CodeGenerator:
             return '  if (simm16.encoding_value_ & 1u) wf.end();'
 
         if cls == 'endpgm':
+            if self.isa_spec.arch_name == 'rdna3_5':
+                if sem.name == 'S_ENDPGM_SAVED':
+                    return '  wf.end(amdgpu::Wavefront::ProgramEnd::ContextSaved);'
+                if sem.name == 'S_ENDPGM_ORDERED_PS_DONE':
+                    return '  wf.end(amdgpu::Wavefront::ProgramEnd::OrderedPixelDone);'
             # Use end() instead of halt() to drain outstanding memory ops.
             # If all wait counters are zero, end() halts immediately.
             # Otherwise, it transitions to ENDING state and the memory
             # pipeline drain handles the final halt.
-            L.append('  wf.end();')
-            return '\n'.join(L)
+            if self.isa_spec.arch_name in ('rdna1', 'rdna2'):
+                if sem.name == 'S_ENDPGM_ORDERED_PS_DONE':
+                    return '  wf.end_ordered_ps(size_);'
+                if sem.name == 'S_ENDPGM_SAVED':
+                    return '  wf.end(amdgpu::Wavefront::EndReason::Saved);'
+            return '  wf.end();'
 
         if cls == 'trap':
             # S_TRAP transfers to the trap handler and RETURNS to the following
@@ -8388,6 +8420,10 @@ class CodeGenerator:
                 'vccnz': 'live_vcc != 0',
                 'execz': 'wf.exec() == 0',
                 'execnz': 'wf.exec() != 0',
+                'debug_user': '(wf.status_raw() & (1u << 20)) != 0',
+                'debug_sys': '(wf.status_raw() & (1u << 21)) != 0',
+                'debug_either': '(wf.status_raw() & (3u << 20)) != 0',
+                'debug_both': '(wf.status_raw() & (3u << 20)) == (3u << 20)',
             }
             if cond in ('vccz', 'vccnz'):
                 L.append('  const uint64_t live_vcc = wf.vcc_mask();')
@@ -8524,25 +8560,35 @@ class CodeGenerator:
             L.append(
                 f'  uint32_t msg = static_cast<uint32_t>({src_ops[0]}.encoding_value_);'
             )
-            L.append('  uint64_t value = 0;')
-            L.append('  switch (msg) {')
-            L.append('  case 0x83: {')
-            L.append('    value = wf.realtime_timestamp();')
-            L.append('    break;')
-            L.append('  }')
-            L.append('  case 0x80:')  # MSG_RTN_GET_DOORBELL
-            L.append('  case 0x81:')  # MSG_RTN_GET_DDID
-            L.append('  case 0x82:')  # MSG_RTN_GET_TMA
-            L.append('  case 0x84:')  # MSG_RTN_SAVE_WAVE
-            L.append('  case 0x85:')  # MSG_RTN_GET_TBA
-            L.append('  case 0x86:')  # MSG_RTN_GET_TBA_TO_PC
-            L.append('  case 0x87:')  # MSG_RTN_GET_SE_AID_ID
-            L.append('  case 0x88:')  # MSG_RTN_GET_CLUSTER_BARRIER_STATE
-            L.append('  case 0x98:')  # MSG_RTN_SAVE_WAVE_HAS_TDM
-            L.append('  default:')
-            L.append('    value = 0;')
-            L.append('    break;')
-            L.append('  }')
+            if self.isa_spec.arch_name == 'rdna3_5':
+                L.append('  uint64_t value = wf.cu().return_message(msg);')
+            else:
+                L.append('  uint64_t value = 0;')
+                L.append('  switch (msg) {')
+                L.append('  case 0x83: {')
+                L.append('    value = wf.realtime_timestamp();')
+                L.append('    break;')
+                L.append('  }')
+                if self.isa_spec.arch_name == 'rdna4':
+                    L.append('  case 0x81: value = wf.dispatch_id(); break;')
+                if self.isa_spec.arch_name in ('cdna5', 'rdna3', 'rdna4'):
+                    L.append('  case 0x82: case 0x85: value = wf.cu().trap_message_address(msg); break;')
+                L.append('  case 0x80:')  # MSG_RTN_GET_DOORBELL
+                if self.isa_spec.arch_name != 'rdna4':
+                    L.append('  case 0x81:')  # MSG_RTN_GET_DDID
+                if self.isa_spec.arch_name not in ('cdna5', 'rdna3', 'rdna4'):
+                    L.append('  case 0x82:')  # MSG_RTN_GET_TMA
+                L.append('  case 0x84:')  # MSG_RTN_SAVE_WAVE
+                if self.isa_spec.arch_name not in ('cdna5', 'rdna3', 'rdna4'):
+                    L.append('  case 0x85:')  # MSG_RTN_GET_TBA
+                L.append('  case 0x86:')  # MSG_RTN_GET_TBA_TO_PC
+                L.append('  case 0x87:')  # MSG_RTN_GET_SE_AID_ID
+                L.append('  case 0x88:')  # MSG_RTN_GET_CLUSTER_BARRIER_STATE
+                L.append('  case 0x98:')  # MSG_RTN_SAVE_WAVE_HAS_TDM
+                L.append('  default:')
+                L.append('    value = 0;')
+                L.append('    break;')
+                L.append('  }')
             L.append(f'  if ({dst_ops[0]}.size_bits() == 64)')
             L.append(
                 f'    amdgpu::RegisterAccess(wf).write_scalar64({dst_ops[0]}, value);'
@@ -8559,8 +8605,8 @@ class CodeGenerator:
             )
             L.append(
                 f'  bool source_is_m0 = '
-                f'{src_ops[0]}.encoding_value() == '
-                f'OpSelSsrcBarrierId::OPR_SSRC_BARRIER_ID_M0;'
+                f'static_cast<uint32_t>({src_ops[0]}.encoding_value()) == '
+                'amdgpu::scalar_m0_selector(wf.cu().arch());'
             )
             L.append(
                 '  int32_t barrier_id = amdgpu::barrier_operand_id(source, source_is_m0);'
@@ -8580,8 +8626,8 @@ class CodeGenerator:
             )
             L.append(
                 f'  bool source_is_m0 = '
-                f'{src_ops[0]}.encoding_value() == '
-                f'OpSelSsrcBarrierId::OPR_SSRC_BARRIER_ID_M0;'
+                f'static_cast<uint32_t>({src_ops[0]}.encoding_value()) == '
+                'amdgpu::scalar_m0_selector(wf.cu().arch());'
             )
             L.append(
                 '  int32_t barrier_id = amdgpu::barrier_operand_id(source, source_is_m0);'
@@ -9072,9 +9118,15 @@ class CodeGenerator:
             )
 
         if cls == 'smem_time':
+            timestamp = 'wf.shader_cycles()'
+            if inst.name.upper() == 'S_MEMREALTIME':
+                timestamp = (
+                    'wf.realtime_clock()'
+                    if self.isa_spec.arch_name in ('cdna1', 'cdna2', 'cdna3', 'cdna4')
+                    else 'wf.realtime_timestamp()'
+                )
             return (
-                '  static thread_local uint64_t counter = 0;\n'
-                '  counter += 100;\n'
+                f'  const uint64_t counter = {timestamp};\n'
                 '  const uint32_t dst_sel = inst_.sdata;\n'
                 '  amdgpu::write_scalar_selector(wf, dst_sel, static_cast<uint32_t>(counter));\n'
                 '  amdgpu::write_scalar_selector(wf, dst_sel + 1, static_cast<uint32_t>(counter >> 32));'
@@ -12969,6 +13021,22 @@ class CodeGenerator:
                                     'if (modifiers.dpp) modifiers.dpp_masked_compare_rhs = &src1;'
                                 )
 
+                        if (
+                            self.isa_spec.arch_name in ('rdna3', 'rdna3_5', 'rdna4')
+                            and inst_sem.semantic_class == 'export'
+                        ):
+                            access_conditions.append(
+                                'modifiers.shader_export = amdgpu::ShaderExportOperands::decode(inst_);'
+                            )
+                            public_members.append(
+                                cgen.Line(
+                                    'bool tracks_explicit_source(uint8_t index) const override {\n'
+                                    '  const auto operands = amdgpu::ShaderExportOperands::decode(inst_);\n'
+                                    '  if (index < operands.sources.size()) return operands.channel_enabled(index);\n'
+                                    '  return src_operands_[index] != &m0 || operands.row_from_m0;\n'
+                                    '}'
+                                )
+                            )
                         gfx12_image_payload = (
                             self.isa_spec.arch_name == 'rdna4'
                             and self._issues_image_memory(inst.name)
@@ -13566,7 +13634,8 @@ class CodeGenerator:
                     )
                     branch_offset_operand = None
                     if inst_sem and (
-                        inst_sem.semantic_class in ('branch', 'cbranch', 'scalar_call')
+                        inst_sem.semantic_class
+                        in ('branch', 'cbranch', 'scalar_call')
                         or (
                             inst_sem.semantic_class == 'cbranch_fork'
                             and inst_sem.operation == 'direct'
@@ -13699,6 +13768,15 @@ class CodeGenerator:
                     fieldless_caps_guards: dict[str, str] = {}
                     factory_validation_parts: list[str] = []
                     factory_op_encoding = f'{inst.fmt_true_enc_name}::OpEncoding'
+                    if inst.name == 'S_SUBVECTOR_LOOP_END' or (
+                        inst.name == 'S_SUBVECTOR_LOOP_BEGIN'
+                        and self.isa_spec.arch_name == 'rdna1'
+                    ):
+                        ctor_body_parts.append(
+                            'omit_repeated_destination_sources_ = true;'
+                        )
+                        ctor_body_parts.append(f'src_operands_[{src_idx}] = &sdst;')
+                        src_idx += 1
                     if self.isa_spec.arch_name == 'cdna1' and inst.name in {
                         'BUFFER_ATOMIC_ADD_F32',
                         'BUFFER_ATOMIC_PK_ADD_F16',
@@ -15201,7 +15279,9 @@ class CodeGenerator:
                     # know AMDGPU instruction names or opcode values.
                     if _mem_sem and _mem_sem.semantic_class == 'branch':
                         ctor_body_parts.append('flags_ |= BRANCH;')
-                    if _mem_sem and _mem_sem.semantic_class == 'cbranch':
+                    if _mem_sem and _mem_sem.semantic_class in (
+                        'cbranch',
+                    ):
                         ctor_body_parts.append('flags_ |= COND_BRANCH;')
                     # A fork either takes its target or falls through.
                     # S_CBRANCH_G_FORK's target and S_CBRANCH_JOIN's resume PC

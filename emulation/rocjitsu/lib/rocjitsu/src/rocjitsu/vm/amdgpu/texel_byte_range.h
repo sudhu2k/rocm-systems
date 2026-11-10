@@ -22,8 +22,7 @@ inline uint64_t image_tap_misses(const ImageSampleAccess::Tap &tap) {
 inline uint64_t image_tap_misses(const GraphicsSampleAccess::Tap &tap) { return tap.missing_lanes; }
 
 // The pipeline issues one address set per filtered tap or multisample fragment.
-template <typename State, typename Visit>
-bool visit_image_sample_taps(State &state, Visit visit) {
+template <typename State, typename Visit> bool visit_image_sample_taps(State &state, Visit visit) {
   auto apply = [&](auto &tap) {
     if constexpr (std::is_const_v<State>)
       visit(std::as_const(tap));

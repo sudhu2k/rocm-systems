@@ -10,9 +10,11 @@
 #include "rocjitsu/code/rj_code.h"
 #include "simdojo/sim/sim_types.h"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace simdojo {
 class SimulationEngine;
@@ -67,9 +69,11 @@ public:
   bool debug_active() const;
   rj_code_arch_t arch() const;
   uint64_t arithmetic_flags() const;
+  uint64_t shader_cycles() const;
   ImageAddressConfig image_address_config() const;
   uint32_t cus_per_shader_array() const;
   uint32_t shader_array_cu_id() const;
+  uint32_t shader_array_id() const;
   uint32_t shader_engine_id() const;
   uint32_t shader_engine_cu_count() const;
   std::optional<uint32_t> xcc_id() const;
@@ -81,8 +85,17 @@ public:
   simdojo::SimulationEngine *engine() const;
   uint32_t fetch_instruction_word(uint64_t address, uint32_t process_id) const;
   void request_functional_yield();
+  bool in_multiwave_workgroup() const;
+  uint64_t return_message(uint32_t message) const;
+  uint64_t trap_message_address(uint32_t message) const;
+  uint64_t trap_address(bool memory) const;
+  bool update_trap_address(bool memory, uint64_t mask, uint64_t value);
+  uint64_t cycle_count() const;
+  std::pair<uint64_t, uint64_t> trap_addresses() const;
   bool handle_sendmsg(Wavefront &wf, uint32_t message);
   void notify_trap_complete(Wavefront &wf);
+  /// Configured TBA and TMA byte addresses for the issuing process.
+  std::array<uint64_t, 2> trap_handler_addresses() const;
   /// Queue a runtime exception for delivery after instruction execution drops
   /// the compute unit's wave-state lock. A caller without a debugger fallback
   /// can require engine failure if the runtime cannot take ownership. Set
@@ -93,7 +106,6 @@ public:
                               QueueExceptionDeliveryPolicy delivery_policy =
                                   QueueExceptionDeliveryPolicy::WaitForAcknowledgment,
                               bool retain_wave = true);
-  bool in_multiwave_workgroup() const;
   bool observes_tensor_dma_memory_access() const;
   void report_tensor_dma_memory_access(const TensorDmaMemoryAccessObservation &access);
   bool observes_tensor_dma_issue() const;

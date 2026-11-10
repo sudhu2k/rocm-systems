@@ -3005,6 +3005,22 @@ class _CbranchJoin(_ScalarDeriver):
         return SemaBlock(sem.name, ExecModel.BRANCH, body)
 
 
+@_register('subvector_loop')
+class _SubvectorLoop(_ScalarDeriver):
+    @staticmethod
+    def derive(sem: InstructionSemantics) -> SemaBlock:
+        call = f'subvector_loop_{sem.operation}'
+        args = [_id(call), _id('EXEC', SemaType.U64), _src(0)]
+        if sem.operation == 'end':
+            args.append(_dst(0))
+        updated = SemaNode(
+            SemaNodeKind.CALL, ty=SemaType.U64, call_name=call, children=tuple(args)
+        )
+        return SemaBlock(
+            sem.name, ExecModel.BRANCH, _assign(_id('EXEC', SemaType.U64), updated)
+        )
+
+
 @_register('endpgm')
 class _Endpgm(_ScalarDeriver):
     @staticmethod

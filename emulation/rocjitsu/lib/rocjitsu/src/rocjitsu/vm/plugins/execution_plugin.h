@@ -35,6 +35,14 @@ public:
   virtual void onAmdgpuImageFeedbackQualified(const Instruction &inst, amdgpu::Wavefront &wf) = 0;
 };
 
+/// Optional notification when an implicit instruction wait retires its memory producers.
+class AmdgpuImplicitMemoryWaitObserver {
+public:
+  virtual ~AmdgpuImplicitMemoryWaitObserver() = default;
+  virtual void onAmdgpuImplicitMemoryWait(amdgpu::Wavefront &wf,
+                                          const amdgpu::WaitFields &fields) = 0;
+};
+
 /// Optional observation of a VALU lane sourcing bytes directly from LDS.
 class AmdgpuLdsDirectReadObserver {
 public:
@@ -390,6 +398,14 @@ private:
   std::string name_;
   uint32_t slot_index_ = 0;
   PluginSink *sink_ = &StderrSink::instance();
+};
+
+/// Optional interface for plugins that observe a wave entering its trap handler.
+/// Separate from ExecutionPlugin to preserve its vtable for loadable plugins.
+class AmdgpuTrapEntryObserver {
+public:
+  virtual ~AmdgpuTrapEntryObserver() = default;
+  virtual void onAmdgpuTrapEntered(amdgpu::Wavefront &wf) = 0;
 };
 
 /// A full workgroup barrier also synchronizes completed writes from waves that

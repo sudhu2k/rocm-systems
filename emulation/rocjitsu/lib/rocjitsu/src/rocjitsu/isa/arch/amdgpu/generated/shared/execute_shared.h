@@ -1306,7 +1306,9 @@ inline void execute_s_cmpk_lt_u32_sopk([[maybe_unused]] Inst &inst,
 }
 
 template <typename Inst>
-inline void execute_s_code_end_sopp([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {}
+inline void execute_s_code_end_sopp([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {
+  wf.report_instruction_execution_error(amdgpu::InstructionExecutionError::IllegalInstruction);
+}
 
 template <typename Inst>
 inline void execute_s_cselect_b32_sop2([[maybe_unused]] Inst &inst,
@@ -1727,19 +1729,8 @@ inline void execute_s_maximum_f32_sop2([[maybe_unused]] Inst &inst,
 }
 
 template <typename Inst>
-inline void execute_s_memrealtime_smem([[maybe_unused]] Inst &inst,
-                                       [[maybe_unused]] Wavefront &wf) {
-  static thread_local uint64_t counter = 0;
-  counter += 100;
-  const uint32_t dst_sel = inst.inst_.sdata;
-  amdgpu::write_scalar_selector(wf, dst_sel, static_cast<uint32_t>(counter));
-  amdgpu::write_scalar_selector(wf, dst_sel + 1, static_cast<uint32_t>(counter >> 32));
-}
-
-template <typename Inst>
 inline void execute_s_memtime_smem([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {
-  static thread_local uint64_t counter = 0;
-  counter += 100;
+  const uint64_t counter = wf.shader_cycles();
   const uint32_t dst_sel = inst.inst_.sdata;
   amdgpu::write_scalar_selector(wf, dst_sel, static_cast<uint32_t>(counter));
   amdgpu::write_scalar_selector(wf, dst_sel + 1, static_cast<uint32_t>(counter >> 32));
@@ -1919,9 +1910,6 @@ inline void execute_s_nand_saveexec_b64_sop1([[maybe_unused]] Inst &inst,
   wf.write_exec((~(old_exec & src)));
   wf.write_scc((wf.exec_raw() != 0ULL));
 }
-
-template <typename Inst>
-inline void execute_s_nop_sopp([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {}
 
 template <typename Inst>
 inline void execute_s_nor_b32_sop2([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {
@@ -2189,48 +2177,6 @@ inline void execute_s_quadmask_b64_sop1([[maybe_unused]] Inst &inst,
 }
 
 template <typename Inst>
-inline void execute_s_rfe_b64_sop1([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {
-  uint64_t saved_pc = amdgpu::RegisterAccess(wf).read_scalar64(inst.ssrc0);
-  constexpr uint64_t kPcAddressMask = 0x0000FFFFFFFFFFFFULL;
-  wf.pc = (saved_pc & kPcAddressMask) - inst.size();
-
-  constexpr uint32_t kStatusHalt = 1u << 13;
-  const bool keep_halted = (wf.status_raw() & kStatusHalt) != 0;
-  // GFX12 returns the interrupted wave state while preserving the handler's
-  // STATE_PRIV.HALT decision. Older layouts keep using the live STATUS word.
-  if (wf.in_trap_handler() && wf.uses_separate_trap_ctrl()) {
-    uint32_t restored_status = wf.trap_saved_status();
-    restored_status =
-        keep_halted ? (restored_status | kStatusHalt) : (restored_status & ~kStatusHalt);
-    wf.set_status_raw(restored_status);
-  }
-
-  // Returning from the handler puts the interrupted EXEC back. The handler runs
-  // under its own mask -- it parks a doorbell id in EXEC_LO on the way to
-  // MSG_INTERRUPT -- and restoring that is part of returning, not part of
-  // stopping for a debugger: a handler that returns without stopping the wave
-  // used to leave its mask installed, so the application ran on with every lane
-  // active. That silently un-diverges a branch (gdb.rocm/lane-info.exp sees
-  // lanes that converged out of a branch reported active again) and is
-  // permanent, because nothing later puts the application's mask back.
-  if (wf.in_trap_handler())
-    wf.set_exec(wf.trap_saved_exec());
-  wf.set_in_trap_handler(false);
-
-  // The handler sets STATUS.HALT when it wants the wave to stay
-  // stopped for the debugger; honour that on the way out.
-  if (keep_halted) {
-    wf.set_debug_single_step(false);
-    wf.set_debug_halted(true);
-  } else {
-    // Nothing is halting the wave any more, so an s_sendmsghalt marker
-    // left over from an earlier stop is stale. Leaving it set would make
-    // the next resume clear a HALT the handler raises later.
-    wf.set_self_halted(false);
-  }
-}
-
-template <typename Inst>
 inline void execute_s_rndne_f16_sop1([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {
   float result = util::rndne_scalar(
       util::f16_to_f32(static_cast<uint16_t>(amdgpu::read_scalar_f16_carrier(inst.ssrc0, wf))));
@@ -2247,93 +2193,6 @@ inline void execute_s_rndne_f32_sop1([[maybe_unused]] Inst &inst, [[maybe_unused
 template <typename Inst>
 inline void execute_s_round_mode_sopp([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {
   wf.set_fp_round_mode(static_cast<uint32_t>(inst.simm16.encoding_value_));
-}
-
-template <typename Inst>
-inline void execute_s_sendmsg_sopp([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {
-  const uint32_t message = static_cast<uint32_t>(inst.simm16.encoding_value_);
-  if (wf.in_trap_handler() && (message & 0xFu) == 1u)
-    wf.set_trap_interrupt_sent(true);
-  wf.cu().handle_sendmsg(wf, message);
-}
-
-template <typename Inst>
-inline void execute_s_sendmsg_rtn_b32_sop1([[maybe_unused]] Inst &inst,
-                                           [[maybe_unused]] Wavefront &wf) {
-  uint32_t msg = static_cast<uint32_t>(inst.ssrc0.encoding_value_);
-  uint64_t value = 0;
-  switch (msg) {
-  case 0x83: {
-    value = wf.realtime_timestamp();
-    break;
-  }
-  case 0x80:
-  case 0x81:
-  case 0x82:
-  case 0x84:
-  case 0x85:
-  case 0x86:
-  case 0x87:
-  case 0x88:
-  case 0x98:
-  default:
-    value = 0;
-    break;
-  }
-  if (inst.sdst.size_bits() == 64)
-    amdgpu::RegisterAccess(wf).write_scalar64(inst.sdst, value);
-  else
-    amdgpu::RegisterAccess(wf).write_scalar(inst.sdst, static_cast<uint32_t>(value));
-}
-
-template <typename Inst>
-inline void execute_s_sendmsg_rtn_b64_sop1([[maybe_unused]] Inst &inst,
-                                           [[maybe_unused]] Wavefront &wf) {
-  uint32_t msg = static_cast<uint32_t>(inst.ssrc0.encoding_value_);
-  uint64_t value = 0;
-  switch (msg) {
-  case 0x83: {
-    value = wf.realtime_timestamp();
-    break;
-  }
-  case 0x80:
-  case 0x81:
-  case 0x82:
-  case 0x84:
-  case 0x85:
-  case 0x86:
-  case 0x87:
-  case 0x88:
-  case 0x98:
-  default:
-    value = 0;
-    break;
-  }
-  if (inst.sdst.size_bits() == 64)
-    amdgpu::RegisterAccess(wf).write_scalar64(inst.sdst, value);
-  else
-    amdgpu::RegisterAccess(wf).write_scalar(inst.sdst, static_cast<uint32_t>(value));
-}
-
-template <typename Inst>
-inline void execute_s_sendmsghalt_sopp([[maybe_unused]] Inst &inst,
-                                       [[maybe_unused]] Wavefront &wf) {
-  const uint32_t message = static_cast<uint32_t>(inst.simm16.encoding_value_);
-  if (wf.in_trap_handler() && (message & 0xFu) == 1u)
-    wf.set_trap_interrupt_sent(true);
-  wf.cu().handle_sendmsg(wf, message);
-
-  // S_SENDMSGHALT halts the wave. Keep the architectural bit and the
-  // scheduler flag in step -- s_rfe consults STATUS.HALT on the way out.
-  constexpr uint32_t kStatusHalt = 1u << 13;
-  wf.set_status_raw(wf.status_raw() | kStatusHalt);
-  wf.set_debug_halted(true);
-  // Remember who raised the bit. The trap handler also raises HALT, via
-  // s_setreg just before it returns, and there it means "keep the wave
-  // stopped" -- the opposite of what it means here, where the wave has
-  // already reported and is waiting to be resumed. The CWSR record cannot
-  // distinguish the two, so the resume path reads this instead.
-  wf.set_self_halted(true);
 }
 
 template <typename Inst>
@@ -2413,18 +2272,10 @@ inline void execute_s_sext_i32_i8_sop1([[maybe_unused]] Inst &inst,
 }
 
 template <typename Inst>
-inline void execute_s_sleep_sopp([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {
-  constexpr uint32_t kSleepClocksPerUnit = 64;
-  wf.set_sleep_cycles(kSleepClocksPerUnit *
-                      (static_cast<uint32_t>(inst.simm16.encoding_value_) & 0x7Fu));
-  wf.cu().request_functional_yield();
-}
-
-template <typename Inst>
 inline void execute_s_sleep_var_sop1([[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf) {
   constexpr uint32_t kSleepClocksPerUnit = 64;
-  wf.set_sleep_cycles(kSleepClocksPerUnit *
-                      (amdgpu::RegisterAccess(wf).read_scalar(inst.ssrc0) & 0x7Fu));
+  wf.issue_sleep_with_credit(kSleepClocksPerUnit *
+                             (amdgpu::RegisterAccess(wf).read_scalar(inst.ssrc0) & 0x7Fu));
   wf.cu().request_functional_yield();
 }
 

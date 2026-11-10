@@ -347,6 +347,7 @@ struct DispatchEntry {
   uint32_t kernel_code_properties = 0;
   /// Register-programmed compute launches use the PM4 user-data register ABI.
   bool pm4_abi = false;
+  bool uses_kfd_queue_abi = false; ///< KFD AQL dispatches use the calibrated GPU clock.
   std::shared_ptr<Pm4FailureState>
       pm4_failure{};                     ///< Shared with all waves and the owning submission.
   std::array<uint32_t, 16> user_sgprs{}; ///< PM4 COMPUTE_USER_DATA register values.
@@ -358,6 +359,7 @@ struct DispatchEntry {
   uint8_t kernel_wave_size = 0;
   uint16_t kernarg_preload = 0;
   uint32_t initial_mode_raw = 0;
+  uint32_t initial_ib_sts2 = 0; ///< GFX11 memory-order and forward-progress state.
   uint64_t dispatch_ptr = 0;
   uint64_t queue_ptr = 0;
   uint32_t workgroup_id_offset = 0;
