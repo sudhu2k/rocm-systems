@@ -248,7 +248,7 @@ def test_gfx1201_memory_demand_does_not_appear_as_gddr6_bandwidth():
         values.pop(name)
     values["DRAM Read Bandwidth"] = 2e12
     lines = render("gfx1201", values).splitlines()
-    top, bottom, left = box_rows(lines, "L2")
+    top, bottom, left = box_rows(lines, "GL2")
     right = lines[top].index("╮", left)
     l2_text = "\n".join(line[left:right] for line in lines[top:bottom])
     assert re.search(r"Memory Read BW\s+2000\.000 GB/s", l2_text)
