@@ -40,7 +40,7 @@ constexpr size_t ddaLL128BcTwoShotSlotSlices(size_t bankSize, int nRanks, size_t
 }
 
 template <int NRANKS_CT>
-__launch_bounds__(256)
+__launch_bounds__(512)
 __global__ void ddaBroadcastFabricLL128TwoShot(
     int8_t* const* __restrict__ peerScratch,
     int8_t* __restrict__ recvbuff,
