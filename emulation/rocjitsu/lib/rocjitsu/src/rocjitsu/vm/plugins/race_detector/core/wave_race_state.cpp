@@ -209,6 +209,10 @@ void WaveRaceState::prepareForCounterIncrement(amdgpu::WaitCounterType type, uin
       return;
     }
   }
+  // Decoded metadata names only the counters its target has: the combined
+  // VMCNT and LGKMCNT before GFX12, and the split counters on gfx1250. A
+  // combined counter without a capacity therefore means the metadata does not
+  // match the target, which is reported rather than silently left unmodeled.
   if (capacity <= 0)
     throw std::logic_error("counter capacity is not configured");
   assert(increment > 0 && increment <= capacity &&
