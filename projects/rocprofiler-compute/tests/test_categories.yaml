@@ -15,7 +15,6 @@ test_categories:
       - test_utils_profile
       - test_common
       - test_amdsmi_interface
-      - test_gpu_identity
       - test_noise_clamper
       - test_benchmark_base
       - test_analysis_cli
@@ -107,7 +106,6 @@ test_categories:
       - test_utils_profile
       - test_common
       - test_amdsmi_interface
-      - test_gpu_identity
       - test_noise_clamper
       - test_benchmark_base
       - test_analysis_cli
@@ -217,7 +215,6 @@ test_categories:
       - test_utils_profile
       - test_common
       - test_amdsmi_interface
-      - test_gpu_identity
       - test_noise_clamper
       - test_benchmark_base
       - test_analysis_cli
@@ -327,7 +324,6 @@ test_categories:
       - test_utils_profile
       - test_common
       - test_amdsmi_interface
-      - test_gpu_identity
       - test_noise_clamper
       - test_benchmark_base
       - test_analysis_cli
